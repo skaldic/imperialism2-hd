@@ -302,6 +302,7 @@ static void adopt_popup(HWND hwnd)
 
 #define VIEW_DUMP_TIMER 0x1D2D
 static BOOL g_knownBuild, g_dumpViews;
+static int g_wideSteps = 7;
 
 static BOOL readable(const void *p, size_t n) { return p && !IsBadReadPtr(p, n); }
 
@@ -336,27 +337,93 @@ static void dump_view(const BYTE *v, int depth, int *budget)
 	}
 }
 
-static void dump_map_screen_if_new(void)
+// ---------------------------------------------------------------------------------------------
+// Wide mode: re-laying out the map screen
+//
+// The map screen ('main') is built for 800x600: a 9x8-tile map ('DLOG', 576x512) on the left and
+// the unit/minimap panel ('tool') on the right. In wide mode the extra width goes to the map and
+// everything to its right shifts over.
+
+#define ID4(a, b, c, d) (((DWORD)(a) << 24) | ((DWORD)(b) << 16) | ((DWORD)(c) << 8) | (DWORD)(d))
+#define VIEW_INT(view, offset) (*(int *)((BYTE *)(view) + (offset)))
+enum { V_ID = 0x1c, V_PARENT = 0x20, V_X = 0x24, V_Y = 0x28, V_W = 0x34, V_H = 0x38, V_SUBVIEWS = 0x44 };
+
+static BYTE *child_view(BYTE *view, DWORD id)
+{
+	BYTE *list = *(BYTE **)(view + V_SUBVIEWS);
+	if (!readable(list, 8)) return NULL;
+	for (void **node = *(void ***)(list + 4); readable(node, 12); node = (void **)node[0]) {
+		BYTE *child = (BYTE *)node[2];
+		if (readable(child, 0x54) && (DWORD)VIEW_INT(child, V_ID) == id) return child;
+	}
+	return NULL;
+}
+
+// TView::UpdateCoordinates (vtable slot 0x168): recomputes window positions down the tree.
+static void update_coordinates(BYTE *view)
+{
+	typedef void (__attribute__((thiscall)) *Method)(void *);
+	((Method)(*(void ***)view)[0x168 / 4])(view);
+}
+
+static void widen_map_screen(BYTE *picture)
+{
+	int extra = g_gameW - BASE_W;
+	BYTE *map = child_view(picture, ID4('D', 'L', 'O', 'G'));
+	if (extra <= 0 || !map || VIEW_INT(picture, V_W) != BASE_W) return;
+
+	// g_wideSteps is a debugging aid: each bit enables one part of the re-layout.
+	if (g_wideSteps & 1) {
+		for (BYTE *v = picture; readable(v, 0x54); v = *(BYTE **)(v + V_PARENT)) {
+			if (VIEW_INT(v, V_W) == BASE_W) VIEW_INT(v, V_W) = g_gameW;
+		}
+	}
+	if (g_wideSteps & 2) {
+		static const DWORD shifted[] = { ID4('t', 'o', 'o', 'l'), ID4('s', 'e', 'n', 'd'), ID4('t', 'b', 'r', '4') };
+		for (int i = 0; i < (int)(sizeof shifted / sizeof shifted[0]); i++) {
+			BYTE *v = child_view(picture, shifted[i]);
+			if (!v) continue;
+			VIEW_INT(v, V_X) += extra;
+			update_coordinates(v); // only walks down when the view's own position changed
+		}
+		BYTE *toolbar = child_view(picture, ID4('t', 'o', 'p', 'B')); // stays centred under the map
+		if (toolbar) {
+			VIEW_INT(toolbar, V_X) += extra / 2;
+			update_coordinates(toolbar);
+		}
+	}
+	if (g_wideSteps & 4) VIEW_INT(map, V_W) += extra;
+
+	InvalidateRect(g_view, NULL, FALSE);
+	logf_("map screen widened by %d (steps %d)", extra, g_wideSteps);
+}
+
+static void watch_map_screen(void)
 {
 	static const BYTE *last;
-	const BYTE **app = (const BYTE **)0x00759888;
+	BYTE **app = (BYTE **)0x00759888;
 	if (!g_knownBuild || !readable(*app, 0x4c)) return;
-	const BYTE *picture = *(const BYTE **)(*app + 0x48);
+	BYTE *picture = *(BYTE **)(*app + 0x48);
 	if (!picture || picture == last || !readable(picture, 0x54)) return;
+	// Wait until the screen is fully built: the map view is one of the last things attached.
+	if (!child_view(picture, ID4('D', 'L', 'O', 'G'))) return;
 	last = picture;
 
-	const BYTE *root = picture;
-	for (int i = 0; i < 16 && readable(*(const BYTE **)(root + 0x20), 0x54); i++) root = *(const BYTE **)(root + 0x20);
-	int budget = 600;
-	logf_("--- view tree (map picture %p) ---", (void *)picture);
-	dump_view(root, 0, &budget);
-	logf_("--- end of view tree ---");
+	if (g_gameW > BASE_W) widen_map_screen(picture);
+	if (g_dumpViews) {
+		const BYTE *root = picture;
+		for (int i = 0; i < 16 && readable(*(const BYTE **)(root + V_PARENT), 0x54); i++) root = *(const BYTE **)(root + V_PARENT);
+		int budget = 600;
+		logf_("--- view tree (map picture %p) ---", (void *)picture);
+		dump_view(root, 0, &budget);
+		logf_("--- end of view tree ---");
+	}
 }
 
 static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	if (msg == WM_TIMER && wp == VIEW_DUMP_TIMER) {
-		dump_map_screen_if_new();
+		watch_map_screen();
 		return 0;
 	}
 	switch (msg) {
@@ -449,7 +516,7 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 		g_frameProc = (WNDPROC)SetWindowLongA(g_frame, GWL_WNDPROC, (LONG)frame_proc);
 		g_viewProc = (WNDPROC)SetWindowLongA(g_view, GWL_WNDPROC, (LONG)view_proc);
 		logf_("attached: frame %p view %p", (void *)g_frame, (void *)g_view);
-		if (g_dumpViews) SetTimer(g_view, VIEW_DUMP_TIMER, 1500, NULL);
+		if (g_dumpViews || g_gameW > BASE_W) SetTimer(g_view, VIEW_DUMP_TIMER, 200, NULL);
 		place_view();
 	}
 	return hwnd;
@@ -782,6 +849,7 @@ static void install(HMODULE self)
 	g_smooth = GetPrivateProfileIntA("Display", "Smooth", 1, ini);
 	g_integerScale = GetPrivateProfileIntA("Display", "IntegerScale", 0, ini);
 	g_dumpViews = GetPrivateProfileIntA("Debug", "DumpViews", 0, ini);
+	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
 	SetProcessDPIAware();
