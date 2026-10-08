@@ -1,13 +1,19 @@
 # Upscales the extracted pictures 2x: Real-ESRGAN x4plus at 4x, reduced to 2x.
 #   assets\orig\<archive>\<id>.png  ->  assets\x2\<archive>\<id>.png
 #
+# Terrain tiles repeat edge to edge, so each is upscaled inside a 3x3 block of itself and the
+# middle cut out, which keeps the joins seamless. The upscaler also smooths their grain away, so
+# part of a plain bicubic enlargement is blended back in.
+#
 # Sprites mark transparent pixels with a key colour (magenta). Left in, the upscaler would smear
 # it into the sprite's edges, so before upscaling the key area is filled with colours bled out
 # from the sprite, and afterwards the key is stamped back from a pixel-doubled copy of the mask.
 param(
     [string]$Assets = "$PSScriptRoot\..\assets",
     [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe",
-    [string[]]$Skip = @('MapTiles')   # tiles need seam-aware handling of their own
+    [string[]]$Only = @(),              # archive names to process; empty means all
+    [string[]]$Terrain = @('MapTiles'), # archives whose key-less 64x64 pictures are repeating terrain
+    [double]$Grain = 0.5                # how much of the original's texture to blend back into terrain
 )
 
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
@@ -114,6 +120,46 @@ public static class KeyedUpscale
         }
     }
 
+    // Writes a 3x3 block of the tile for the upscaler.
+    public static void PrepareTile(string source, string dest)
+    {
+        using (var src = new Bitmap(source))
+        using (var block = new Bitmap(src.Width * 3, src.Height * 3, PixelFormat.Format24bppRgb))
+        {
+            using (var g = Graphics.FromImage(block))
+                for (int y = 0; y < 3; y++)
+                    for (int x = 0; x < 3; x++)
+                        g.DrawImage(src, x * src.Width, y * src.Height, src.Width, src.Height);
+            block.Save(dest, ImageFormat.Png);
+        }
+    }
+
+    // Cuts the middle tile out of the upscaled 3x3 block at 2x and blends in the original's grain.
+    public static void FinishTile(string upscaled, string original, string dest, double grain)
+    {
+        using (var big = new Bitmap(upscaled))
+        using (var src = new Bitmap(original))
+        using (var outBmp = new Bitmap(src.Width * 2, src.Height * 2, PixelFormat.Format32bppArgb))
+        {
+            var all = new Rectangle(0, 0, outBmp.Width, outBmp.Height);
+            using (var g = Graphics.FromImage(outBmp))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.PixelOffsetMode = PixelOffsetMode.Half;
+                g.DrawImage(big, all, big.Width / 3, big.Height / 3, big.Width / 3, big.Height / 3, GraphicsUnit.Pixel);
+                using (var attrs = new ImageAttributes())
+                {
+                    attrs.SetWrapMode(WrapMode.Tile); // the tile's own far edge is its neighbour
+                    var fade = new ColorMatrix();
+                    fade.Matrix33 = (float)grain;
+                    attrs.SetColorMatrix(fade);
+                    g.DrawImage(src, all, 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, attrs);
+                }
+            }
+            Save24(outBmp, dest);
+        }
+    }
+
     static void Save24(Bitmap bmp, string dest)
     {
         using (var rgb = bmp.Clone(new Rectangle(0, 0, bmp.Width, bmp.Height), PixelFormat.Format24bppRgb))
@@ -125,9 +171,9 @@ public static class KeyedUpscale
 $orig = "$Assets\orig"
 $tempIn = "$Assets\_in"
 $tempOut = "$Assets\_out"
-$total = 0; $keyed = 0
+$total = 0; $keyed = 0; $tiles = 0
 foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
-    if ($Skip -contains $dir.Name) { "$($dir.Name): skipped"; continue }
+    if ($Only.Count -gt 0 -and $Only -notcontains $dir.Name) { continue }
     Remove-Item -Recurse -Force $tempIn, $tempOut -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $tempIn, $tempOut, "$Assets\x2\$($dir.Name)" | Out-Null
 
@@ -135,14 +181,18 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
     foreach ($file in Get-ChildItem -LiteralPath $dir.FullName -Filter *.png) {
         $w = 0; $h = 0
         $mask = [KeyedUpscale]::Prepare($file.FullName, "$tempIn\$($file.Name)", [ref]$w, [ref]$h)
-        $info[$file.Name] = @{ Mask = $mask; W = $w; H = $h }
+        $tile = $null -eq $mask -and $Terrain -contains $dir.Name -and $w -eq 64 -and $h -eq 64
+        if ($tile) { [KeyedUpscale]::PrepareTile($file.FullName, "$tempIn\$($file.Name)") }
+        $info[$file.Name] = @{ Mask = $mask; W = $w; H = $h; Tile = $tile; Source = $file.FullName }
     }
     & $Upscaler -i $tempIn -o $tempOut -n realesrgan-x4plus -s 4 -f png 2>$null
 
     $done = 0
     foreach ($name in $info.Keys) {
         if (-not (Test-Path -LiteralPath "$tempOut\$name")) { continue }
-        [KeyedUpscale]::Finish("$tempOut\$name", "$Assets\x2\$($dir.Name)\$name", $info[$name].Mask, $info[$name].W, $info[$name].H)
+        $dest = "$Assets\x2\$($dir.Name)\$name"
+        if ($info[$name].Tile) { [KeyedUpscale]::FinishTile("$tempOut\$name", $info[$name].Source, $dest, $Grain); $tiles++ }
+        else { [KeyedUpscale]::Finish("$tempOut\$name", $dest, $info[$name].Mask, $info[$name].W, $info[$name].H) }
         $done++
         if ($null -ne $info[$name].Mask) { $keyed++ }
     }
@@ -150,4 +200,4 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
     "$($dir.Name): $done of $($info.Count)"
 }
 Remove-Item -Recurse -Force $tempIn, $tempOut -ErrorAction SilentlyContinue
-"upscaled $total pictures ($keyed with transparency) -> $Assets\x2"
+"upscaled $total pictures ($keyed with transparency, $tiles terrain tiles) -> $Assets\x2"
