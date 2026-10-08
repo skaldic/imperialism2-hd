@@ -49,6 +49,10 @@ static void load_real_ddraw(void)
 // State
 
 static int g_gameW = BASE_W; // width of the game's frame buffer; wider than BASE_W in wide mode
+// Screens other than the map stay 800 wide. In wide mode they are shown centred by shifting
+// the picture this many game pixels to the right when it is presented; the game itself still
+// sees them at x=0, so its cached click regions stay valid.
+static int g_offsetX;
 static HWND g_frame, g_view;
 static WNDPROC g_frameProc, g_viewProc;
 static int g_viewW = BASE_W, g_viewH = GAME_H; // current size of the view window, in pixels
@@ -106,11 +110,12 @@ static void place_view(void)
 		SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-static void map_dc(HDC dc)
+static void map_dc(HDC dc, HWND hwnd)
 {
 	SetMapMode(dc, MM_ANISOTROPIC);
 	SetWindowExtEx(dc, GAME_W, GAME_H, NULL);
 	SetViewportExtEx(dc, g_viewW, g_viewH, NULL);
+	SetViewportOrgEx(dc, hwnd == g_view ? MulDiv(g_offsetX, g_viewW, GAME_W) : 0, 0, NULL);
 	SetStretchBltMode(dc, g_smooth ? HALFTONE : COLORONCOLOR);
 	SetBrushOrgEx(dc, 0, 0, NULL);
 }
@@ -194,7 +199,8 @@ static LRESULT CALLBACK child_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			if (!(pos->flags & SWP_NOSIZE)) { g_children[i].cx = pos->cx; g_children[i].cy = pos->cy; }
 		}
 		if (scaled()) {
-			if (!(pos->flags & SWP_NOMOVE)) { pos->x = to_view_x(pos->x); pos->y = to_view_y(pos->y); }
+			int shift = GetParent(hwnd) == g_view ? g_offsetX : 0;
+			if (!(pos->flags & SWP_NOMOVE)) { pos->x = to_view_x(pos->x + shift); pos->y = to_view_y(pos->y); }
 			if (!(pos->flags & SWP_NOSIZE)) { pos->cx = to_view_x(pos->cx); pos->cy = to_view_y(pos->cy); }
 		}
 	}
@@ -305,6 +311,7 @@ static void adopt_popup(HWND hwnd)
 static BOOL g_knownBuild, g_dumpViews;
 static void widen_globals(void);
 static int g_wideSteps = 7;
+static int g_traceBudget; // diagnostic: number of paint calls still to be logged
 static BOOL g_wideMap; // tile cache relocated, so the map view itself may be widened
 
 static BOOL readable(const void *p, size_t n) { return p && !IsBadReadPtr(p, n); }
@@ -508,6 +515,20 @@ static void widen_map_screen(BYTE *picture)
 			VIEW_INT(ocean, V_X) += extra;
 			update_coordinates(ocean);
 		}
+		// Top status bar: the date stays at the left, the treasury moves right in proportion to
+		// the longer bar, and the message text in the middle stays centred over the map.
+		BYTE *status = child_view(picture, ID4('t', 'b', 'r', '1'));
+		BYTE *treasury = status ? child_view(status, ID4('t', 'r', 'e', 'a')) : NULL;
+		if (treasury) {
+			VIEW_INT(status, V_W) += extra / 2; // or the treasury would fall outside its parent
+			VIEW_INT(treasury, V_X) += extra * 3 / 8;
+			update_coordinates(treasury);
+		}
+		BYTE *message = child_view(picture, ID4('c', 'u', 'r', 's'));
+		if (message) {
+			VIEW_INT(message, V_X) += extra / 2;
+			update_coordinates(message);
+		}
 		// The bottom toolbar's buttons are painted into the background's ribbon; both move half
 		// the extra width so they stay centred under the map.
 		BYTE *toolbar = child_view(picture, ID4('t', 'o', 'p', 'B'));
@@ -542,32 +563,79 @@ static void widen_map_screen(BYTE *picture)
 	logf_("map screen widened by %d (steps %d)", extra, g_wideSteps);
 }
 
-static void watch_map_screen(void)
+// Every screen is a child of the 'base' view inside the game window's view tree:
+//   TGameWindow 'WIND' > TIncludeView 'Incl' > TView 'base' > one picture per screen.
+// The game window hangs off the object at 0x0075a60c.
+static BYTE *screens_container(void)
 {
-	static const BYTE *last;
-	BYTE **app = (BYTE **)0x00759888;
-	if (!g_knownBuild || !readable(*app, 0x4c)) return;
-	BYTE *picture = *(BYTE **)(*app + 0x48);
-	if (!picture || picture == last || !readable(picture, 0x54)) return;
-	// Wait until the screen is fully built: the map view is one of the last things attached.
-	if (!child_view(picture, ID4('D', 'L', 'O', 'G'))) return;
-	last = picture;
-
-	if (g_gameW > BASE_W) widen_map_screen(picture);
-	if (g_dumpViews) {
-		const BYTE *root = picture;
-		for (int i = 0; i < 16 && readable(*(const BYTE **)(root + V_PARENT), 0x54); i++) root = *(const BYTE **)(root + V_PARENT);
-		int budget = 600;
-		logf_("--- view tree (map picture %p) ---", (void *)picture);
-		dump_view(root, 0, &budget);
-		logf_("--- end of view tree ---");
-	}
+	BYTE **holder = (BYTE **)0x0075a60c;
+	if (!g_knownBuild || !readable(*holder, 8)) return NULL;
+	BYTE *root = *(BYTE **)(*holder + 4);
+	if (!readable(root, 0x54)) return NULL;
+	BYTE *include = child_view(root, ID4('I', 'n', 'c', 'l'));
+	// The containers are left at 800 wide here; widen_map_screen widens them when the map needs it.
+	return include ? child_view(include, ID4('b', 'a', 's', 'e')) : NULL;
 }
 
+static BOOL is_map_screen(const BYTE *screen) { return strcmp(view_class(screen), "TMapUberPicture") == 0; }
+
+
+// Called before each paint and from a timer. The map screen is widened when it is built; every
+// other screen was designed for 800 and is presented centred instead (see g_offsetX).
+static void watch_screens(void)
+{
+	static BYTE *handled[32];
+	static int handledCount;
+	if (g_gameW <= BASE_W && !g_dumpViews) return;
+	BYTE *base = screens_container();
+	if (!base) return;
+
+	BYTE *current[32], *top = NULL;
+	int count = 0;
+	BYTE *list = *(BYTE **)(base + V_SUBVIEWS);
+	if (readable(list, 8)) {
+		for (void **node = *(void ***)(list + 4); readable(node, 12) && count < 32; node = (void **)node[0]) {
+			BYTE *screen = (BYTE *)node[2];
+			if (!readable(screen, 0x54)) continue;
+			top = screen;
+
+			BOOL seen = FALSE;
+			for (int i = 0; i < handledCount; i++) seen |= handled[i] == screen;
+			if (!seen) {
+				BOOL map = is_map_screen(screen);
+				// The map view is one of the last things attached; wait until the screen is built.
+				if (map && !child_view(screen, ID4('D', 'L', 'O', 'G'))) continue;
+
+				if (g_gameW > BASE_W) {
+					if (map) widen_map_screen(screen);
+				}
+				if (g_dumpViews) g_traceBudget = 60;
+				DWORD id = (DWORD)VIEW_INT(screen, V_ID);
+				logf_("screen %s '%c%c%c%c' at %d,%d size %dx%d", view_class(screen), (char)(id >> 24),
+					(char)(id >> 16), (char)(id >> 8), (char)id, VIEW_INT(screen, V_X), VIEW_INT(screen, V_Y),
+					VIEW_INT(screen, V_W), VIEW_INT(screen, V_H));
+				if (g_dumpViews) {
+					int budget = 400;
+					dump_view(screen, 1, &budget);
+				}
+			}
+			current[count++] = screen;
+		}
+	}
+	memcpy(handled, current, sizeof(BYTE *) * count);
+	handledCount = count;
+	// Whatever is on top decides how the frame is presented.
+	int offset = g_gameW > BASE_W && top && !is_map_screen(top) ? (g_gameW - BASE_W) / 2 : 0;
+	if (offset != g_offsetX) {
+		g_offsetX = offset;
+		relayout_children();
+		InvalidateRect(g_view, NULL, FALSE);
+	}
+}
 static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	if (msg == WM_TIMER && wp == VIEW_DUMP_TIMER) {
-		watch_map_screen();
+		watch_screens();
 		return 0;
 	}
 	switch (msg) {
@@ -600,7 +668,12 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	}
 	default:
 		if (msg >= WM_MOUSEFIRST && msg <= WM_MBUTTONDBLCLK && scaled()) {
-			lp = MAKELPARAM(to_game_x((short)LOWORD(lp)), to_game_y((short)HIWORD(lp)));
+			int rawX = (short)LOWORD(lp), rawY = (short)HIWORD(lp);
+			lp = MAKELPARAM(to_game_x(rawX) - g_offsetX, to_game_y(rawY));
+			if (g_dumpViews && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP)) {
+				logf_("%s at view %d,%d -> game %d,%d (offset %d)", msg == WM_LBUTTONDOWN ? "press" : "release",
+					rawX, rawY, (short)LOWORD(lp), (short)HIWORD(lp), g_offsetX);
+			}
 		}
 		break;
 	}
@@ -667,16 +740,40 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 	return hwnd;
 }
 
+// With a centred screen the drawing origin is shifted, so a repaint rectangle that reaches into
+// the black margins comes out with coordinates below 0 or past 800. The game skips redrawing
+// for such rectangles, so hand it only the part that lies on the screen itself.
+static void clamp_to_screen(RECT *r)
+{
+	if (!g_offsetX) return;
+	RECT screen = { 0, 0, BASE_W, GAME_H }, out;
+	if (IntersectRect(&out, r, &screen)) *r = out;
+	else SetRectEmpty(r);
+}
+
+static int (WINAPI *o_GetClipBox)(HDC, RECT *);
+
+static int WINAPI h_GetClipBox(HDC dc, RECT *r)
+{
+	int kind = o_GetClipBox(dc, r);
+	if (kind != ERROR && r && g_offsetX && scaled() && WindowFromDC(dc) == g_view) clamp_to_screen(r);
+	return kind;
+}
+
 static HDC WINAPI h_BeginPaint(HWND hwnd, PAINTSTRUCT *ps)
 {
 	// Re-lay out a freshly built map screen before its first paint, so it never shows at the
 	// old width. (The timer is only a fallback.)
-	if (hwnd == g_view && (g_gameW > BASE_W || g_dumpViews)) watch_map_screen();
+	if (hwnd == g_view) watch_screens();
 	HDC dc = o_BeginPaint(hwnd, ps);
 	if (dc && is_game_window(hwnd) && scaled()) {
-		map_dc(dc);
+		map_dc(dc, hwnd);
 		DPtoLP(dc, (POINT *)&ps->rcPaint, 2);
 		InflateRect(&ps->rcPaint, 1, 1);
+		if (hwnd == g_view) clamp_to_screen(&ps->rcPaint);
+		if (g_traceBudget > 0 && hwnd == g_view) {
+			logf_("  paint rect %ld,%ld-%ld,%ld", ps->rcPaint.left, ps->rcPaint.top, ps->rcPaint.right, ps->rcPaint.bottom);
+		}
 	}
 	return dc;
 }
@@ -684,7 +781,7 @@ static HDC WINAPI h_BeginPaint(HWND hwnd, PAINTSTRUCT *ps)
 static HDC WINAPI h_GetDC(HWND hwnd)
 {
 	HDC dc = o_GetDC(hwnd);
-	if (dc && is_game_window(hwnd) && scaled()) map_dc(dc);
+	if (dc && is_game_window(hwnd) && scaled()) map_dc(dc, hwnd);
 	return dc;
 }
 
@@ -702,34 +799,59 @@ static BOOL WINAPI h_GetClientRect(HWND hwnd, RECT *r)
 static BOOL WINAPI h_ScreenToClient(HWND hwnd, POINT *p)
 {
 	BOOL ok = o_ScreenToClient(hwnd, p);
-	if (ok && is_game_window(hwnd) && scaled()) { p->x = to_game_x(p->x); p->y = to_game_y(p->y); }
+	if (ok && is_game_window(hwnd) && scaled()) {
+		p->x = to_game_x(p->x) - (hwnd == g_view ? g_offsetX : 0);
+		p->y = to_game_y(p->y);
+	}
 	return ok;
 }
 
 static BOOL WINAPI h_ClientToScreen(HWND hwnd, POINT *p)
 {
-	if (p && is_game_window(hwnd) && scaled()) { p->x = to_view_x(p->x); p->y = to_view_y(p->y); }
+	if (p && is_game_window(hwnd) && scaled()) {
+		p->x = to_view_x(p->x + (hwnd == g_view ? g_offsetX : 0));
+		p->y = to_view_y(p->y);
+	}
 	return o_ClientToScreen(hwnd, p);
 }
 
 static BOOL WINAPI h_InvalidateRect(HWND hwnd, const RECT *r, BOOL erase)
 {
 	RECT v;
-	if (r && is_game_window(hwnd) && scaled()) { v = *r; rect_to_view(&v); r = &v; }
+	if (g_traceBudget > 0 && hwnd == g_view) {
+		if (r) logf_("  invalidate %ld,%ld-%ld,%ld", r->left, r->top, r->right, r->bottom);
+		else logf_("  invalidate all");
+	}
+	if (r && is_game_window(hwnd) && scaled()) {
+		v = *r;
+		if (hwnd == g_view) OffsetRect(&v, g_offsetX, 0);
+		rect_to_view(&v);
+		r = &v;
+	}
 	return o_InvalidateRect(hwnd, r, erase);
 }
 
 static BOOL WINAPI h_ValidateRect(HWND hwnd, const RECT *r)
 {
 	RECT v;
-	if (r && is_game_window(hwnd) && scaled()) { v = *r; rect_to_view(&v); r = &v; }
+	if (r && is_game_window(hwnd) && scaled()) {
+		v = *r;
+		if (hwnd == g_view) OffsetRect(&v, g_offsetX, 0);
+		rect_to_view(&v);
+		r = &v;
+	}
 	return o_ValidateRect(hwnd, r);
 }
 
 static BOOL WINAPI h_RedrawWindow(HWND hwnd, const RECT *r, HRGN rgn, UINT flags)
 {
 	RECT v;
-	if (r && is_game_window(hwnd) && scaled()) { v = *r; rect_to_view(&v); r = &v; }
+	if (r && is_game_window(hwnd) && scaled()) {
+		v = *r;
+		if (hwnd == g_view) OffsetRect(&v, g_offsetX, 0);
+		rect_to_view(&v);
+		r = &v;
+	}
 	return o_RedrawWindow(hwnd, r, rgn, flags);
 }
 
@@ -747,8 +869,12 @@ static void ensure_mapped(HDC dc)
 {
 	if (!scaled() || !is_game_window(WindowFromDC(dc))) return;
 	SIZE ext;
-	if (GetMapMode(dc) == MM_ANISOTROPIC && GetViewportExtEx(dc, &ext) && ext.cx == g_viewW && ext.cy == g_viewH) return;
-	map_dc(dc);
+	POINT org;
+	HWND hwnd = WindowFromDC(dc);
+	int wantX = hwnd == g_view ? MulDiv(g_offsetX, g_viewW, GAME_W) : 0;
+	if (GetMapMode(dc) == MM_ANISOTROPIC && GetViewportExtEx(dc, &ext) && ext.cx == g_viewW && ext.cy == g_viewH &&
+		GetViewportOrgEx(dc, &org) && org.x == wantX) return;
+	map_dc(dc, hwnd);
 }
 
 static BOOL (WINAPI *o_StretchBlt)(HDC, int, int, int, int, HDC, int, int, int, int, DWORD);
@@ -764,12 +890,23 @@ static int WINAPI h_StretchDIBits(HDC dst, int x, int y, int w, int h, int sx, i
 	const void *bits, const BITMAPINFO *info, UINT usage, DWORD rop)
 {
 	ensure_mapped(dst);
+	if (g_traceBudget > 0 && WindowFromDC(dst) == g_view) {
+		g_traceBudget--;
+		logf_("  dib to view %d,%d %dx%d from %d,%d %dx%d", x, y, w, h, sx, sy, sw, sh);
+	}
 	return o_StretchDIBits(dst, x, y, w, h, sx, sy, sw, sh, bits, info, usage, rop);
 }
 
 static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
 	ensure_mapped(dst);
+	if (g_traceBudget > 0 && WindowFromDC(dst) == g_view) {
+		g_traceBudget--;
+		BITMAP bm = { 0 };
+		HGDIOBJ obj = src ? GetCurrentObject(src, OBJ_BITMAP) : NULL;
+		if (obj) GetObjectA(obj, sizeof bm, &bm);
+		logf_("  blit to view %d,%d %dx%d from %d,%d of %ldx%ld bitmap", x, y, w, h, sx, sy, bm.bmWidth, bm.bmHeight);
+	}
 
 	// Reading the screen back (the blinking unit does this to composite its sprite over what is
 	// already there): the enlarged view has to be shrunk into the game's small bitmap. GDI's
@@ -786,8 +923,17 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 	// instead, so every partial update lands on the same pixel grid as a full one.
 	if (scaled() && src && x == sx && y == sy && WindowFromDC(dst) == g_view && holds_game_frame(src)) {
 		int saved = SaveDC(dst);
-		IntersectClipRect(dst, x - 1, y - 1, x + w + 1, y + h + 1);
-		BOOL ok = StretchBlt(dst, 0, 0, GAME_W, GAME_H, src, 0, 0, GAME_W, GAME_H, rop);
+		// (Widened by the margin so the black bars are repainted along with the screen's edge.)
+		IntersectClipRect(dst, x - 1 - g_offsetX, y - 1, x + w + 1 + g_offsetX, y + h + 1);
+		// A centred screen only owns the left 800 columns of the frame buffer; the rest still
+		// holds whatever the map screen left there, so it is not shown and the margins are black.
+		int width = g_offsetX ? BASE_W : GAME_W;
+		BOOL ok = StretchBlt(dst, 0, 0, width, GAME_H, src, 0, 0, width, GAME_H, rop);
+		if (g_offsetX) {
+			RECT left = { -g_offsetX, 0, 0, GAME_H }, right = { BASE_W, 0, GAME_W - g_offsetX, GAME_H };
+			FillRect(dst, &left, (HBRUSH)GetStockObject(BLACK_BRUSH));
+			FillRect(dst, &right, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		}
 		RestoreDC(dst, saved);
 		return ok;
 	}
@@ -1134,6 +1280,7 @@ static void install(HMODULE self)
 	HOOK("USER32.dll", RedrawWindow);
 	HOOK("USER32.dll", SetCursor);
 	HOOK("GDI32.dll", StretchBlt);
+	HOOK("GDI32.dll", GetClipBox);
 	HOOK("GDI32.dll", StretchDIBits);
 	BOOL native = skip_mode_switch();
 	// Four extra 64-pixel map columns: 1056x600, close to 16:9.

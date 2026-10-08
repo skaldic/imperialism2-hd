@@ -12,8 +12,10 @@ $ini = "$game\imp2hd.ini"
 $saved = if (Test-Path -LiteralPath $ini) { [IO.File]::ReadAllText($ini) } else { $null }
 Set-Content -LiteralPath $ini -Value "[Display]`r`nWide=1`r`n[Debug]`r`nDumpViews=1`r`nWideSteps=$Steps" -Encoding ascii
 try {
-    $script = @('wait:6', 'click:5,5', 'wait:2', 'click:5,5', 'wait:4', 'click:150,450', 'wait:4',
-        'click:643,475', 'wait:2', 'click:400,72', 'wait:9', "shot:$Shot") + $Then + @('wait:1')
+    # Menu screens are 800 wide and centred in the 1056-wide frame, so their click points are
+    # 128 further right than in the 800x600 layout.
+    $script = @('wait:6', 'click:133,5', 'wait:2', 'click:133,5', 'wait:4', 'shot:wide_menu', 'click:278,450', 'wait:4',
+        'shot:wide_load', 'click:771,475', 'wait:2', 'click:528,72', 'wait:9', "shot:$Shot") + $Then + @('wait:1')
     & "$PSScriptRoot\drive.ps1" -GameW 1056 @script
 }
 finally {
