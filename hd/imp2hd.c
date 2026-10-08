@@ -246,7 +246,8 @@ static void popup_rect_to_frame(int *x, int *y, int *cx, int *cy)
 {
 	RECT v;
 	view_placement(&v);
-	if (x) *x = v.left + to_view_x(*x - v.left);
+	// The game centres pop-ups for an 800-wide layout; shift them by half the extra width.
+	if (x) *x = v.left + to_view_x(*x - v.left + (g_gameW - BASE_W) / 2);
 	if (y) *y = v.top + to_view_y(*y - v.top);
 	if (cx) *cx = to_view_x(*cx);
 	if (cy) *cy = to_view_y(*cy);
@@ -380,8 +381,15 @@ static void update_coordinates(BYTE *view)
 #define MAP_HOLE_Y 58
 #define MAP_HOLE_W 576
 #define MAP_HOLE_H 512
+// The toolbar ribbon painted into the bottom border, tails included.
+#define RIBBON_LEFT 112
+#define RIBBON_RIGHT 488
 
 static void *g_backgroundVtable[0x101];
+
+// One horizontal run of the widened background: destination columns [dstStart, dstEnd) come from
+// the picture starting at srcStart. With tile > 0 the source is a strip that wide, repeated.
+typedef struct { int dstStart, dstEnd, srcStart, tile; } BgSpan;
 
 static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int *area)
 {
@@ -392,6 +400,21 @@ static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int
 	if (!src || !dst) return;
 
 	int extra = g_gameW - BASE_W;
+	// Top border and side columns: everything from BG_SPLIT on moves right with the panel.
+	const BgSpan upper[] = {
+		{ 0, BG_SPLIT, 0, 0 },
+		{ BG_SPLIT, BG_SPLIT + extra, BG_SLICE, BG_SLICE_W },
+		{ BG_SPLIT + extra, g_gameW, BG_SPLIT, 0 },
+	};
+	// Bottom border: the toolbar ribbon is moved half the extra width so it stays centred under
+	// the map, with plain border either side of it.
+	const BgSpan lower[] = {
+		{ 0, RIBBON_LEFT, 0, 0 },
+		{ RIBBON_LEFT, RIBBON_LEFT + extra / 2, RIBBON_RIGHT, BG_SPLIT - RIBBON_RIGHT },
+		{ RIBBON_LEFT + extra / 2, RIBBON_RIGHT + extra / 2, RIBBON_LEFT, 0 },
+		{ RIBBON_RIGHT + extra / 2, BG_SPLIT + extra, RIBBON_RIGHT, BG_SPLIT - RIBBON_RIGHT },
+		{ BG_SPLIT + extra, g_gameW, BG_SPLIT, 0 },
+	};
 
 	// The map's rectangle is never painted: the game does not redraw the map after the
 	// background, it relies on the background leaving that area alone.
@@ -401,35 +424,34 @@ static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int
 	for (int band = 0; band < 3; band++) {
 		int top = max(area[1], bands[band][0]), bottom = min(area[3], bands[band][1]);
 		if (bottom <= top) continue;
+		const BgSpan *spans = band == 2 ? lower : upper;
+		int count = band == 2 ? (int)(sizeof lower / sizeof lower[0]) : (int)(sizeof upper / sizeof upper[0]);
 
-		for (int dx = 0; dx < g_gameW;) {
-			int sx, w;
-			if (dx < BG_SPLIT) { sx = dx; w = BG_SPLIT - dx; }
-			else if (dx < BG_SPLIT + extra) {
-				int into = (dx - BG_SPLIT) % BG_SLICE_W;
-				sx = BG_SLICE + into;
-				w = min(BG_SLICE_W - into, BG_SPLIT + extra - dx);
-			}
-			else { sx = dx - extra; w = g_gameW - dx; }
+		for (int i = 0; i < count; i++) {
+			for (int dx = spans[i].dstStart; dx < spans[i].dstEnd;) {
+				// One straight copy, or one repeat of the tile.
+				int into = spans[i].tile ? (dx - spans[i].dstStart) % spans[i].tile : dx - spans[i].dstStart;
+				int w = spans[i].tile ? min(spans[i].tile - into, spans[i].dstEnd - dx) : spans[i].dstEnd - dx;
+				int sx = spans[i].srcStart + into;
 
-			// Up to two pieces of this run survive: left of the hole and right of it.
-			for (int side = 0; side < 2; side++) {
-				int left = max(dx, area[0]), right = min(dx + w, area[2]);
-				if (band == 1) {
-					if (side == 0) right = min(right, holeLeft);
-					else left = max(left, holeRight);
-				} else if (side == 1) {
-					break;
+				// Up to two pieces of this run survive: left of the hole and right of it.
+				for (int side = 0; side < 2; side++) {
+					int left = max(dx, area[0]), right = min(dx + w, area[2]);
+					if (band == 1) {
+						if (side == 0) right = min(right, holeLeft);
+						else left = max(left, holeRight);
+					} else if (side == 1) {
+						break;
+					}
+					if (right > left) {
+						((CopyPixels)0x00487790)(src, dst, sx + (left - dx), top, right - left, bottom - top, left, top, 0xffffffff);
+					}
 				}
-				if (right > left) {
-					((CopyPixels)0x00487790)(src, dst, sx + (left - dx), top, right - left, bottom - top, left, top, 0xffffffff);
-				}
+				dx += w;
 			}
-			dx += w;
 		}
 	}
 }
-
 // Gives this one picture object its own copy of its class's virtual table with Draw replaced.
 static BOOL hook_background_draw(BYTE *picture)
 {
@@ -480,12 +502,19 @@ static void widen_map_screen(BYTE *picture)
 		// On a wider screen that is visible, and the idle sea map draws its blank contents over
 		// the panel and into the buffer it shares with the land map. Park it further out.
 		BYTE *ocean = child_view(picture, ID4('D', 'O', 'O', 'G'));
+		logf_("parking point for hidden map views: %d,%d", *(int *)0x007608f8, *(int *)0x007608fc);
+		if (ocean && (g_wideSteps & 16)) VIEW_INT(ocean, V_W) += extra; // experiment: widen the zoomed-out map
 		if (ocean && VIEW_INT(ocean, V_X) >= BASE_W) {
 			VIEW_INT(ocean, V_X) += extra;
 			update_coordinates(ocean);
 		}
-		// The bottom toolbar ('topB') stays put: its buttons are painted into the background's
-		// ribbon, which is left of the split and does not move.
+		// The bottom toolbar's buttons are painted into the background's ribbon; both move half
+		// the extra width so they stay centred under the map.
+		BYTE *toolbar = child_view(picture, ID4('t', 'o', 'p', 'B'));
+		if (toolbar) {
+			VIEW_INT(toolbar, V_X) += extra / 2;
+			update_coordinates(toolbar);
+		}
 	}
 	if ((g_wideSteps & 4) && g_wideMap) {
 		VIEW_INT(map, V_W) += extra;
@@ -640,6 +669,9 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 
 static HDC WINAPI h_BeginPaint(HWND hwnd, PAINTSTRUCT *ps)
 {
+	// Re-lay out a freshly built map screen before its first paint, so it never shows at the
+	// old width. (The timer is only a fallback.)
+	if (hwnd == g_view && (g_gameW > BASE_W || g_dumpViews)) watch_map_screen();
 	HDC dc = o_BeginPaint(hwnd, ps);
 	if (dc && is_game_window(hwnd) && scaled()) {
 		map_dc(dc);
