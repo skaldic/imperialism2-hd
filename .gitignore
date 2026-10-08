@@ -1,0 +1,10 @@
+# Everything derived from the game itself stays local: the scripts regenerate it from your own copy.
+/src/
+/probe/
+/ghidra_proj/
+/*.csv
+/*.log
+
+# Build output and test captures
+/hd/ddraw.dll
+/hd/shots/
