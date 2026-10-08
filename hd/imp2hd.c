@@ -1339,13 +1339,17 @@ static void trace_picture_copies(void)
 // Pictures are matched to their upscaled files by content: the pixel data in memory is the same
 // as in the .rsrc archive it was loaded from, so a hash of a few slices identifies it.
 
-typedef struct { DWORD hash; int w, h, id; char archive[24]; } HdIndexEntry;
-typedef struct { DWORD hash; int w, h; DWORD *pixels; } HdImage; // pixels NULL: known to be missing
+// "tight" is a second hash, of the whole picture row by row without padding. The game assembles
+// some small 8-bit pictures into sprite sheets, and a cell copied out of a sheet is recognised
+// by hashing just that cell the same way. Zero when not computed.
+typedef struct { DWORD hash, tight; int w, h, bpp, id; char archive[24]; BYTE *data8; } HdIndexEntry;
+typedef struct { DWORD hash; int w, h, bpp; DWORD *pixels; } HdImage; // pixels NULL: known to be missing
 
 static char g_hdAssets[MAX_PATH], g_gameDir[MAX_PATH];
 static HdIndexEntry *g_hdIndex;
 static int g_hdIndexCount;
 static HdImage g_hdImages[512];
+static int g_hdMissLog = 40; // diagnostic: unmatched pictures still to be reported
 static int g_hdImageCount;
 static size_t g_hdBytes;
 
@@ -1389,7 +1393,25 @@ static DWORD picture_hash(const BYTE *pixels, size_t size, int w, int h)
 	return hash;
 }
 
-static size_t pixel_bytes_16(int w, int h) { return (size_t)((w + 1) & ~1) * 2 * h; }
+#define HD_CELL_MAX 160 // largest picture considered as a sprite-sheet cell
+
+// Hash of a w-by-h region of an 8-bit picture, rows taken top to bottom.
+static DWORD tight_hash(const BYTE *bits, int pictureW, int pictureH, BOOL bottomUp, int x, int y, int w, int h)
+{
+	int stride = (pictureW + 3) & ~3;
+	DWORD hash = fnv(2166136261u, (const BYTE *)&w, sizeof w);
+	hash = fnv(hash, (const BYTE *)&h, sizeof h);
+	for (int row = 0; row < h; row++) {
+		hash = fnv(hash, bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x, (size_t)w);
+	}
+	return hash ? hash : 1;
+}
+
+// Size of a picture's pixel data: rows are padded to 4 bytes.
+static size_t pixel_bytes(int w, int h, int bpp)
+{
+	return bpp == 16 ? (size_t)((w + 1) & ~1) * 2 * h : (size_t)((w + 3) & ~3) * h;
+}
 
 static void hd_index_archive(const char *path, const char *name)
 {
@@ -1407,10 +1429,11 @@ static void hd_index_archive(const char *path, const char *name)
 				if (type != 0x50494354) continue; // 'PICT'
 				SetFilePointer(f, offset, NULL, FILE_BEGIN);
 				if (!ReadFile(f, &bih, sizeof bih, &got, NULL) || got != sizeof bih) continue;
-				if (bih.biSize != 40 || bih.biBitCount != 16 || bih.biCompression != BI_RGB) continue;
+				if (bih.biSize != 40 || (bih.biBitCount != 16 && bih.biBitCount != 8) || bih.biCompression != BI_RGB) continue;
 				int w = bih.biWidth, h = abs(bih.biHeight);
-				size_t size = pixel_bytes_16(w, h), n = size < HD_SLICE ? size : HD_SLICE;
-				DWORD base = offset + 40 + bih.biClrUsed * 4;
+				size_t size = pixel_bytes(w, h, bih.biBitCount), n = size < HD_SLICE ? size : HD_SLICE;
+				DWORD colours = bih.biClrUsed ? bih.biClrUsed : (bih.biBitCount == 8 ? 256 : 0);
+				DWORD base = offset + 40 + colours * 4;
 				DWORD hash = fnv(2166136261u, (const BYTE *)&w, sizeof w);
 				hash = fnv(hash, (const BYTE *)&h, sizeof h);
 				SetFilePointer(f, base, NULL, FILE_BEGIN);
@@ -1425,7 +1448,21 @@ static void hd_index_archive(const char *path, const char *name)
 					hash = fnv(hash, buf, n);
 				}
 				HdIndexEntry *e = &g_hdIndex[g_hdIndexCount++];
-				e->hash = hash; e->w = w; e->h = h; e->id = (int)id;
+				e->hash = hash; e->w = w; e->h = h; e->bpp = bih.biBitCount; e->id = (int)id;
+				e->tight = 0;
+				e->data8 = NULL;
+				if (bih.biBitCount == 8) {
+					// Keep the pixels, unpadded and top-down, for matching by similarity.
+					BYTE *whole = malloc(size);
+					SetFilePointer(f, base, NULL, FILE_BEGIN);
+					if (whole && ReadFile(f, whole, (DWORD)size, &got, NULL) && got == size && (e->data8 = malloc((size_t)w * h))) {
+						int rowBytes = (w + 3) & ~3;
+						for (int y = 0; y < h; y++) {
+							memcpy(e->data8 + (size_t)y * w, whole + (size_t)(bih.biHeight > 0 ? h - 1 - y : y) * rowBytes, (size_t)w);
+						}
+					}
+					free(whole);
+				}
 				lstrcpynA(e->archive, name, sizeof e->archive);
 				if (g_hdIndexCount >= 4096) break;
 			}
@@ -1453,7 +1490,7 @@ static void hd_build_index(void)
 		if (g_hdIndexCount < 4096) hd_index_archive(path, name);
 	} while (FindNextFileA(find, &fd));
 	FindClose(find);
-	logf_("HD: indexed %d full-colour pictures", g_hdIndexCount);
+	logf_("HD: indexed %d pictures", g_hdIndexCount);
 }
 
 static DWORD *hd_load_png(const char *path, int w2, int h2)
@@ -1484,14 +1521,14 @@ static DWORD *hd_load_png(const char *path, int w2, int h2)
 	return pixels;
 }
 
-// The upscaled picture for a 16-bit picture in memory, or NULL.
-static const HdImage *hd_find(const BYTE *bits, int w, int h)
+// The upscaled picture for a picture in memory, or NULL.
+static const HdImage *hd_find(const BYTE *bits, int w, int h, int bpp)
 {
-	size_t size = pixel_bytes_16(w, h);
+	size_t size = pixel_bytes(w, h, bpp);
 	if (!readable(bits, size)) return NULL;
 	DWORD hash = picture_hash(bits, size, w, h);
 	for (int i = 0; i < g_hdImageCount; i++) {
-		if (g_hdImages[i].hash == hash && g_hdImages[i].w == w && g_hdImages[i].h == h) {
+		if (g_hdImages[i].hash == hash && g_hdImages[i].w == w && g_hdImages[i].h == h && g_hdImages[i].bpp == bpp) {
 			return g_hdImages[i].pixels ? &g_hdImages[i] : NULL;
 		}
 	}
@@ -1502,14 +1539,66 @@ static const HdImage *hd_find(const BYTE *bits, int w, int h)
 		memset(g_hdState, 0, (size_t)g_hdW * GAME_H); // blocks referring to freed art are simply redrawn
 	}
 	HdImage *img = &g_hdImages[g_hdImageCount++];
-	img->hash = hash; img->w = w; img->h = h; img->pixels = NULL;
+	img->hash = hash; img->w = w; img->h = h; img->bpp = bpp; img->pixels = NULL;
+	BOOL indexed = FALSE;
 	for (int i = 0; i < g_hdIndexCount; i++) {
-		if (g_hdIndex[i].hash != hash || g_hdIndex[i].w != w || g_hdIndex[i].h != h) continue;
+		if (g_hdIndex[i].hash != hash || g_hdIndex[i].w != w || g_hdIndex[i].h != h || g_hdIndex[i].bpp != bpp) continue;
+		indexed = TRUE;
 		char path[MAX_PATH];
 		snprintf(path, sizeof path, "%s\\%s\\%d.png", g_hdAssets, g_hdIndex[i].archive, g_hdIndex[i].id);
 		img->pixels = hd_load_png(path, w * 2, h * 2);
 		if (img->pixels) g_hdBytes += (size_t)w * h * 16;
-		logf_("HD: %s\\%d %dx%d %s", g_hdIndex[i].archive, g_hdIndex[i].id, w, h, img->pixels ? "loaded" : "NOT FOUND on disk");
+		logf_("HD: %s\\%d %dx%d %dbpp %s", g_hdIndex[i].archive, g_hdIndex[i].id, w, h, bpp, img->pixels ? "loaded" : "NOT FOUND on disk");
+		break;
+	}
+	if (!indexed && g_hdMissLog > 0) {
+		g_hdMissLog--;
+		logf_("HD: no archive picture matches a %dx%d %dbpp picture in memory", w, h, bpp);
+	}
+	return img->pixels ? img : NULL;
+}
+
+// The upscaled picture for one cell of an 8-bit sprite sheet in memory, or NULL.
+static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH, BOOL bottomUp, int x, int y, int w, int h)
+{
+	if (!readable(bits, pixel_bytes(pictureW, pictureH, 8))) return NULL;
+	// The game remaps some palette indices when it loads 8-bit pictures, so the bytes in memory
+	// are close to the archive's but not identical. The region is matched by similarity: among
+	// archive pictures of the same size, the one agreeing on the most sampled pixels wins.
+	int rowStep = max(1, h / 48), stride = (pictureW + 3) & ~3;
+	DWORD hash = fnv(2166136261u, (const BYTE *)&w, sizeof w);
+	for (int row = 0; row < h; row += rowStep) {
+		hash = fnv(hash, bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x, (size_t)w);
+	}
+	for (int i = 0; i < g_hdImageCount; i++) {
+		if (g_hdImages[i].hash == hash && g_hdImages[i].w == w && g_hdImages[i].h == h && g_hdImages[i].bpp == -8) {
+			return g_hdImages[i].pixels ? &g_hdImages[i] : NULL;
+		}
+	}
+	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0])) return NULL;
+	HdImage *img = &g_hdImages[g_hdImageCount++];
+	img->hash = hash; img->w = w; img->h = h; img->bpp = -8; img->pixels = NULL; // -8: matched as a cell
+	int best = -1, bestSame = 0, sampled = 0;
+	for (int i = 0; i < g_hdIndexCount; i++) {
+		if (g_hdIndex[i].bpp != 8 || g_hdIndex[i].w != w || g_hdIndex[i].h != h || !g_hdIndex[i].data8) continue;
+		int same = 0;
+		sampled = 0;
+		for (int row = 0; row < h; row += rowStep) {
+			const BYTE *mem = bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x;
+			const BYTE *file = g_hdIndex[i].data8 + (size_t)row * w;
+			for (int col = 0; col < w; col++) same += mem[col] == file[col];
+			sampled += w;
+		}
+		if (same > bestSame) { bestSame = same; best = i; }
+	}
+	for (int i = best; i >= 0 && i == best; i++) {
+		if (bestSame * 100 < sampled * 80) break; // under 80% agreement: not the same picture
+		char path[MAX_PATH];
+		snprintf(path, sizeof path, "%s\\%s\\%d.png", g_hdAssets, g_hdIndex[i].archive, g_hdIndex[i].id);
+		img->pixels = hd_load_png(path, w * 2, h * 2);
+		if (img->pixels) g_hdBytes += (size_t)w * h * 16;
+		logf_("HD: %s\\%d %dx%d 8-bit (%d%% match) %s", g_hdIndex[i].archive, g_hdIndex[i].id, w, h,
+			bestSame * 100 / max(sampled, 1), img->pixels ? "loaded" : "NOT FOUND on disk");
 		break;
 	}
 	return img->pixels ? img : NULL;
@@ -1554,18 +1643,20 @@ static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int s
 {
 	((CopyPixelsFn)0x00487790)(src, dst, sx, sy, w, h, dx, dy, transparent);
 
-	if (transparent != 0xffffffff || !readable(src, 0x14) || !readable(dst, 0x14) || !hd_ready()) return;
+	if (!readable(src, 0x14) || !readable(dst, 0x14) || !hd_ready()) return;
 	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
 	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
-	if (!readable(sh, sizeof *sh) || sh->biBitCount != 16 || !readable(dh, sizeof *dh)) return;
+	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh)) return;
+	// Plain copies of 8- and 16-bit pictures, and 8-bit copies that skip one palette index.
+	BOOL keyed = transparent != 0xffffffff;
+	if ((sh->biBitCount != 16 && sh->biBitCount != 8) || (keyed && sh->biBitCount != 8)) return;
 	// Only copies into a frame-sized 16-bit buffer are of interest.
 	if (dh->biBitCount != 16 || dh->biWidth != g_hdW || abs(dh->biHeight) != GAME_H) return;
 	int pw = sh->biWidth, ph = abs(sh->biHeight), stride = (dh->biWidth + 1) & ~1;
 	BOOL bottomUp = dh->biHeight > 0;
 	const WORD *frame = *(const WORD **)(dst + 0x0c);
-	const HdImage *art = frame ? hd_find(*(const BYTE **)(src + 0x0c), pw, ph) : NULL;
-	if (!art) return;
-	hd_track_frame(frame);
+	const BYTE *srcBits = *(const BYTE **)(src + 0x0c);
+	if (!frame) return;
 
 	// The same clipping the game applies, then to both pictures' bounds.
 	if (dx < 0) { sx -= dx; w += dx; dx = 0; }
@@ -1578,14 +1669,49 @@ static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int s
 	if (h > GAME_H - dy) h = GAME_H - dy;
 	if (w <= 0 || h <= 0) return;
 
+	// The art is either the whole picture upscaled, or (8-bit only) just the cell being copied.
+	const HdImage *art = hd_find(srcBits, pw, ph, sh->biBitCount);
+	int ax = sx, ay = sy, aw = pw;
+	if (!art && sh->biBitCount == 8) {
+		art = hd_find_cell(srcBits, pw, ph, sh->biHeight > 0, sx, sy, w, h);
+		static int samples = 6; // diagnostic: show what an unmatched cell holds
+		if (!art && samples > 0 && w >= 24 && h >= 16) {
+			samples--;
+			const BYTE *r = srcBits + (size_t)(sh->biHeight > 0 ? ph - 1 - (sy + h / 2) : sy + h / 2) * ((pw + 3) & ~3) + sx;
+			char hex[3 * 24 + 1];
+			for (int i = 0; i < 24; i++) sprintf(hex + i * 3, "%02x ", r[i]);
+			logf_("HD: unmatched cell %dx%d at %d,%d of %dx%d, middle row: %s", w, h, sx, sy, pw, ph, hex);
+		}
+		ax = 0; ay = 0; aw = w;
+	}
+	if (!art) return;
+	hd_track_frame(frame);
+
 	for (int y = 0; y < h; y++) {
 		const WORD *row = frame + (size_t)(bottomUp ? GAME_H - 1 - (dy + y) : dy + y) * stride + dx;
 		size_t at = (size_t)(dy + y) * g_hdW + dx;
-		memcpy(g_hdShadow + at, row, (size_t)w * 2);
-		memset(g_hdState + at, 1, (size_t)w);
-		for (int half = 0; half < 2; half++) {
-			memcpy(g_hdFrame + (size_t)((dy + y) * 2 + half) * g_hdW * 2 + dx * 2,
-				art->pixels + (size_t)((sy + y) * 2 + half) * pw * 2 + sx * 2, (size_t)w * 8);
+		if (!keyed) {
+			memcpy(g_hdShadow + at, row, (size_t)w * 2);
+			memset(g_hdState + at, 1, (size_t)w);
+			for (int half = 0; half < 2; half++) {
+				memcpy(g_hdFrame + (size_t)((dy + y) * 2 + half) * g_hdW * 2 + dx * 2,
+					art->pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + ax * 2, (size_t)w * 8);
+			}
+			continue;
+		}
+		// Keyed: the game skipped the pixels holding the key index, and so do we.
+		const BYTE *srcRow = srcBits + (size_t)(sh->biHeight > 0 ? ph - 1 - (sy + y) : sy + y) * ((pw + 3) & ~3) + sx;
+		BYTE key = (BYTE)transparent;
+		for (int x = 0; x < w; x++) {
+			if (srcRow[x] == key) continue;
+			g_hdShadow[at + x] = row[x];
+			g_hdState[at + x] = 1;
+			for (int half = 0; half < 2; half++) {
+				const DWORD *from = art->pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + (ax + x) * 2;
+				DWORD *to = g_hdFrame + (size_t)((dy + y) * 2 + half) * g_hdW * 2 + (dx + x) * 2;
+				to[0] = from[0];
+				to[1] = from[1];
+			}
 		}
 	}
 }
