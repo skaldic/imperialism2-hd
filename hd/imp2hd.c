@@ -1250,6 +1250,11 @@ static BOOL widen_overview_constants(int extra)
 	ok &= patch_imm32(0x005b9533, 108 - 36, 108 - 36 - columns);
 	ok &= patch_imm32(0x0060e3bb, 36, 36 + columns);                      // ZoomOut: minimap rectangle width
 	ok &= patch_imm32(0x0060e686, 36, 36 + columns);                      // minimap set-up, zoomed out
+	ok &= patch_imm32(0x005b95e0, 575, 575 + extra);                      // scroll: area to repaint
+	ok &= patch_imm8(0x005b9492, 36, (BYTE)(36 + columns));               // "is this tile on screen" test
+	ok &= patch_imm8(0x005b96f1, (BYTE)-18, (BYTE)-(18 + columns / 2));   // CenterOn: half the columns
+	ok &= patch_imm8(0x005b97c4, 18, (BYTE)(18 + columns / 2));           // GetCenterTile
+	ok &= patch_imm32(0x0055a8da, 575, 575 + extra);                      // close-up CenterOn: area to repaint
 	return ok;
 }
 
