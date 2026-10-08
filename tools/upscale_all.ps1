@@ -13,7 +13,7 @@ param(
     [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe",
     [string[]]$Only = @(),              # archive names to process; empty means all
     [string[]]$Terrain = @('MapTiles'), # archives whose key-less 64x64 pictures are repeating terrain
-    [double]$Grain = 0.5                # how much of the original's texture to blend back into terrain
+    [double]$Grain = 0.5                # how much of a plain enlargement to blend back in (0 = none)
 )
 
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
@@ -95,10 +95,14 @@ public static class KeyedUpscale
     }
 
     // Reduces the 4x result to 2x and stamps the key colour back.
-    public static void Finish(string upscaled, string dest, bool[] mask, int width, int height)
+    // "prepared" is the picture as it was given to the upscaler; a plain enlargement of it is
+    // blended over the result at "grain" opacity, which keeps dithered textures from being
+    // redrawn as patterns the artist never made.
+    public static void Finish(string upscaled, string prepared, string dest, bool[] mask, int width, int height, double grain)
     {
         int w2 = width * 2, h2 = height * 2;
         using (var big = new Bitmap(upscaled))
+        using (var small = new Bitmap(prepared))
         using (var half = new Bitmap(w2, h2, PixelFormat.Format32bppArgb))
         {
             using (var g = Graphics.FromImage(half))
@@ -109,6 +113,13 @@ public static class KeyedUpscale
                 {
                     attrs.SetWrapMode(WrapMode.TileFlipXY); // no dark fringe at the picture's edges
                     g.DrawImage(big, new Rectangle(0, 0, w2, h2), 0, 0, big.Width, big.Height, GraphicsUnit.Pixel, attrs);
+                    if (grain > 0)
+                    {
+                        var fade = new ColorMatrix();
+                        fade.Matrix33 = (float)grain;
+                        attrs.SetColorMatrix(fade);
+                        g.DrawImage(small, new Rectangle(0, 0, w2, h2), 0, 0, small.Width, small.Height, GraphicsUnit.Pixel, attrs);
+                    }
                 }
             }
             if (mask == null) { Save24(half, dest); return; }
@@ -192,7 +203,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
         if (-not (Test-Path -LiteralPath "$tempOut\$name")) { continue }
         $dest = "$Assets\x2\$($dir.Name)\$name"
         if ($info[$name].Tile) { [KeyedUpscale]::FinishTile("$tempOut\$name", $info[$name].Source, $dest, $Grain); $tiles++ }
-        else { [KeyedUpscale]::Finish("$tempOut\$name", $dest, $info[$name].Mask, $info[$name].W, $info[$name].H) }
+        else { [KeyedUpscale]::Finish("$tempOut\$name", "$tempIn\$name", $dest, $info[$name].Mask, $info[$name].W, $info[$name].H, $Grain) }
         $done++
         if ($null -ne $info[$name].Mask) { $keyed++ }
     }

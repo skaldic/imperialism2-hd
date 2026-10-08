@@ -1348,6 +1348,7 @@ static size_t g_hdBytes;
 static DWORD *g_hdFrame;        // top-down, 2*g_hdW by 2*GAME_H
 static WORD *g_hdShadow;        // the 1x value each pixel had when its 2x block was last written
 static BYTE *g_hdState;         // 0 unknown, 1 block holds HD art, 2 block holds doubled 1x pixel
+static BYTE *g_hdDirty;         // scratch: pixels found changed during the current compose
 static int g_hdW;
 
 // GDI+ flat API, used only to read PNG files.
@@ -1526,7 +1527,8 @@ static BOOL hd_ready(void)
 	ReleaseDC(NULL, screen);
 	g_hdShadow = calloc((size_t)g_gameW * GAME_H, sizeof *g_hdShadow);
 	g_hdState = calloc((size_t)g_gameW * GAME_H, 1);
-	if (!g_hdDC || !bmp || !g_hdShadow || !g_hdState) { g_hdFrame = NULL; return FALSE; }
+	g_hdDirty = calloc((size_t)g_gameW * GAME_H, 1);
+	if (!g_hdDC || !bmp || !g_hdShadow || !g_hdState || !g_hdDirty) { g_hdFrame = NULL; return FALSE; }
 	SelectObject(g_hdDC, bmp);
 	g_hdW = g_gameW;
 	hd_build_index();
@@ -1597,20 +1599,56 @@ static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1)
 	BOOL bottomUp = ds.dsBmih.biHeight > 0;
 	hd_track_frame(frame);
 	x0 = max(x0, 0); y0 = max(y0, 0); x1 = min(x1, g_hdW); y1 = min(y1, GAME_H);
+	if (x1 <= x0 || y1 <= y0) return TRUE;
+#define FRAME_ROW(yy) (frame + (size_t)(bottomUp ? GAME_H - 1 - (yy) : (yy)) * stride)
+
+	// Pass 1: find the pixels the game has changed since their 2x block was written.
 	for (int y = y0; y < y1; y++) {
-		const WORD *row = frame + (size_t)(bottomUp ? GAME_H - 1 - y : y) * stride;
+		const WORD *row = FRAME_ROW(y);
 		size_t at = (size_t)y * g_hdW;
-		DWORD *out = g_hdFrame + (size_t)y * 2 * g_hdW * 2;
 		for (int x = x0; x < x1; x++) {
 			WORD p = row[x];
 			if (g_hdState[at + x] && g_hdShadow[at + x] == p) continue;
 			g_hdState[at + x] = 2;
 			g_hdShadow[at + x] = p;
-			DWORD r = (p >> 10) & 31, g = (p >> 5) & 31, b = p & 31;
-			DWORD c = ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
-			out[x * 2] = out[x * 2 + 1] = out[g_hdW * 2 + x * 2] = out[g_hdW * 2 + x * 2 + 1] = c;
+			g_hdDirty[at + x] = 1;
 		}
 	}
+
+	// Pass 2: redraw the non-HD blocks that changed or touch a change. Each 1x pixel becomes four,
+	// each a 9:3:3:1 mix of it and its three neighbours on that side, which smooths text and
+	// sprites instead of doubling their pixels.
+	int bx0 = max(x0 - 1, 0), by0 = max(y0 - 1, 0), bx1 = min(x1 + 1, g_hdW), by1 = min(y1 + 1, GAME_H);
+	for (int y = by0; y < by1; y++) {
+		const WORD *rows[3] = { FRAME_ROW(max(y - 1, 0)), FRAME_ROW(y), FRAME_ROW(min(y + 1, GAME_H - 1)) };
+		size_t at = (size_t)y * g_hdW;
+		DWORD *out = g_hdFrame + (size_t)y * 2 * g_hdW * 2;
+		for (int x = bx0; x < bx1; x++) {
+			if (g_hdState[at + x] != 2) continue;
+			BOOL touched = FALSE;
+			for (int ny = max(y - 1, 0); ny <= min(y + 1, GAME_H - 1) && !touched; ny++) {
+				for (int nx = max(x - 1, 0); nx <= min(x + 1, g_hdW - 1); nx++) {
+					if (g_hdDirty[(size_t)ny * g_hdW + nx]) { touched = TRUE; break; }
+				}
+			}
+			if (!touched) continue;
+			WORD p = rows[1][x];
+			for (int sub = 0; sub < 4; sub++) {
+				int nx = sub & 1 ? min(x + 1, g_hdW - 1) : max(x - 1, 0);
+				const WORD *other = rows[sub & 2 ? 2 : 0];
+				WORD ph = rows[1][nx], pv = other[x], pd = other[nx];
+				DWORD c = 0;
+				for (int shift = 0; shift <= 10; shift += 5) {
+					DWORD v = 9 * ((p >> shift) & 31) + 3 * ((ph >> shift) & 31) + 3 * ((pv >> shift) & 31) + ((pd >> shift) & 31);
+					v = (v * 255 + 248) / 496; // 0..496 (16 x 31) -> 0..255
+					c |= v << (shift == 0 ? 0 : shift == 5 ? 8 : 16);
+				}
+				out[(sub & 2 ? g_hdW * 2 : 0) + x * 2 + (sub & 1)] = c;
+			}
+		}
+	}
+	for (int y = y0; y < y1; y++) memset(g_hdDirty + (size_t)y * g_hdW + x0, 0, (size_t)(x1 - x0));
+#undef FRAME_ROW
 	return TRUE;
 }
 
