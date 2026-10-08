@@ -13,7 +13,8 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define GAME_W 800
+#define BASE_W 800 // the width every screen was designed for
+#define GAME_W g_gameW
 #define GAME_H 600
 #define VIEW_CHILD_ID 0xE900 // AFX_IDW_PANE_FIRST: the id MFC gives a frame's main view
 
@@ -47,9 +48,10 @@ static void load_real_ddraw(void)
 // ---------------------------------------------------------------------------------------------
 // State
 
+static int g_gameW = BASE_W; // width of the game's frame buffer; wider than BASE_W in wide mode
 static HWND g_frame, g_view;
 static WNDPROC g_frameProc, g_viewProc;
-static int g_viewW = GAME_W, g_viewH = GAME_H; // current size of the view window, in pixels
+static int g_viewW = BASE_W, g_viewH = GAME_H; // current size of the view window, in pixels
 static BOOL g_smooth = TRUE, g_integerScale = FALSE;
 static char g_logPath[MAX_PATH];
 
@@ -735,6 +737,32 @@ static BOOL skip_mode_switch(void)
 	return TRUE;
 }
 
+static BOOL patch_imm32(DWORD address, DWORD expected, DWORD value)
+{
+	DWORD *site = (DWORD *)address, old;
+	if (*site != expected) {
+		logf_("patch site %08lx holds %08lx, expected %08lx: skipped", (unsigned long)address,
+			(unsigned long)*site, (unsigned long)expected);
+		return FALSE;
+	}
+	VirtualProtect(site, 4, PAGE_EXECUTE_READWRITE, &old);
+	*site = value;
+	VirtualProtect(site, 4, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, 4);
+	return TRUE;
+}
+
+// Wide mode, step one: make the game's own idea of the screen wider than 800. Addresses are for
+// the v1.03 exe.
+static void widen_screen(int width)
+{
+	BOOL ok = patch_imm32(0x004aadc4, BASE_W, width);  // GetMainDevice: emulated Mac screen rect
+	ok &= patch_imm32(0x0049615e, BASE_W, width);      // CIncludeView::OnDraw: frame buffer size
+	ok &= patch_imm32(0x004a2abf, BASE_W, width);      // TWindow::Center: centring against the screen
+	if (ok) g_gameW = width;
+	logf_("wide mode %s (%d wide)", ok ? "on" : "FAILED", width);
+}
+
 #define HOOK(dll, name) hook_import(dll, #name, h_##name, &o_##name)
 
 static void install(HMODULE self)
@@ -772,6 +800,8 @@ static void install(HMODULE self)
 	HOOK("GDI32.dll", StretchBlt);
 	HOOK("GDI32.dll", StretchDIBits);
 	BOOL native = skip_mode_switch();
+	// Four extra 64-pixel map columns: 1056x600, close to 16:9.
+	if (native && GetPrivateProfileIntA("Display", "Wide", 0, ini)) widen_screen(BASE_W + 4 * 64);
 	logf_("imp2hd loaded (smooth=%d integer=%d) core hooks %s, native resolution %s", g_smooth,
 		g_integerScale, ok ? "ok" : "INCOMPLETE", native ? "kept" : "NOT kept");
 }

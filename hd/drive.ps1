@@ -7,7 +7,8 @@
 # Example: .\drive.ps1 wait:9 click:150,450 wait:3 shot:load
 param(
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Steps,
-    [switch]$KeepRunning
+    [switch]$KeepRunning,
+    [int]$GameW = 800   # width of the game's frame: 1056 when testing wide mode
 )
 
 Add-Type -AssemblyName System.Drawing, System.Windows.Forms
@@ -23,10 +24,10 @@ New-Item -ItemType Directory -Force $outDir | Out-Null
 $game = Resolve-Path "$PSScriptRoot\..\.."
 $proc = Start-Process -FilePath "$game\Imperialism II.exe" -WorkingDirectory $game -PassThru
 
-# The view is the largest 4:3 rectangle centred on the primary screen.
+# The view is the largest rectangle of the game's shape centred on the primary screen.
 $b = [Windows.Forms.Screen]::PrimaryScreen.Bounds
-$scale = [Math]::Min($b.Width / 800.0, $b.Height / 600.0)
-$ox = ($b.Width - 800 * $scale) / 2
+$scale = [Math]::Min($b.Width / [double]$GameW, $b.Height / 600.0)
+$ox = ($b.Width - $GameW * $scale) / 2
 $oy = ($b.Height - 600 * $scale) / 2
 
 function Move-To([int]$gx, [int]$gy) {
