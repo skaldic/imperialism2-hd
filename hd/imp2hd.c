@@ -145,7 +145,9 @@ static const char kChildProcProp[] = "imp2hd.proc";
 
 // Each child's rectangle as the game last asked for it, in game coordinates, so it can be laid
 // out again when the view changes size (the movie window is set up before the view is enlarged).
-static struct { HWND hwnd; int x, y, cx, cy; } g_children[16];
+// "centred" marks the movie player: it is placed in the middle of the frame whatever position
+// the game asks for, because the game centres it against a width that depends on the mode.
+static struct { HWND hwnd; int x, y, cx, cy; BOOL centred; } g_children[16];
 
 static int child_slot(HWND hwnd, BOOL create)
 {
@@ -200,7 +202,12 @@ static LRESULT CALLBACK child_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		}
 		if (scaled()) {
 			int shift = GetParent(hwnd) == g_view ? g_offsetX : 0;
-			if (!(pos->flags & SWP_NOMOVE)) { pos->x = to_view_x(pos->x + shift); pos->y = to_view_y(pos->y); }
+			if (!(pos->flags & SWP_NOMOVE)) {
+				int gameX = pos->x + shift;
+				if (i >= 0 && g_children[i].centred) gameX = (GAME_W - g_children[i].cx) / 2;
+				pos->x = to_view_x(gameX);
+				pos->y = to_view_y(pos->y);
+			}
 			if (!(pos->flags & SWP_NOSIZE)) { pos->cx = to_view_x(pos->cx); pos->cy = to_view_y(pos->cy); }
 		}
 	}
@@ -224,15 +231,16 @@ static void relayout_children(void)
 static void adopt_child(HWND parent, HWND child)
 {
 	if (GetPropA(child, kChildProcProp)) return;
-	child_slot(child, TRUE);
+	char cls[64] = "";
+	GetClassNameA(child, cls, sizeof cls);
+	int slot = child_slot(child, TRUE);
+	if (slot >= 0) g_children[slot].centred = g_gameW > BASE_W && lstrcmpiA(cls, "MCIWndClass") == 0;
 	SetPropA(child, kChildProcProp, (HANDLE)SetWindowLongA(child, GWL_WNDPROC, (LONG)child_proc));
 
 	// It was created at game coordinates; re-apply them so they pass through child_proc.
 	RECT r;
 	GetWindowRect(child, &r);
 	MapWindowPoints(NULL, parent, (POINT *)&r, 2);
-	char cls[64] = "";
-	GetClassNameA(child, cls, sizeof cls);
 	logf_("child %p of %p class '%s' style %08lx at %ld,%ld %ldx%ld", (void *)child, (void *)parent, cls,
 		(unsigned long)GetWindowLongA(child, GWL_STYLE), r.left, r.top, r.right - r.left, r.bottom - r.top);
 	SetWindowPos(child, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -588,11 +596,10 @@ static void watch_screens(void)
 	static int handledCount;
 	if (g_gameW <= BASE_W && !g_dumpViews) return;
 	BYTE *base = screens_container();
-	if (!base) return;
 
 	BYTE *current[32], *top = NULL;
 	int count = 0;
-	BYTE *list = *(BYTE **)(base + V_SUBVIEWS);
+	BYTE *list = base ? *(BYTE **)(base + V_SUBVIEWS) : NULL;
 	if (readable(list, 8)) {
 		for (void **node = *(void ***)(list + 4); readable(node, 12) && count < 32; node = (void **)node[0]) {
 			BYTE *screen = (BYTE *)node[2];
@@ -624,8 +631,9 @@ static void watch_screens(void)
 	}
 	memcpy(handled, current, sizeof(BYTE *) * count);
 	handledCount = count;
-	// Whatever is on top decides how the frame is presented.
-	int offset = g_gameW > BASE_W && top && !is_map_screen(top) ? (g_gameW - BASE_W) / 2 : 0;
+	// Whatever is on top decides how the frame is presented. Only the map uses the full width;
+	// with no screen at all (the intro movies) the 800-wide layout is centred too.
+	int offset = g_gameW > BASE_W && !(top && is_map_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
 	if (offset != g_offsetX) {
 		g_offsetX = offset;
 		relayout_children();
