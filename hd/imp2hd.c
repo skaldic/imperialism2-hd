@@ -302,7 +302,9 @@ static void adopt_popup(HWND hwnd)
 
 #define VIEW_DUMP_TIMER 0x1D2D
 static BOOL g_knownBuild, g_dumpViews;
+static void widen_globals(void);
 static int g_wideSteps = 7;
+static BOOL g_wideMap; // tile cache relocated, so the map view itself may be widened
 
 static BOOL readable(const void *p, size_t n) { return p && !IsBadReadPtr(p, n); }
 
@@ -366,6 +368,90 @@ static void update_coordinates(BYTE *view)
 	((Method)(*(void ***)view)[0x168 / 4])(view);
 }
 
+// The map screen's background is one 800x600 picture: border art, a hole for the map, and the
+// side panel's artwork from about x=586 on. For a wider screen the right-hand 256 columns move to
+// the new right edge with the panel, and the gap in the top and bottom borders is filled by
+// repeating a plain 64-pixel slice of them. (The gap's middle rows are covered by the map.)
+#define BG_SPLIT 544      // columns from here on belong to the right-hand side
+#define BG_SLICE 480      // start of the slice repeated to fill the gap
+#define BG_SLICE_W 64
+// The land map view in the 800x600 layout.
+#define MAP_HOLE_X 10
+#define MAP_HOLE_Y 58
+#define MAP_HOLE_W 576
+#define MAP_HOLE_H 512
+
+static void *g_backgroundVtable[0x101];
+
+static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int *area)
+{
+	typedef void (__attribute__((thiscall)) *CopyPixels)(void *src, void *dst, int sx, int sy, int w, int h, int dx, int dy, DWORD transparent);
+	typedef void *(__cdecl *QuickOffscreenDib)(void);
+	void *src = *(void **)(self + 0x90); // TPicture: the loaded picture
+	void *dst = ((QuickOffscreenDib)0x004a8540)();
+	if (!src || !dst) return;
+
+	int extra = g_gameW - BASE_W;
+
+	// The map's rectangle is never painted: the game does not redraw the map after the
+	// background, it relies on the background leaving that area alone.
+	const int holeLeft = MAP_HOLE_X, holeRight = MAP_HOLE_X + MAP_HOLE_W + extra;
+	const int bands[3][2] = { { 0, MAP_HOLE_Y }, { MAP_HOLE_Y, MAP_HOLE_Y + MAP_HOLE_H }, { MAP_HOLE_Y + MAP_HOLE_H, GAME_H } };
+
+	for (int band = 0; band < 3; band++) {
+		int top = max(area[1], bands[band][0]), bottom = min(area[3], bands[band][1]);
+		if (bottom <= top) continue;
+
+		for (int dx = 0; dx < g_gameW;) {
+			int sx, w;
+			if (dx < BG_SPLIT) { sx = dx; w = BG_SPLIT - dx; }
+			else if (dx < BG_SPLIT + extra) {
+				int into = (dx - BG_SPLIT) % BG_SLICE_W;
+				sx = BG_SLICE + into;
+				w = min(BG_SLICE_W - into, BG_SPLIT + extra - dx);
+			}
+			else { sx = dx - extra; w = g_gameW - dx; }
+
+			// Up to two pieces of this run survive: left of the hole and right of it.
+			for (int side = 0; side < 2; side++) {
+				int left = max(dx, area[0]), right = min(dx + w, area[2]);
+				if (band == 1) {
+					if (side == 0) right = min(right, holeLeft);
+					else left = max(left, holeRight);
+				} else if (side == 1) {
+					break;
+				}
+				if (right > left) {
+					((CopyPixels)0x00487790)(src, dst, sx + (left - dx), top, right - left, bottom - top, left, top, 0xffffffff);
+				}
+			}
+			dx += w;
+		}
+	}
+}
+
+// Gives this one picture object its own copy of its class's virtual table with Draw replaced.
+static BOOL hook_background_draw(BYTE *picture)
+{
+	const DWORD originalDraw = 0x005c8800; // TOffLimitsPicture::Draw
+	void **vtable = *(void ***)picture;
+	if (vtable == &g_backgroundVtable[1]) return TRUE;
+	if (!readable(vtable - 1, sizeof g_backgroundVtable)) return FALSE;
+
+	for (int slot = 0; slot < 0x100; slot++) {
+		const BYTE *fn = (const BYTE *)vtable[slot];
+		// Incremental-link builds reach functions through a "jmp" thunk.
+		if (readable(fn, 5) && fn[0] == 0xe9) fn += 5 + *(const int *)(fn + 1);
+		if ((DWORD)(DWORD_PTR)fn != originalDraw) continue;
+		memcpy(g_backgroundVtable, vtable - 1, sizeof g_backgroundVtable);
+		g_backgroundVtable[slot + 1] = (void *)wide_background_draw;
+		*(void ***)picture = &g_backgroundVtable[1];
+		logf_("background draw replaced (vtable slot %d)", slot);
+		return TRUE;
+	}
+	return FALSE;
+}
+
 static void widen_map_screen(BYTE *picture)
 {
 	int extra = g_gameW - BASE_W;
@@ -374,7 +460,11 @@ static void widen_map_screen(BYTE *picture)
 
 	// g_wideSteps is a debugging aid: each bit enables one part of the re-layout.
 	if (g_wideSteps & 1) {
+		// The picture is only widened if its drawing can be replaced: left alone at 1056 it
+		// reads past each 800-pixel row of its bitmap.
+		BOOL background = hook_background_draw(picture);
 		for (BYTE *v = picture; readable(v, 0x54); v = *(BYTE **)(v + V_PARENT)) {
+			if (v == picture && !background) continue;
 			if (VIEW_INT(v, V_W) == BASE_W) VIEW_INT(v, V_W) = g_gameW;
 		}
 	}
@@ -386,15 +476,40 @@ static void widen_map_screen(BYTE *picture)
 			VIEW_INT(v, V_X) += extra;
 			update_coordinates(v); // only walks down when the view's own position changed
 		}
-		BYTE *toolbar = child_view(picture, ID4('t', 'o', 'p', 'B')); // stays centred under the map
-		if (toolbar) {
-			VIEW_INT(toolbar, V_X) += extra / 2;
-			update_coordinates(toolbar);
+		// Hidden views are parked at x=1001, just past the right edge of an 800-wide screen.
+		// On a wider screen that is visible, and the idle sea map draws its blank contents over
+		// the panel and into the buffer it shares with the land map. Park it further out.
+		BYTE *ocean = child_view(picture, ID4('D', 'O', 'O', 'G'));
+		if (ocean && VIEW_INT(ocean, V_X) >= BASE_W) {
+			VIEW_INT(ocean, V_X) += extra;
+			update_coordinates(ocean);
 		}
+		// The bottom toolbar ('topB') stays put: its buttons are painted into the background's
+		// ribbon, which is left of the split and does not move.
 	}
-	if (g_wideSteps & 4) VIEW_INT(map, V_W) += extra;
+	if ((g_wideSteps & 4) && g_wideMap) {
+		VIEW_INT(map, V_W) += extra;
 
-	InvalidateRect(g_view, NULL, FALSE);
+		// The background picture leaves a hole where the map goes (TOffLimitsPicture); the hole
+		// was cut for the old map size when the screen was built.
+		typedef void **(__cdecl *NewRgnFn)(void);
+		typedef void (__cdecl *SetRectRgnFn)(void **, short, short, short, short);
+		typedef void (__attribute__((thiscall)) *SetRgnFn)(void *, void **);
+		typedef void **(__cdecl *DisposeRgnFn)(void **);
+		void **rgn = ((NewRgnFn)0x004a94e0)();
+		((SetRectRgnFn)0x004ac6c0)(rgn, (short)VIEW_INT(map, V_X), (short)VIEW_INT(map, V_Y),
+			(short)(VIEW_INT(map, V_X) + VIEW_INT(map, V_W)), (short)(VIEW_INT(map, V_Y) + VIEW_INT(map, V_H)));
+		((SetRgnFn)0x005c88b0)(picture, rgn);
+		((DisposeRgnFn)0x004a92d0)(rgn);
+	}
+
+	if (g_wideSteps & 8) {
+		// Experiment: repaint through the game's own TView::InvalidateRect on the map view only.
+		typedef void (__attribute__((thiscall)) *Invalidate)(void *, const RECT *, int);
+		((Invalidate)0x0049fbf0)(map, NULL, 0);
+	} else {
+		InvalidateRect(g_view, NULL, FALSE);
+	}
 	logf_("map screen widened by %d (steps %d)", extra, g_wideSteps);
 }
 
@@ -516,6 +631,7 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 		g_frameProc = (WNDPROC)SetWindowLongA(g_frame, GWL_WNDPROC, (LONG)frame_proc);
 		g_viewProc = (WNDPROC)SetWindowLongA(g_view, GWL_WNDPROC, (LONG)view_proc);
 		logf_("attached: frame %p view %p", (void *)g_frame, (void *)g_view);
+		widen_globals();
 		if (g_dumpViews || g_gameW > BASE_W) SetTimer(g_view, VIEW_DUMP_TIMER, 200, NULL);
 		place_view();
 	}
@@ -819,8 +935,110 @@ static BOOL patch_imm32(DWORD address, DWORD expected, DWORD value)
 	return TRUE;
 }
 
-// Wide mode, step one: make the game's own idea of the screen wider than 800. Addresses are for
-// the v1.03 exe.
+static BOOL patch_imm8(DWORD address, BYTE expected, BYTE value)
+{
+	BYTE *site = (BYTE *)address;
+	DWORD old;
+	if (*site != expected) {
+		logf_("patch site %08lx holds %02x, expected %02x: skipped", (unsigned long)address, *site, expected);
+		return FALSE;
+	}
+	VirtualProtect(site, 1, PAGE_EXECUTE_READWRITE, &old);
+	*site = value;
+	VirtualProtect(site, 1, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, 1);
+	return TRUE;
+}
+
+// The land map view (TMapDialog, with TCitySiteView and TMapEditView derived from it) caches
+// rendered tiles. The bookkeeping is an array of 110 eight-byte slots embedded in the object at
+// +0x84, sized for the 10x11 tiles a 576x512 view can touch; the fields after it start at +0x3f4.
+// A wider view needs more slots, so the array is moved to the end of an enlarged object.
+//
+// Slot numbers are stored in a signed byte per map tile, which caps the count at 127. A 832-wide
+// view touches 14 columns; keeping 9 rows instead of 11 makes that 126.
+#define MAP_COLUMNS_WIDE 13
+#define CACHE_OLD_BASE 0x84
+#define CACHE_NEW_BASE 0x420   // past the largest derived class (TCitySiteView, 0x41c bytes)
+#define CACHE_OLD_SLOTS 110
+#define CACHE_NEW_SLOTS 127
+#define CACHE_ALLOCATED_SLOTS 128 // one spare: the "no free slot" path writes one past the end
+
+static BOOL relocate_tile_cache(void)
+{
+	// Address of the 32-bit displacement inside each instruction that indexes the slot array.
+	static const DWORD slotAccess[] = {
+		0x00559b23, 0x00559c07,                         // TMapDialog::FrameCursorArea
+		0x0055b2bf, 0x0055b3a3,                         // TCitySiteView::FrameCursorArea
+		0x0055cfb3,                                     // TMapDialog::FlushCache
+		0x0055d021, 0x0055d02a, 0x0055d032, 0x0055d03a, // TMapDialog::DeCache
+		0x0055d21d, 0x0055d3cc, 0x0055d3ea, 0x0055d3f1, // TMapDialog::Draw
+		0x0055d41a, 0x0055d423, 0x0055d430,
+		0x00562845, 0x00562866, 0x0056287d, 0x005628b4, // single-tile redraw (0x00562730)
+		0x005628d0, 0x005628dc,
+	};
+	BOOL ok = TRUE;
+	for (int i = 0; i < (int)(sizeof slotAccess / sizeof slotAccess[0]); i++) {
+		DWORD disp = *(DWORD *)slotAccess[i];
+		if (disp < CACHE_OLD_BASE || disp > CACHE_OLD_BASE + 6) {
+			logf_("cache access %08lx holds displacement %lx: not relocating", (unsigned long)slotAccess[i], (unsigned long)disp);
+			return FALSE; // nothing has been written yet, so the game is untouched
+		}
+	}
+	for (int i = 0; i < (int)(sizeof slotAccess / sizeof slotAccess[0]); i++) {
+		DWORD disp = *(DWORD *)slotAccess[i];
+		ok &= patch_imm32(slotAccess[i], disp, disp - CACHE_OLD_BASE + CACHE_NEW_BASE);
+	}
+
+	// Slot counts.
+	ok &= patch_imm32(0x0055cfb8, CACHE_OLD_SLOTS, CACHE_ALLOCATED_SLOTS); // FlushCache clears them all
+	ok &= patch_imm32(0x0055d211, CACHE_OLD_SLOTS, CACHE_NEW_SLOTS);       // Draw: eviction pass
+	ok &= patch_imm8(0x0055d3bf, CACHE_OLD_SLOTS, CACHE_NEW_SLOTS);        // Draw: free-slot search
+	ok &= patch_imm8(0x0055d3dc, CACHE_OLD_SLOTS, CACHE_NEW_SLOTS);
+	ok &= patch_imm8(0x0056284f, CACHE_OLD_SLOTS, CACHE_NEW_SLOTS);        // single-tile redraw
+	ok &= patch_imm8(0x00562855, CACHE_OLD_SLOTS, CACHE_NEW_SLOTS);
+	ok &= patch_imm8(0x00562874, CACHE_OLD_SLOTS, CACHE_NEW_SLOTS);
+
+	// Object allocations, enlarged to hold the relocated array.
+	DWORD size = CACHE_NEW_BASE + CACHE_ALLOCATED_SLOTS * 8;
+	ok &= patch_imm32(0x0044e9e9, 0x40c, size); // map screen builder: TMapDialog
+	ok &= patch_imm32(0x005595a7, 0x40c, size); // TMapDialog::CreateObject
+	ok &= patch_imm32(0x0045fe58, 0x41c, size); // startup screens builder: TCitySiteView
+	ok &= patch_imm32(0x0055acf8, 0x41c, size); // TCitySiteView::CreateObject
+	ok &= patch_imm32(0x0055b8f9, 0x418, size); // TMapEditView::CreateObject
+
+	// The bitmap holding the cached tiles: one 64-pixel cell per slot.
+	ok &= patch_imm32(0x00559932, CACHE_OLD_SLOTS * 64, CACHE_ALLOCATED_SLOTS * 64); // TMapDialog::DoPostCreate
+	ok &= patch_imm32(0x0055ae44, CACHE_OLD_SLOTS * 64, CACHE_ALLOCATED_SLOTS * 64); // TCitySiteView::DoPostCreate
+	ok &= patch_imm32(0x0055ba2f, CACHE_OLD_SLOTS * 64, CACHE_ALLOCATED_SLOTS * 64); // TMapEditView::DoPostCreate
+	return ok;
+}
+
+// Fixed "the map is 576 pixels / 9 tiles wide" numbers in the map code.
+static BOOL widen_map_constants(int extra)
+{
+	BOOL ok = patch_imm8(0x0055d22c, 9, MAP_COLUMNS_WIDE);          // Draw: columns kept in the cache
+	ok &= patch_imm32(0x0055aaee, 576, 576 + extra);                // SetUpperLeft: area to invalidate
+	ok &= patch_imm32(0x0055ab1a, 640, 640 + extra);                // SetUpperLeft: scroll area
+	ok &= patch_imm32(0x0055db92, 576, 576 + extra);                // DrawTile: clip rectangle
+	// TWorldView::DrawDecorativeBorder: the right-hand frame strip sits 58 pixels in from the
+	// right edge. (Shared with the 576-wide city-site view, whose strip now falls outside it.)
+	ok &= patch_imm32(0x0060a252, 576 - 58, 576 - 58 + extra);
+	// ImmediateDrawTile compares a 16-bit register: "66 81 f9 40 02".
+	WORD *limit = (WORD *)0x0055a756;
+	DWORD old;
+	if (*limit == 576) {
+		VirtualProtect(limit, 2, PAGE_EXECUTE_READWRITE, &old);
+		*limit = (WORD)(576 + extra);
+		VirtualProtect(limit, 2, old, &old);
+	} else {
+		ok = FALSE;
+	}
+	return ok;
+}
+
+// Wide mode: make the game's own idea of the screen wider than 800. Addresses are for the v1.03
+// exe.
 static void widen_screen(int width)
 {
 	BOOL ok = patch_imm32(0x004aadc4, BASE_W, width);  // GetMainDevice: emulated Mac screen rect
@@ -828,6 +1046,24 @@ static void widen_screen(int width)
 	ok &= patch_imm32(0x004a2abf, BASE_W, width);      // TWindow::Center: centring against the screen
 	if (ok) g_gameW = width;
 	logf_("wide mode %s (%d wide)", ok ? "on" : "FAILED", width);
+	if (!ok) return;
+
+	g_wideMap = relocate_tile_cache() && widen_map_constants(width - BASE_W);
+	logf_("wide map %s", g_wideMap ? "enabled" : "NOT enabled: the map stays 576 wide");
+}
+
+// Globals the game fills in before WinMain; adjusted once its windows exist.
+static void widen_globals(void)
+{
+	if (g_gameW <= BASE_W) return;
+	int *screenW = (int *)0x0075bc88, *columns = (int *)0x0075c048, *rows = (int *)0x0075c0d0;
+	logf_("globals before: screen width %d, map columns+1 %d, cached row span %d", *screenW,
+		(short)*columns, (short)*rows);
+	*screenW = g_gameW; // also sizes the map's composition buffer
+	if (g_wideMap) {
+		*columns = MAP_COLUMNS_WIDE + 1; // limits how far right the map can scroll
+		*rows = 8;                       // rows kept in the cache: 9, down from 11
+	}
 }
 
 #define HOOK(dll, name) hook_import(dll, #name, h_##name, &o_##name)
