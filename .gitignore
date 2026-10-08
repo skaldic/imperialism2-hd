@@ -8,3 +8,6 @@
 # Build output and test captures
 /hd/ddraw.dll
 /hd/shots/
+
+# Extracted and upscaled game artwork
+/assets/
