@@ -54,6 +54,11 @@ static int g_gameW = BASE_W; // width of the game's frame buffer; wider than BAS
 // sees them at x=0, so its cached click regions stay valid.
 static int g_offsetX;
 static HWND g_frame, g_view;
+
+// HD artwork layer (defined further down).
+static BOOL g_hd;
+static HDC g_hdDC;
+static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
 static WNDPROC g_frameProc, g_viewProc;
 static int g_viewW = BASE_W, g_viewH = GAME_H; // current size of the view window, in pixels
 static BOOL g_smooth = TRUE, g_integerScale = FALSE;
@@ -936,7 +941,12 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 		// A centred screen only owns the left 800 columns of the frame buffer; the rest still
 		// holds whatever the map screen left there, so it is not shown and the margins are black.
 		int width = g_offsetX ? BASE_W : GAME_W;
-		BOOL ok = StretchBlt(dst, 0, 0, width, GAME_H, src, 0, 0, width, GAME_H, rop);
+		BOOL ok;
+		if (g_hd && rop == SRCCOPY && hd_compose(src, x - 2, y - 2, x + w + 2, y + h + 2)) {
+			ok = StretchBlt(dst, 0, 0, width, GAME_H, g_hdDC, 0, 0, width * 2, GAME_H * 2, rop);
+		} else {
+			ok = StretchBlt(dst, 0, 0, width, GAME_H, src, 0, 0, width, GAME_H, rop);
+		}
 		if (g_offsetX) {
 			RECT left = { -g_offsetX, 0, 0, GAME_H }, right = { BASE_W, 0, GAME_W - g_offsetX, GAME_H };
 			FillRect(dst, &left, (HBRUSH)GetStockObject(BLACK_BRUSH));
@@ -1258,6 +1268,368 @@ static BOOL widen_overview_constants(int extra)
 	return ok;
 }
 
+// ---------------------------------------------------------------------------------------------
+// HD artwork groundwork: observing the game's picture copies
+//
+// Pictures reach the frame through CDib::CopyPixels (0x00487790), which the rest of the game calls
+// through a jump thunk at 0x00403125. A CDib keeps its pixel pointer at +0x0c and a pointer to its
+// BITMAPINFOHEADER at +0x10.
+
+typedef void (__attribute__((thiscall)) *CopyPixelsFn)(void *src, void *dst, int sx, int sy, int w,
+	int h, int dx, int dy, DWORD transparent);
+
+static void __attribute__((thiscall)) traced_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w,
+	int h, int dx, int dy, DWORD transparent)
+{
+	// Objects are reused at the same address for different pictures, so a picture is identified
+	// by its pixel pointer and the rectangle copied.
+	static struct { BYTE *bits; int w, h, dx, dy; } seen[400];
+	static int seenCount;
+	BOOL known = FALSE;
+	BYTE *bits = readable(src, 0x14) ? *(BYTE **)(src + 0x0c) : NULL;
+	for (int i = 0; i < seenCount; i++) {
+		known |= seen[i].bits == bits && seen[i].w == w && seen[i].h == h && seen[i].dx == dx && seen[i].dy == dy;
+	}
+	if (!known && seenCount < 400 && bits && readable(dst, 0x14)) {
+		seen[seenCount].bits = bits; seen[seenCount].w = w; seen[seenCount].h = h;
+		seen[seenCount].dx = dx; seen[seenCount].dy = dy;
+		seenCount++;
+		const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
+		const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
+		typedef void *(__cdecl *QuickOffscreenDib)(void);
+		BOOL toFrame = dst == (BYTE *)((QuickOffscreenDib)0x004a8540)();
+		if (readable(sh, sizeof *sh) && readable(dh, sizeof *dh)) {
+			logf_("copy: picture %ldx%ld %dbpp -> %s %ldx%ld %dbpp, %dx%d from %d,%d to %d,%d key %08lx",
+				sh->biWidth, labs(sh->biHeight), sh->biBitCount, toFrame ? "frame" : "other buffer",
+				dh->biWidth, labs(dh->biHeight), dh->biBitCount, w, h, sx, sy, dx, dy, (unsigned long)transparent);
+		}
+	}
+	((CopyPixelsFn)0x00487790)(src, dst, sx, sy, w, h, dx, dy, transparent);
+}
+
+static void trace_picture_copies(void)
+{
+	const DWORD thunk = 0x00403125, target = 0x00487790;
+	DWORD *rel = (DWORD *)(thunk + 1), old;
+	if (*(BYTE *)thunk != 0xe9 || thunk + 5 + *rel != target) {
+		logf_("picture-copy thunk not as expected: tracing off");
+		return;
+	}
+	VirtualProtect(rel, 4, PAGE_EXECUTE_READWRITE, &old);
+	*rel = (DWORD)(DWORD_PTR)traced_copy_pixels - (thunk + 5);
+	VirtualProtect(rel, 4, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), rel, 4);
+	logf_("tracing picture copies");
+}
+
+// ---------------------------------------------------------------------------------------------
+// HD artwork
+//
+// The game keeps drawing its 1x frame exactly as before. Alongside it the DLL keeps a frame twice
+// the size. Whenever the game copies a picture into its frame and an upscaled version of that
+// picture exists, the same rectangle is copied at 2x into the big frame, and the 1x pixels the
+// game just wrote are remembered. When the frame is shown, every pixel that still holds the
+// remembered value is taken from the big frame; anything the game has drawn over since (text,
+// the map, sprites without HD art) is pixel-doubled from the 1x frame instead.
+//
+// Pictures are matched to their upscaled files by content: the pixel data in memory is the same
+// as in the .rsrc archive it was loaded from, so a hash of a few slices identifies it.
+
+typedef struct { DWORD hash; int w, h, id; char archive[24]; } HdIndexEntry;
+typedef struct { DWORD hash; int w, h; DWORD *pixels; } HdImage; // pixels NULL: known to be missing
+
+static char g_hdAssets[MAX_PATH], g_gameDir[MAX_PATH];
+static HdIndexEntry *g_hdIndex;
+static int g_hdIndexCount;
+static HdImage g_hdImages[512];
+static int g_hdImageCount;
+static size_t g_hdBytes;
+
+static DWORD *g_hdFrame;        // top-down, 2*g_hdW by 2*GAME_H
+static WORD *g_hdShadow;        // the 1x value each pixel had when its 2x block was last written
+static BYTE *g_hdState;         // 0 unknown, 1 block holds HD art, 2 block holds doubled 1x pixel
+static int g_hdW;
+
+// GDI+ flat API, used only to read PNG files.
+typedef struct { UINT32 version; void *debugCallback; BOOL noThread; BOOL noCodecs; } GpStartupInput;
+typedef struct { UINT width, height; INT stride; INT format; void *scan0; UINT_PTR reserved; } GpBitmapData;
+typedef struct { INT x, y, w, h; } GpRectI;
+int WINAPI GdiplusStartup(ULONG_PTR *token, const GpStartupInput *input, void *output);
+int WINAPI GdipCreateBitmapFromFile(const WCHAR *path, void **bitmap);
+int WINAPI GdipGetImageWidth(void *image, UINT *width);
+int WINAPI GdipGetImageHeight(void *image, UINT *height);
+int WINAPI GdipBitmapLockBits(void *bitmap, const GpRectI *rect, UINT flags, INT format, GpBitmapData *data);
+int WINAPI GdipBitmapUnlockBits(void *bitmap, GpBitmapData *data);
+int WINAPI GdipDisposeImage(void *image);
+#define GP_FORMAT_32BPP_RGB 0x00022009
+
+static DWORD fnv(DWORD h, const BYTE *p, size_t n)
+{
+	while (n--) h = (h ^ *p++) * 16777619u;
+	return h;
+}
+
+// Hash of three slices of a picture's pixel data: start, middle and end.
+#define HD_SLICE 2048
+static DWORD picture_hash(const BYTE *pixels, size_t size, int w, int h)
+{
+	DWORD hash = fnv(2166136261u, (const BYTE *)&w, sizeof w);
+	hash = fnv(hash, (const BYTE *)&h, sizeof h);
+	size_t n = size < HD_SLICE ? size : HD_SLICE;
+	hash = fnv(hash, pixels, n);
+	if (size > 3 * HD_SLICE) {
+		hash = fnv(hash, pixels + (size / 2 & ~(size_t)1), n);
+		hash = fnv(hash, pixels + size - n, n);
+	}
+	return hash;
+}
+
+static size_t pixel_bytes_16(int w, int h) { return (size_t)((w + 1) & ~1) * 2 * h; }
+
+static void hd_index_archive(const char *path, const char *name)
+{
+	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	if (f == INVALID_HANDLE_VALUE) return;
+	DWORD got, header[4];
+	if (ReadFile(f, header, sizeof header, &got, NULL) && got == sizeof header && header[0] == 0x63727372) { // "rsrc"
+		DWORD count = header[3];
+		DWORD *dir = malloc(count * 16);
+		if (dir && ReadFile(f, dir, count * 16, &got, NULL) && got == count * 16) {
+			BYTE *buf = malloc(3 * HD_SLICE);
+			for (DWORD i = 0; i < count; i++) {
+				DWORD type = dir[i * 4], id = dir[i * 4 + 1], offset = dir[i * 4 + 2];
+				BITMAPINFOHEADER bih;
+				if (type != 0x50494354) continue; // 'PICT'
+				SetFilePointer(f, offset, NULL, FILE_BEGIN);
+				if (!ReadFile(f, &bih, sizeof bih, &got, NULL) || got != sizeof bih) continue;
+				if (bih.biSize != 40 || bih.biBitCount != 16 || bih.biCompression != BI_RGB) continue;
+				int w = bih.biWidth, h = abs(bih.biHeight);
+				size_t size = pixel_bytes_16(w, h), n = size < HD_SLICE ? size : HD_SLICE;
+				DWORD base = offset + 40 + bih.biClrUsed * 4;
+				DWORD hash = fnv(2166136261u, (const BYTE *)&w, sizeof w);
+				hash = fnv(hash, (const BYTE *)&h, sizeof h);
+				SetFilePointer(f, base, NULL, FILE_BEGIN);
+				if (!ReadFile(f, buf, (DWORD)n, &got, NULL) || got != n) continue;
+				hash = fnv(hash, buf, n);
+				if (size > 3 * HD_SLICE) {
+					SetFilePointer(f, base + (DWORD)(size / 2 & ~(size_t)1), NULL, FILE_BEGIN);
+					ReadFile(f, buf, (DWORD)n, &got, NULL);
+					hash = fnv(hash, buf, n);
+					SetFilePointer(f, base + (DWORD)(size - n), NULL, FILE_BEGIN);
+					ReadFile(f, buf, (DWORD)n, &got, NULL);
+					hash = fnv(hash, buf, n);
+				}
+				HdIndexEntry *e = &g_hdIndex[g_hdIndexCount++];
+				e->hash = hash; e->w = w; e->h = h; e->id = (int)id;
+				lstrcpynA(e->archive, name, sizeof e->archive);
+				if (g_hdIndexCount >= 4096) break;
+			}
+			free(buf);
+		}
+		free(dir);
+	}
+	CloseHandle(f);
+}
+
+static void hd_build_index(void)
+{
+	char pattern[MAX_PATH];
+	WIN32_FIND_DATAA fd;
+	g_hdIndex = calloc(4096, sizeof *g_hdIndex);
+	snprintf(pattern, sizeof pattern, "%sData\\*.rsrc", g_gameDir);
+	HANDLE find = FindFirstFileA(pattern, &fd);
+	if (find == INVALID_HANDLE_VALUE || !g_hdIndex) return;
+	do {
+		char path[MAX_PATH], name[64];
+		snprintf(path, sizeof path, "%sData\\%s", g_gameDir, fd.cFileName);
+		lstrcpynA(name, fd.cFileName, sizeof name);
+		char *dot = strrchr(name, '.');
+		if (dot) *dot = 0;
+		if (g_hdIndexCount < 4096) hd_index_archive(path, name);
+	} while (FindNextFileA(find, &fd));
+	FindClose(find);
+	logf_("HD: indexed %d full-colour pictures", g_hdIndexCount);
+}
+
+static DWORD *hd_load_png(const char *path, int w2, int h2)
+{
+	static ULONG_PTR token;
+	if (!token) {
+		GpStartupInput input = { 1, NULL, FALSE, FALSE };
+		if (GdiplusStartup(&token, &input, NULL) != 0) return NULL;
+	}
+	WCHAR wide[MAX_PATH];
+	MultiByteToWideChar(CP_ACP, 0, path, -1, wide, MAX_PATH);
+	void *bitmap = NULL;
+	if (GdipCreateBitmapFromFile(wide, &bitmap) != 0 || !bitmap) return NULL;
+	DWORD *pixels = NULL;
+	UINT w = 0, h = 0;
+	GdipGetImageWidth(bitmap, &w);
+	GdipGetImageHeight(bitmap, &h);
+	GpBitmapData data;
+	GpRectI all = { 0, 0, (INT)w, (INT)h };
+	if ((int)w == w2 && (int)h == h2 && GdipBitmapLockBits(bitmap, &all, 1, GP_FORMAT_32BPP_RGB, &data) == 0) {
+		pixels = malloc((size_t)w * h * 4);
+		if (pixels) {
+			for (UINT y = 0; y < h; y++) memcpy(pixels + (size_t)y * w, (BYTE *)data.scan0 + (size_t)y * data.stride, (size_t)w * 4);
+		}
+		GdipBitmapUnlockBits(bitmap, &data);
+	}
+	GdipDisposeImage(bitmap);
+	return pixels;
+}
+
+// The upscaled picture for a 16-bit picture in memory, or NULL.
+static const HdImage *hd_find(const BYTE *bits, int w, int h)
+{
+	size_t size = pixel_bytes_16(w, h);
+	if (!readable(bits, size)) return NULL;
+	DWORD hash = picture_hash(bits, size, w, h);
+	for (int i = 0; i < g_hdImageCount; i++) {
+		if (g_hdImages[i].hash == hash && g_hdImages[i].w == w && g_hdImages[i].h == h) {
+			return g_hdImages[i].pixels ? &g_hdImages[i] : NULL;
+		}
+	}
+	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0]) || g_hdBytes > 400u * 1024 * 1024) {
+		for (int i = 0; i < g_hdImageCount; i++) free(g_hdImages[i].pixels);
+		g_hdImageCount = 0;
+		g_hdBytes = 0;
+		memset(g_hdState, 0, (size_t)g_hdW * GAME_H); // blocks referring to freed art are simply redrawn
+	}
+	HdImage *img = &g_hdImages[g_hdImageCount++];
+	img->hash = hash; img->w = w; img->h = h; img->pixels = NULL;
+	for (int i = 0; i < g_hdIndexCount; i++) {
+		if (g_hdIndex[i].hash != hash || g_hdIndex[i].w != w || g_hdIndex[i].h != h) continue;
+		char path[MAX_PATH];
+		snprintf(path, sizeof path, "%s\\%s\\%d.png", g_hdAssets, g_hdIndex[i].archive, g_hdIndex[i].id);
+		img->pixels = hd_load_png(path, w * 2, h * 2);
+		if (img->pixels) g_hdBytes += (size_t)w * h * 16;
+		logf_("HD: %s\\%d %dx%d %s", g_hdIndex[i].archive, g_hdIndex[i].id, w, h, img->pixels ? "loaded" : "NOT FOUND on disk");
+		break;
+	}
+	return img->pixels ? img : NULL;
+}
+
+static BOOL hd_ready(void)
+{
+	if (g_hdFrame && g_hdW == g_gameW) return TRUE;
+	if (g_hdFrame) return FALSE; // the frame width never changes after start-up
+	BITMAPINFO bi = { 0 };
+	bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+	bi.bmiHeader.biWidth = g_gameW * 2;
+	bi.bmiHeader.biHeight = -GAME_H * 2;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	HDC screen = GetDC(NULL);
+	g_hdDC = CreateCompatibleDC(screen);
+	HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&g_hdFrame, NULL, 0);
+	ReleaseDC(NULL, screen);
+	g_hdShadow = calloc((size_t)g_gameW * GAME_H, sizeof *g_hdShadow);
+	g_hdState = calloc((size_t)g_gameW * GAME_H, 1);
+	if (!g_hdDC || !bmp || !g_hdShadow || !g_hdState) { g_hdFrame = NULL; return FALSE; }
+	SelectObject(g_hdDC, bmp);
+	g_hdW = g_gameW;
+	hd_build_index();
+	return TRUE;
+}
+
+// The 1x frame the HD state describes: the pixel buffer the game last copied artwork into. The
+// game has several offscreen buffers of the same size, so they are told apart by address.
+static const WORD *g_hdSourceBits;
+
+static void hd_track_frame(const WORD *bits)
+{
+	if (bits == g_hdSourceBits) return;
+	g_hdSourceBits = bits;
+	memset(g_hdState, 0, (size_t)g_hdW * GAME_H);
+}
+static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
+	int dx, int dy, DWORD transparent)
+{
+	((CopyPixelsFn)0x00487790)(src, dst, sx, sy, w, h, dx, dy, transparent);
+
+	if (transparent != 0xffffffff || !readable(src, 0x14) || !readable(dst, 0x14) || !hd_ready()) return;
+	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
+	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
+	if (!readable(sh, sizeof *sh) || sh->biBitCount != 16 || !readable(dh, sizeof *dh)) return;
+	// Only copies into a frame-sized 16-bit buffer are of interest.
+	if (dh->biBitCount != 16 || dh->biWidth != g_hdW || abs(dh->biHeight) != GAME_H) return;
+	int pw = sh->biWidth, ph = abs(sh->biHeight), stride = (dh->biWidth + 1) & ~1;
+	BOOL bottomUp = dh->biHeight > 0;
+	const WORD *frame = *(const WORD **)(dst + 0x0c);
+	const HdImage *art = frame ? hd_find(*(const BYTE **)(src + 0x0c), pw, ph) : NULL;
+	if (!art) return;
+	hd_track_frame(frame);
+
+	// The same clipping the game applies, then to both pictures' bounds.
+	if (dx < 0) { sx -= dx; w += dx; dx = 0; }
+	if (dy < 0) { sy -= dy; h += dy; dy = 0; }
+	if (sx < 0) { dx -= sx; w += sx; sx = 0; }
+	if (sy < 0) { dy -= sy; h += sy; sy = 0; }
+	if (w > pw - sx) w = pw - sx;
+	if (h > ph - sy) h = ph - sy;
+	if (w > g_hdW - dx) w = g_hdW - dx;
+	if (h > GAME_H - dy) h = GAME_H - dy;
+	if (w <= 0 || h <= 0) return;
+
+	for (int y = 0; y < h; y++) {
+		const WORD *row = frame + (size_t)(bottomUp ? GAME_H - 1 - (dy + y) : dy + y) * stride + dx;
+		size_t at = (size_t)(dy + y) * g_hdW + dx;
+		memcpy(g_hdShadow + at, row, (size_t)w * 2);
+		memset(g_hdState + at, 1, (size_t)w);
+		for (int half = 0; half < 2; half++) {
+			memcpy(g_hdFrame + (size_t)((dy + y) * 2 + half) * g_hdW * 2 + dx * 2,
+				art->pixels + (size_t)((sy + y) * 2 + half) * pw * 2 + sx * 2, (size_t)w * 8);
+		}
+	}
+}
+
+// Brings the big frame up to date for a rectangle of the 1x frame before it is shown.
+static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1)
+{
+	// The bitmap being shown tells us which buffer this is and how its rows are laid out.
+	DIBSECTION ds;
+	HGDIOBJ bmp = GetCurrentObject(source, OBJ_BITMAP);
+	if (!hd_ready() || !bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || !ds.dsBm.bmBits) return FALSE;
+	if (ds.dsBm.bmBitsPixel != 16 || ds.dsBm.bmWidth != g_hdW || ds.dsBm.bmHeight != GAME_H) return FALSE;
+	const WORD *frame = ds.dsBm.bmBits;
+	int stride = ds.dsBm.bmWidthBytes / 2;
+	BOOL bottomUp = ds.dsBmih.biHeight > 0;
+	hd_track_frame(frame);
+	x0 = max(x0, 0); y0 = max(y0, 0); x1 = min(x1, g_hdW); y1 = min(y1, GAME_H);
+	for (int y = y0; y < y1; y++) {
+		const WORD *row = frame + (size_t)(bottomUp ? GAME_H - 1 - y : y) * stride;
+		size_t at = (size_t)y * g_hdW;
+		DWORD *out = g_hdFrame + (size_t)y * 2 * g_hdW * 2;
+		for (int x = x0; x < x1; x++) {
+			WORD p = row[x];
+			if (g_hdState[at + x] && g_hdShadow[at + x] == p) continue;
+			g_hdState[at + x] = 2;
+			g_hdShadow[at + x] = p;
+			DWORD r = (p >> 10) & 31, g = (p >> 5) & 31, b = p & 31;
+			DWORD c = ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
+			out[x * 2] = out[x * 2 + 1] = out[g_hdW * 2 + x * 2] = out[g_hdW * 2 + x * 2 + 1] = c;
+		}
+	}
+	return TRUE;
+}
+
+static void hd_install(void)
+{
+	const DWORD thunk = 0x00403125, target = 0x00487790;
+	DWORD *rel = (DWORD *)(thunk + 1), old;
+	if (*(BYTE *)thunk != 0xe9 || thunk + 5 + *rel != target) {
+		logf_("HD: picture-copy thunk not as expected: HD art off");
+		return;
+	}
+	VirtualProtect(rel, 4, PAGE_EXECUTE_READWRITE, &old);
+	*rel = (DWORD)(DWORD_PTR)hd_copy_pixels - (thunk + 5);
+	VirtualProtect(rel, 4, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), rel, 4);
+	g_hd = TRUE;
+	logf_("HD art on, from %s", g_hdAssets);
+}
+
 // Wide mode: make the game's own idea of the screen wider than 800. Addresses are for the v1.03
 // exe.
 static void widen_screen(int width)
@@ -1330,6 +1702,17 @@ static void install(HMODULE self)
 	HOOK("GDI32.dll", GetClipBox);
 	HOOK("GDI32.dll", StretchDIBits);
 	BOOL native = skip_mode_switch();
+	lstrcpynA(g_gameDir, ini, sizeof g_gameDir);
+	char *lastSlash = strrchr(g_gameDir, '\\');
+	if (lastSlash) lastSlash[1] = 0;
+	if (g_knownBuild && GetPrivateProfileIntA("Debug", "TraceCopies", 0, ini)) {
+		trace_picture_copies();
+	} else if (g_knownBuild && GetPrivateProfileIntA("Display", "HD", 0, ini)) {
+		char fallback[MAX_PATH];
+		snprintf(fallback, sizeof fallback, "%sdecomp\\assets\\x2", g_gameDir);
+		GetPrivateProfileStringA("Display", "HDAssets", fallback, g_hdAssets, sizeof g_hdAssets, ini);
+		hd_install();
+	}
 	// Four extra 64-pixel map columns: 1056x600, close to 16:9.
 	if (native && GetPrivateProfileIntA("Display", "Wide", 0, ini)) widen_screen(BASE_W + 4 * 64);
 	logf_("imp2hd loaded (smooth=%d integer=%d) core hooks %s, native resolution %s", g_smooth,

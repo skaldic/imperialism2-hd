@@ -59,6 +59,15 @@ foreach ($step in $Steps) {
             $g.Dispose(); $full.Dispose(); $half.Dispose()
             "saved $arg.png"
         }
+        'crop'  {
+            # Full-resolution 1000x700 crop around the centre of the screen: crop:<name>
+            $bmp = New-Object Drawing.Bitmap(1000, 700)
+            $g = [Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen(($b.Width / 2 - 500), ($b.Height / 2 - 350), 0, 0, $bmp.Size)
+            $bmp.Save("$outDir\$arg.png", [Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            "saved $arg.png"
+        }
         default { "unknown step '$step'" }
     }
 }
