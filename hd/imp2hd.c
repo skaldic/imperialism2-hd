@@ -59,6 +59,8 @@ static HWND g_frame, g_view;
 static BOOL g_hd;
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
+static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
+	int dx, int dy, DWORD transparent);
 static WNDPROC g_frameProc, g_viewProc;
 static int g_viewW = BASE_W, g_viewH = GAME_H; // current size of the view window, in pixels
 static BOOL g_smooth = TRUE, g_integerScale = FALSE;
@@ -464,7 +466,9 @@ static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int
 						break;
 					}
 					if (right > left) {
-						((CopyPixels)0x00487790)(src, dst, sx + (left - dx), top, right - left, bottom - top, left, top, 0xffffffff);
+						// Through the HD layer when it is on, so the widened background gets HD art too.
+						CopyPixels copy = g_hd ? (CopyPixels)hd_copy_pixels : (CopyPixels)0x00487790;
+						copy(src, dst, sx + (left - dx), top, right - left, bottom - top, left, top, 0xffffffff);
 					}
 				}
 				dx += w;
