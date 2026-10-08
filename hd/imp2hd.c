@@ -518,7 +518,7 @@ static void widen_map_screen(BYTE *picture)
 		// the panel and into the buffer it shares with the land map. Park it further out.
 		BYTE *ocean = child_view(picture, ID4('D', 'O', 'O', 'G'));
 		logf_("parking point for hidden map views: %d,%d", *(int *)0x007608f8, *(int *)0x007608fc);
-		if (ocean && (g_wideSteps & 16)) VIEW_INT(ocean, V_W) += extra; // experiment: widen the zoomed-out map
+		if (ocean && g_wideMap && (g_wideSteps & 4)) VIEW_INT(ocean, V_W) += extra; // the zoomed-out overview
 		if (ocean && VIEW_INT(ocean, V_X) >= BASE_W) {
 			VIEW_INT(ocean, V_X) += extra;
 			update_coordinates(ocean);
@@ -1223,6 +1223,36 @@ static BOOL widen_map_constants(int extra)
 	return ok;
 }
 
+static BOOL patch_imm16(DWORD address, WORD expected, WORD value)
+{
+	WORD *site = (WORD *)address;
+	DWORD old;
+	if (*site != expected) {
+		logf_("patch site %08lx holds %04x, expected %04x: skipped", (unsigned long)address, *site, expected);
+		return FALSE;
+	}
+	VirtualProtect(site, 2, PAGE_EXECUTE_READWRITE, &old);
+	*site = value;
+	VirtualProtect(site, 2, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, 2);
+	return TRUE;
+}
+
+// The zoomed-out overview (TOceanDialog, 'DOOG') draws 16-pixel tiles: 36 columns by 32 rows in a
+// 576x512 view. Its drawing loop, right-edge test, scroll limit and the minimap's "you are here"
+// rectangle all carry that column count.
+static BOOL widen_overview_constants(int extra)
+{
+	int columns = extra / 16;
+	BOOL ok = patch_imm8(0x005b7c0e, 36, (BYTE)(36 + columns));          // draw loop: last column index
+	ok &= patch_imm32(0x005b62fd, 600, 600 + extra);                      // draw loop: right-edge test
+	ok &= patch_imm16(0x005b952e, 108 - 36, (WORD)(108 - 36 - columns)); // scroll: furthest left column
+	ok &= patch_imm32(0x005b9533, 108 - 36, 108 - 36 - columns);
+	ok &= patch_imm32(0x0060e3bb, 36, 36 + columns);                      // ZoomOut: minimap rectangle width
+	ok &= patch_imm32(0x0060e686, 36, 36 + columns);                      // minimap set-up, zoomed out
+	return ok;
+}
+
 // Wide mode: make the game's own idea of the screen wider than 800. Addresses are for the v1.03
 // exe.
 static void widen_screen(int width)
@@ -1234,7 +1264,8 @@ static void widen_screen(int width)
 	logf_("wide mode %s (%d wide)", ok ? "on" : "FAILED", width);
 	if (!ok) return;
 
-	g_wideMap = relocate_tile_cache() && widen_map_constants(width - BASE_W);
+	g_wideMap = relocate_tile_cache() && widen_map_constants(width - BASE_W) &&
+		widen_overview_constants(width - BASE_W);
 	logf_("wide map %s", g_wideMap ? "enabled" : "NOT enabled: the map stays 576 wide");
 }
 
@@ -1249,6 +1280,9 @@ static void widen_globals(void)
 	if (g_wideMap) {
 		*columns = MAP_COLUMNS_WIDE + 1; // limits how far right the map can scroll
 		*rows = 8;                       // rows kept in the cache: 9, down from 11
+		short *minimapColumns = (short *)0x0076091c; // minimap rectangle width for the close-up map
+		logf_("minimap close-up columns before: %d", *minimapColumns);
+		if (*minimapColumns == 10) *minimapColumns = MAP_COLUMNS_WIDE + 1; // stored as columns + 1
 	}
 }
 
