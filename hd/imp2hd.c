@@ -290,8 +290,73 @@ static void adopt_popup(HWND hwnd)
 	}
 }
 
+// ---------------------------------------------------------------------------------------------
+// Diagnostics: dump the game's view tree
+//
+// Screens are trees of TView objects (McAppUI.cpp). Layout fields, from the decompilation:
+//   +0x1c four-character id   +0x20 parent view   +0x24 location in parent (x, y)
+//   +0x2c location in window (x, y)   +0x34 size (w, h)   +0x44 CList of subviews
+// The application object (global at 0x00759888) keeps the map screen's root picture at +0x48.
+
+#define VIEW_DUMP_TIMER 0x1D2D
+static BOOL g_knownBuild, g_dumpViews;
+
+static BOOL readable(const void *p, size_t n) { return p && !IsBadReadPtr(p, n); }
+
+// MFC classes answer GetRuntimeClass (vtable slot 0) with "mov eax, <CRuntimeClass*>; ret", and
+// the class name is the first field. Read it out of the code instead of calling into the game.
+static const char *view_class(const BYTE *view)
+{
+	if (!readable(view, 4)) return "?";
+	const BYTE **vtable = *(const BYTE ***)view;
+	if (!readable(vtable, 4)) return "?";
+	const BYTE *fn = vtable[0];
+	for (int hops = 0; hops < 2 && readable(fn, 6) && fn[0] == 0xe9; hops++) fn += 5 + *(const int *)(fn + 1);
+	if (!readable(fn, 6) || fn[0] != 0xb8 || fn[5] != 0xc3) return "?";
+	const char **rtc = *(const char ***)(fn + 1);
+	return readable(rtc, 4) && readable(*rtc, 2) ? *rtc : "?";
+}
+
+static void dump_view(const BYTE *v, int depth, int *budget)
+{
+	if (depth > 12 || --*budget < 0 || !readable(v, 0x54)) return;
+	const int *f = (const int *)v;
+	DWORD id = (DWORD)f[0x1c / 4];
+	char name[5] = { (char)(id >> 24), (char)(id >> 16), (char)(id >> 8), (char)id, 0 };
+	for (int i = 0; i < 4; i++) if (name[i] < 32 || name[i] > 126) name[i] = '.';
+	logf_("%*s%s '%s' at %d,%d (window %d,%d) size %dx%d  [%p]", depth * 2, "", view_class(v), name,
+		f[0x24 / 4], f[0x28 / 4], f[0x2c / 4], f[0x30 / 4], f[0x34 / 4], f[0x38 / 4], (void *)v);
+
+	const BYTE *list = *(const BYTE **)(v + 0x44);
+	if (!readable(list, 8)) return;
+	for (const void **node = *(const void ***)(list + 4); readable(node, 12); node = (const void **)node[0]) {
+		dump_view((const BYTE *)node[2], depth + 1, budget);
+	}
+}
+
+static void dump_map_screen_if_new(void)
+{
+	static const BYTE *last;
+	const BYTE **app = (const BYTE **)0x00759888;
+	if (!g_knownBuild || !readable(*app, 0x4c)) return;
+	const BYTE *picture = *(const BYTE **)(*app + 0x48);
+	if (!picture || picture == last || !readable(picture, 0x54)) return;
+	last = picture;
+
+	const BYTE *root = picture;
+	for (int i = 0; i < 16 && readable(*(const BYTE **)(root + 0x20), 0x54); i++) root = *(const BYTE **)(root + 0x20);
+	int budget = 600;
+	logf_("--- view tree (map picture %p) ---", (void *)picture);
+	dump_view(root, 0, &budget);
+	logf_("--- end of view tree ---");
+}
+
 static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+	if (msg == WM_TIMER && wp == VIEW_DUMP_TIMER) {
+		dump_map_screen_if_new();
+		return 0;
+	}
 	switch (msg) {
 	case WM_PARENTNOTIFY:
 		if (LOWORD(wp) == WM_CREATE) adopt_child(hwnd, (HWND)lp);
@@ -382,6 +447,7 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 		g_frameProc = (WNDPROC)SetWindowLongA(g_frame, GWL_WNDPROC, (LONG)frame_proc);
 		g_viewProc = (WNDPROC)SetWindowLongA(g_view, GWL_WNDPROC, (LONG)view_proc);
 		logf_("attached: frame %p view %p", (void *)g_frame, (void *)g_view);
+		if (g_dumpViews) SetTimer(g_view, VIEW_DUMP_TIMER, 1500, NULL);
 		place_view();
 	}
 	return hwnd;
@@ -660,6 +726,7 @@ static BOOL skip_mode_switch(void)
 		logf_("unrecognised exe build: display mode switch left alone");
 		return FALSE;
 	}
+	g_knownBuild = TRUE;
 	DWORD old;
 	VirtualProtect(site, sizeof patch, PAGE_EXECUTE_READWRITE, &old);
 	memcpy(site, patch, sizeof patch);
@@ -686,6 +753,7 @@ static void install(HMODULE self)
 	}
 	g_smooth = GetPrivateProfileIntA("Display", "Smooth", 1, ini);
 	g_integerScale = GetPrivateProfileIntA("Display", "IntegerScale", 0, ini);
+	g_dumpViews = GetPrivateProfileIntA("Debug", "DumpViews", 0, ini);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
 	SetProcessDPIAware();
