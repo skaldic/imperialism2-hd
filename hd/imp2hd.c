@@ -59,6 +59,7 @@ static HWND g_frame, g_view;
 static BOOL g_hd;
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
+static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h);
 static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
 	int dx, int dy, DWORD transparent);
 static WNDPROC g_frameProc, g_viewProc;
@@ -901,6 +902,7 @@ static int (WINAPI *o_StretchDIBits)(HDC, int, int, int, int, int, int, int, int
 static BOOL WINAPI h_StretchBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, int sw, int sh, DWORD rop)
 {
 	ensure_mapped(dst);
+	if (g_hd) hd_note_gdi_draw(dst, x, y, w, h);
 	return o_StretchBlt(dst, x, y, w, h, src, sx, sy, sw, sh, rop);
 }
 
@@ -912,12 +914,14 @@ static int WINAPI h_StretchDIBits(HDC dst, int x, int y, int w, int h, int sx, i
 		g_traceBudget--;
 		logf_("  dib to view %d,%d %dx%d from %d,%d %dx%d", x, y, w, h, sx, sy, sw, sh);
 	}
+	if (g_hd) hd_note_gdi_draw(dst, x, y, w, h);
 	return o_StretchDIBits(dst, x, y, w, h, sx, sy, sw, sh, bits, info, usage, rop);
 }
 
 static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
 	ensure_mapped(dst);
+	if (g_hd) hd_note_gdi_draw(dst, x, y, w, h);
 	if (g_traceBudget > 0 && WindowFromDC(dst) == g_view) {
 		g_traceBudget--;
 		BITMAP bm = { 0 };
@@ -1215,6 +1219,15 @@ static BOOL relocate_tile_cache(void)
 	ok &= patch_imm32(0x00559932, CACHE_OLD_SLOTS * 64, CACHE_ALLOCATED_SLOTS * 64); // TMapDialog::DoPostCreate
 	ok &= patch_imm32(0x0055ae44, CACHE_OLD_SLOTS * 64, CACHE_ALLOCATED_SLOTS * 64); // TCitySiteView::DoPostCreate
 	ok &= patch_imm32(0x0055ba2f, CACHE_OLD_SLOTS * 64, CACHE_ALLOCATED_SLOTS * 64); // TMapEditView::DoPostCreate
+
+	// TMacViewMgr::CreateMapArtStorage makes six more sheets with one 64-pixel cell per slot,
+	// which the tile drawing code indexes by slot number alongside the cache. Left at 110 cells,
+	// slots 110 and up read and write past the end of each row, which shows as stray dashes of
+	// colour in freshly drawn tiles.
+	static const DWORD sheets[] = { 0x005497ce, 0x00549805, 0x00549822, 0x00549838, 0x00549852, 0x0054988b };
+	for (int i = 0; i < (int)(sizeof sheets / sizeof sheets[0]); i++) {
+		ok &= patch_imm32(sheets[i], CACHE_OLD_SLOTS * 64, CACHE_ALLOCATED_SLOTS * 64);
+	}
 	return ok;
 }
 
@@ -1721,6 +1734,32 @@ static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int s
 				to[1] = from[1];
 			}
 		}
+	}
+}
+
+// The game has drawn into a rectangle of the 1x frame through GDI (the map, pop-ups, sprites).
+// Whatever HD art was there is gone, even where a new pixel happens to have the same value as
+// the old one, so the unchanged-value test must not be trusted for these pixels.
+static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h)
+{
+	DIBSECTION ds;
+	if (!g_hdFrame || !g_hdSourceBits) return;
+	HGDIOBJ bmp = GetCurrentObject(dst, OBJ_BITMAP);
+	if (!bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || (const WORD *)ds.dsBm.bmBits != g_hdSourceBits) return;
+
+	POINT pts[2] = { { x, y }, { x + w, y + h } };
+	LPtoDP(dst, pts, 2);
+	RECT r = { min(pts[0].x, pts[1].x), min(pts[0].y, pts[1].y), max(pts[0].x, pts[1].x), max(pts[0].y, pts[1].y) }, clip;
+	if (GetClipBox(dst, &clip) != ERROR) {
+		POINT c[2] = { { clip.left, clip.top }, { clip.right, clip.bottom } };
+		LPtoDP(dst, c, 2);
+		r.left = max(r.left, c[0].x); r.top = max(r.top, c[0].y);
+		r.right = min(r.right, c[1].x); r.bottom = min(r.bottom, c[1].y);
+	}
+	r.left = max(r.left, 0); r.top = max(r.top, 0);
+	r.right = min(r.right, g_hdW); r.bottom = min(r.bottom, GAME_H);
+	for (int row = r.top; row < r.bottom && r.right > r.left; row++) {
+		memset(g_hdState + (size_t)row * g_hdW + r.left, 0, (size_t)(r.right - r.left));
 	}
 }
 
