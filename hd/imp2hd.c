@@ -61,6 +61,9 @@ static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's 
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
 static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h);
+static BOOL hd_transfer_map(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
+static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
+static void hd_forget_art(void);
 static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
 	int dx, int dy, DWORD transparent);
 static WNDPROC g_frameProc, g_viewProc;
@@ -941,7 +944,10 @@ static int WINAPI h_StretchDIBits(HDC dst, int x, int y, int w, int h, int sx, i
 static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
 	ensure_mapped(dst);
-	if (g_hd) hd_note_gdi_draw(dst, x, y, w, h);
+	if (g_hd) {
+		if (hd_map_to_window(dst, x, y, w, h, src, sx, sy, rop)) return TRUE;
+		if (!hd_transfer_map(dst, x, y, w, h, src, sx, sy, rop)) hd_note_gdi_draw(dst, x, y, w, h);
+	}
 	if (g_traceBudget > 0 && WindowFromDC(dst) == g_view) {
 		g_traceBudget--;
 		BITMAP bm = { 0 };
@@ -1409,11 +1415,6 @@ static int g_hdMissLog = 40; // diagnostic: unmatched pictures still to be repor
 static int g_hdImageCount;
 static size_t g_hdBytes;
 
-static DWORD *g_hdFrame;        // top-down, 2*g_hdW by 2*GAME_H
-static WORD *g_hdShadow;        // the 1x value each pixel had when its 2x block was last written
-static BYTE *g_hdState;         // 0 unknown, 1 block holds HD art, 2 block holds doubled 1x pixel
-static BYTE *g_hdDirty;         // scratch: pixels found changed during the current compose
-static int g_hdW;
 
 // GDI+ flat API, used only to read PNG files.
 typedef struct { UINT32 version; void *debugCallback; BOOL noThread; BOOL noCodecs; } GpStartupInput;
@@ -1592,7 +1593,7 @@ static const HdImage *hd_find(const BYTE *bits, int w, int h, int bpp)
 		for (int i = 0; i < g_hdImageCount; i++) free(g_hdImages[i].pixels);
 		g_hdImageCount = 0;
 		g_hdBytes = 0;
-		memset(g_hdState, 0, (size_t)g_hdW * GAME_H); // blocks referring to freed art are simply redrawn
+		hd_forget_art(); // blocks referring to freed art are simply redrawn
 	}
 	HdImage *img = &g_hdImages[g_hdImageCount++];
 	img->hash = hash; img->w = w; img->h = h; img->bpp = bpp; img->pixels = NULL;
@@ -1660,42 +1661,198 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 	return img->pixels ? img : NULL;
 }
 
-static BOOL hd_ready(void)
+// A surface pairs one of the game's 1x pixel buffers with a frame twice its size. "state" says
+// what each 2x block holds: 0 unknown, 1 HD art, 2 smoothed 1x pixel. "shadow" is the 1x value
+// the pixel had when its block was written, so later changes by the game can be detected.
+//
+// There are two: the frame that is shown, and the buffer the map view is assembled in before it
+// is copied to the frame (the game's "GWorld", 64 pixels wider and 128 taller than the screen).
+typedef struct {
+	int w, h;
+	const WORD *bits; // the 1x buffer this state describes
+	HDC dc;
+	DWORD *frame;     // top-down, 2w by 2h
+	WORD *shadow;
+	BYTE *state, *dirty;
+} HdSurface;
+
+#define MAP_SURFACE_H 728
+static HdSurface g_main, g_map;
+
+static BOOL surface_create(HdSurface *s, int w, int h)
 {
-	if (g_hdFrame && g_hdW == g_gameW) return TRUE;
-	if (g_hdFrame) return FALSE; // the frame width never changes after start-up
+	if (s->frame) return s->w == w && s->h == h;
 	BITMAPINFO bi = { 0 };
 	bi.bmiHeader.biSize = sizeof bi.bmiHeader;
-	bi.bmiHeader.biWidth = g_gameW * 2;
-	bi.bmiHeader.biHeight = -GAME_H * 2;
+	bi.bmiHeader.biWidth = w * 2;
+	bi.bmiHeader.biHeight = -h * 2;
 	bi.bmiHeader.biPlanes = 1;
 	bi.bmiHeader.biBitCount = 32;
 	HDC screen = GetDC(NULL);
-	g_hdDC = CreateCompatibleDC(screen);
-	HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&g_hdFrame, NULL, 0);
+	s->dc = CreateCompatibleDC(screen);
+	HBITMAP bmp = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&s->frame, NULL, 0);
 	ReleaseDC(NULL, screen);
-	g_hdShadow = calloc((size_t)g_gameW * GAME_H, sizeof *g_hdShadow);
-	g_hdState = calloc((size_t)g_gameW * GAME_H, 1);
-	g_hdDirty = calloc((size_t)g_gameW * GAME_H, 1);
-	if (!g_hdDC || !bmp || !g_hdShadow || !g_hdState || !g_hdDirty) { g_hdFrame = NULL; return FALSE; }
-	SelectObject(g_hdDC, bmp);
-	g_hdW = g_gameW;
-	if (g_hd) hd_build_index();
+	s->shadow = calloc((size_t)w * h, sizeof *s->shadow);
+	s->state = calloc((size_t)w * h, 1);
+	s->dirty = calloc((size_t)w * h, 1);
+	if (!s->dc || !bmp || !s->shadow || !s->state || !s->dirty) { s->frame = NULL; return FALSE; }
+	SelectObject(s->dc, bmp);
+	s->w = w;
+	s->h = h;
+	return TRUE;
+}
+
+// The game has several offscreen buffers of the same size, so they are told apart by address.
+static void surface_track(HdSurface *s, const WORD *bits)
+{
+	if (bits == s->bits) return;
+	s->bits = bits;
+	memset(s->state, 0, (size_t)s->w * s->h);
+}
+
+static void hd_forget_art(void)
+{
+	if (g_main.state) memset(g_main.state, 0, (size_t)g_main.w * g_main.h);
+	if (g_map.state) memset(g_map.state, 0, (size_t)g_map.w * g_map.h);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Map tiles
+//
+// The game builds each map tile at run time (terrain, coast, borders, roads) into a cache of
+// 8-bit 64x64 cells, then copies cells into the map buffer. A finished tile is identified by a
+// hash of its cell. Tiles with no upscaled version yet are saved to assets\orig\_tiles as they
+// are met; tools\upscale_all.ps1 -Only _tiles turns those into assets\x2\_tiles, which is what
+// is loaded here.
+
+typedef struct { DWORD hash; DWORD *pixels; BYTE used, onDisk, captured; } HdTile;
+#define HD_TILE_SLOTS 16384
+#define HD_TILE_MAX 12000
+#define HD_TILE_LOADED_MAX 3000
+static HdTile *g_tiles;
+static int g_tileCount, g_tilesLoaded, g_tilesCaptured;
+static BOOL g_captureTiles = TRUE;
+static char g_tileArtDir[MAX_PATH], g_tileOrigDir[MAX_PATH];
+
+int WINAPI GdipCreateBitmapFromScan0(INT w, INT h, INT stride, INT format, BYTE *scan0, void **bitmap);
+int WINAPI GdipSaveImageToFile(void *image, const WCHAR *path, const CLSID *encoder, const void *params);
+
+static HdTile *tile_slot(DWORD hash)
+{
+	if (!g_tiles) return NULL;
+	for (DWORD i = hash & (HD_TILE_SLOTS - 1);; i = (i + 1) & (HD_TILE_SLOTS - 1)) {
+		HdTile *t = &g_tiles[i];
+		if (t->used && t->hash == hash) return t;
+		if (!t->used) {
+			if (g_tileCount >= HD_TILE_MAX) return NULL;
+			g_tileCount++;
+			t->used = 1;
+			t->hash = hash;
+			return t;
+		}
+	}
+}
+
+static int scan_tile_dir(const char *dir, BOOL art)
+{
+	char pattern[MAX_PATH];
+	WIN32_FIND_DATAA fd;
+	int found = 0;
+	snprintf(pattern, sizeof pattern, "%s\\*.png", dir);
+	HANDLE find = FindFirstFileA(pattern, &fd);
+	if (find == INVALID_HANDLE_VALUE) return 0;
+	do {
+		char *end;
+		DWORD hash = strtoul(fd.cFileName, &end, 16);
+		if (end != fd.cFileName + 8) continue;
+		HdTile *t = tile_slot(hash);
+		if (!t) break;
+		if (art) t->onDisk = 1; else t->captured = 1;
+		found++;
+	} while (FindNextFileA(find, &fd));
+	FindClose(find);
+	return found;
+}
+
+static void hd_scan_tiles(void)
+{
+	g_tiles = calloc(HD_TILE_SLOTS, sizeof *g_tiles);
+	snprintf(g_tileArtDir, sizeof g_tileArtDir, "%s\\_tiles", g_hdAssets);
+	snprintf(g_tileOrigDir, sizeof g_tileOrigDir, "%s\\..\\orig\\_tiles", g_hdAssets);
+	CreateDirectoryA(g_tileOrigDir, NULL);
+	int captured = scan_tile_dir(g_tileOrigDir, FALSE);
+	int art = scan_tile_dir(g_tileArtDir, TRUE);
+	logf_("HD: map tiles: %d upscaled, %d captured so far; capture %s", art, captured, g_captureTiles ? "on" : "off");
+}
+
+static void save_tile(DWORD hash, const WORD *frame, int stride, BOOL bottomUp, int surfaceH, int dx, int dy)
+{
+	static const CLSID pngEncoder = { 0x557cf406, 0x1a04, 0x11d3, { 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
+	static ULONG_PTR token;
+	static DWORD pixels[64 * 64];
+	if (!token) {
+		GpStartupInput input = { 1, NULL, FALSE, FALSE };
+		if (GdiplusStartup(&token, &input, NULL) != 0) return;
+	}
+	for (int y = 0; y < 64; y++) {
+		const WORD *row = frame + (size_t)(bottomUp ? surfaceH - 1 - (dy + y) : dy + y) * stride + dx;
+		for (int x = 0; x < 64; x++) {
+			DWORD r = (row[x] >> 10) & 31, g = (row[x] >> 5) & 31, b = row[x] & 31;
+			pixels[y * 64 + x] = 0xff000000 | (r << 3 | r >> 2) << 16 | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2);
+		}
+	}
+	char path[MAX_PATH];
+	WCHAR wide[MAX_PATH];
+	snprintf(path, sizeof path, "%s\\%08lx.png", g_tileOrigDir, (unsigned long)hash);
+	MultiByteToWideChar(CP_ACP, 0, path, -1, wide, MAX_PATH);
+	void *bitmap = NULL;
+	if (GdipCreateBitmapFromScan0(64, 64, 64 * 4, GP_FORMAT_32BPP_RGB, (BYTE *)pixels, &bitmap) != 0 || !bitmap) return;
+	if (GdipSaveImageToFile(bitmap, wide, &pngEncoder, NULL) == 0) {
+		g_tilesCaptured++;
+		if (g_tilesCaptured == 1 || g_tilesCaptured % 100 == 0) logf_("HD: captured %d new map tiles this session", g_tilesCaptured);
+	}
+	GdipDisposeImage(bitmap);
+}
+
+// The upscaled art for the 64x64 cell at (sx, sy) of an 8-bit cache picture, or NULL. The cell
+// has just been copied to (dx, dy) of a 16-bit buffer, which is what gets saved if it is new.
+static const DWORD *tile_art(const BYTE *bits, int pw, int ph, BOOL bottomUp8, int sx, int sy,
+	const WORD *frame, int stride, BOOL bottomUp, int surfaceH, int dx, int dy)
+{
+	if (!g_tiles || !readable(bits, pixel_bytes(pw, ph, 8))) return NULL;
+	HdTile *t = tile_slot(tight_hash(bits, pw, ph, bottomUp8, sx, sy, 64, 64));
+	if (!t) return NULL;
+	if (t->pixels) return t->pixels;
+	if (t->onDisk) {
+		if (g_tilesLoaded >= HD_TILE_LOADED_MAX) return NULL;
+		char path[MAX_PATH];
+		snprintf(path, sizeof path, "%s\\%08lx.png", g_tileArtDir, (unsigned long)t->hash);
+		t->pixels = hd_load_png(path, 128, 128);
+		if (t->pixels) g_tilesLoaded++; else t->onDisk = 0;
+		return t->pixels;
+	}
+	if (g_captureTiles && !t->captured) {
+		t->captured = 1;
+		save_tile(t->hash, frame, stride, bottomUp, surfaceH, dx, dy);
+	}
+	return NULL;
+}
+
+static BOOL hd_ready(void)
+{
+	static BOOL indexed;
+	if (!surface_create(&g_main, g_gameW, GAME_H)) return FALSE;
+	g_hdDC = g_main.dc;
+	if (g_hd && !indexed) {
+		indexed = TRUE;
+		hd_build_index();
+		hd_scan_tiles();
+	}
 	return TRUE;
 }
 
 static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, int h, int dx, int dy, DWORD transparent);
 
-// The 1x frame the HD state describes: the pixel buffer the game last copied artwork into. The
-// game has several offscreen buffers of the same size, so they are told apart by address.
-static const WORD *g_hdSourceBits;
-
-static void hd_track_frame(const WORD *bits)
-{
-	if (bits == g_hdSourceBits) return;
-	g_hdSourceBits = bits;
-	memset(g_hdState, 0, (size_t)g_hdW * GAME_H);
-}
 static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
 	int dx, int dy, DWORD transparent)
 {
@@ -1715,14 +1872,17 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	if (!readable(src, 0x14) || !readable(dst, 0x14) || !hd_ready()) return;
 	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
 	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
-	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh)) return;
-	// Plain copies of 8- and 16-bit pictures, and 8-bit copies that skip one palette index.
-	BOOL keyed = transparent != 0xffffffff;
-	if ((sh->biBitCount != 16 && sh->biBitCount != 8) || (keyed && sh->biBitCount != 8)) return;
-	// Only copies into a frame-sized 16-bit buffer are of interest.
-	if (dh->biBitCount != 16 || dh->biWidth != g_hdW || abs(dh->biHeight) != GAME_H) return;
+	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh) || dh->biBitCount != 16) return;
+
+	// Only copies into the frame or the map buffer are of interest.
+	HdSurface *s = NULL;
+	if (dh->biWidth == g_main.w && abs(dh->biHeight) == g_main.h) s = &g_main;
+	else if (g_hd && dh->biWidth == g_gameW + 64 && abs(dh->biHeight) == MAP_SURFACE_H &&
+		surface_create(&g_map, g_gameW + 64, MAP_SURFACE_H)) s = &g_map;
+	if (!s) return;
+
 	int pw = sh->biWidth, ph = abs(sh->biHeight), stride = (dh->biWidth + 1) & ~1;
-	BOOL bottomUp = dh->biHeight > 0;
+	BOOL bottomUp = dh->biHeight > 0, bottomUp8 = sh->biHeight > 0;
 	const WORD *frame = *(const WORD **)(dst + 0x0c);
 	const BYTE *srcBits = *(const BYTE **)(src + 0x0c);
 	if (!frame) return;
@@ -1734,50 +1894,60 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	if (sy < 0) { dy -= sy; h += sy; sy = 0; }
 	if (w > pw - sx) w = pw - sx;
 	if (h > ph - sy) h = ph - sy;
-	if (w > g_hdW - dx) w = g_hdW - dx;
-	if (h > GAME_H - dy) h = GAME_H - dy;
+	if (w > s->w - dx) w = s->w - dx;
+	if (h > s->h - dy) h = s->h - dy;
 	if (w <= 0 || h <= 0) return;
 
-	// The art is either the whole picture upscaled, or (8-bit only) just the cell being copied.
-	const HdImage *art = hd_find(srcBits, pw, ph, sh->biBitCount);
+	// Plain copies of 8- and 16-bit pictures, and 8-bit copies that skip one palette index, can
+	// have HD art: a map tile, the whole picture upscaled, or (8-bit only) the cell being copied.
+	BOOL keyed = transparent != 0xffffffff, eight = sh->biBitCount == 8;
+	const DWORD *pixels = NULL;
 	int ax = sx, ay = sy, aw = pw;
-	if (!art && sh->biBitCount == 8) {
-		art = hd_find_cell(srcBits, pw, ph, sh->biHeight > 0, sx, sy, w, h);
-		static int samples = 6; // diagnostic: show what an unmatched cell holds
-		if (!art && samples > 0 && w >= 24 && h >= 16) {
-			samples--;
-			const BYTE *r = srcBits + (size_t)(sh->biHeight > 0 ? ph - 1 - (sy + h / 2) : sy + h / 2) * ((pw + 3) & ~3) + sx;
-			char hex[3 * 24 + 1];
-			for (int i = 0; i < 24; i++) sprintf(hex + i * 3, "%02x ", r[i]);
-			logf_("HD: unmatched cell %dx%d at %d,%d of %dx%d, middle row: %s", w, h, sx, sy, pw, ph, hex);
+	if (s == &g_map && eight && !keyed && w == 64 && h == 64) {
+		pixels = tile_art(srcBits, pw, ph, bottomUp8, sx, sy, frame, stride, bottomUp, s->h, dx, dy);
+		ax = 0; ay = 0; aw = 64;
+	} else if (sh->biBitCount == 16 && !keyed) {
+		const HdImage *art = hd_find(srcBits, pw, ph, 16);
+		if (art) pixels = art->pixels;
+	} else if (eight) {
+		const HdImage *art = hd_find(srcBits, pw, ph, 8);
+		if (!art) {
+			art = hd_find_cell(srcBits, pw, ph, bottomUp8, sx, sy, w, h);
+			ax = 0; ay = 0; aw = w;
 		}
-		ax = 0; ay = 0; aw = w;
+		if (art) pixels = art->pixels;
 	}
-	if (!art) return;
-	hd_track_frame(frame);
+	if (pixels) surface_track(s, frame);
+	else if (frame != s->bits) return;
 
+	BYTE key = (BYTE)transparent;
 	for (int y = 0; y < h; y++) {
-		const WORD *row = frame + (size_t)(bottomUp ? GAME_H - 1 - (dy + y) : dy + y) * stride + dx;
-		size_t at = (size_t)(dy + y) * g_hdW + dx;
+		const WORD *row = frame + (size_t)(bottomUp ? s->h - 1 - (dy + y) : dy + y) * stride + dx;
+		const BYTE *srcRow = eight ? srcBits + (size_t)(bottomUp8 ? ph - 1 - (sy + y) : sy + y) * ((pw + 3) & ~3) + sx : NULL;
+		size_t at = (size_t)(dy + y) * s->w + dx;
+		if (!pixels) {
+			// The game drew something with no HD version over whatever was here.
+			if (keyed && srcRow) { for (int x = 0; x < w; x++) if (srcRow[x] != key) s->state[at + x] = 0; }
+			else memset(s->state + at, 0, (size_t)w);
+			continue;
+		}
 		if (!keyed) {
-			memcpy(g_hdShadow + at, row, (size_t)w * 2);
-			memset(g_hdState + at, 1, (size_t)w);
+			memcpy(s->shadow + at, row, (size_t)w * 2);
+			memset(s->state + at, 1, (size_t)w);
 			for (int half = 0; half < 2; half++) {
-				memcpy(g_hdFrame + (size_t)((dy + y) * 2 + half) * g_hdW * 2 + dx * 2,
-					art->pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + ax * 2, (size_t)w * 8);
+				memcpy(s->frame + (size_t)((dy + y) * 2 + half) * s->w * 2 + dx * 2,
+					pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + ax * 2, (size_t)w * 8);
 			}
 			continue;
 		}
 		// Keyed: the game skipped the pixels holding the key index, and so do we.
-		const BYTE *srcRow = srcBits + (size_t)(sh->biHeight > 0 ? ph - 1 - (sy + y) : sy + y) * ((pw + 3) & ~3) + sx;
-		BYTE key = (BYTE)transparent;
 		for (int x = 0; x < w; x++) {
 			if (srcRow[x] == key) continue;
-			g_hdShadow[at + x] = row[x];
-			g_hdState[at + x] = 1;
+			s->shadow[at + x] = row[x];
+			s->state[at + x] = 1;
 			for (int half = 0; half < 2; half++) {
-				const DWORD *from = art->pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + (ax + x) * 2;
-				DWORD *to = g_hdFrame + (size_t)((dy + y) * 2 + half) * g_hdW * 2 + (dx + x) * 2;
+				const DWORD *from = pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + (ax + x) * 2;
+				DWORD *to = s->frame + (size_t)((dy + y) * 2 + half) * s->w * 2 + (dx + x) * 2;
 				to[0] = from[0];
 				to[1] = from[1];
 			}
@@ -1785,81 +1955,128 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	}
 }
 
-// The game has drawn into a rectangle of the 1x frame through GDI (the map, pop-ups, sprites).
-// Whatever HD art was there is gone, even where a new pixel happens to have the same value as
-// the old one, so the unchanged-value test must not be trusted for these pixels.
-static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h)
+// The 16-bit pixel buffer selected into a device context, with its layout; NULL if there is none.
+static const WORD *dc_pixels(HDC dc, int *w, int *h, int *stride, BOOL *bottomUp)
 {
 	DIBSECTION ds;
-	if (!g_hdFrame || !g_hdSourceBits) return;
-	HGDIOBJ bmp = GetCurrentObject(dst, OBJ_BITMAP);
-	if (!bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || (const WORD *)ds.dsBm.bmBits != g_hdSourceBits) return;
+	HGDIOBJ bmp = dc ? GetCurrentObject(dc, OBJ_BITMAP) : NULL;
+	if (!bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || !ds.dsBm.bmBits || ds.dsBm.bmBitsPixel != 16) return NULL;
+	*w = ds.dsBm.bmWidth;
+	*h = ds.dsBm.bmHeight;
+	*stride = ds.dsBm.bmWidthBytes / 2;
+	*bottomUp = ds.dsBmih.biHeight > 0;
+	return ds.dsBm.bmBits;
+}
 
+// A drawing rectangle in device pixels, limited to the clip box and the surface.
+static RECT device_rect(HDC dc, const HdSurface *s, int x, int y, int w, int h)
+{
 	POINT pts[2] = { { x, y }, { x + w, y + h } };
-	LPtoDP(dst, pts, 2);
+	LPtoDP(dc, pts, 2);
 	RECT r = { min(pts[0].x, pts[1].x), min(pts[0].y, pts[1].y), max(pts[0].x, pts[1].x), max(pts[0].y, pts[1].y) }, clip;
-	if (GetClipBox(dst, &clip) != ERROR) {
+	if (GetClipBox(dc, &clip) != ERROR) {
 		POINT c[2] = { { clip.left, clip.top }, { clip.right, clip.bottom } };
-		LPtoDP(dst, c, 2);
+		LPtoDP(dc, c, 2);
 		r.left = max(r.left, c[0].x); r.top = max(r.top, c[0].y);
 		r.right = min(r.right, c[1].x); r.bottom = min(r.bottom, c[1].y);
 	}
 	r.left = max(r.left, 0); r.top = max(r.top, 0);
-	r.right = min(r.right, g_hdW); r.bottom = min(r.bottom, GAME_H);
+	r.right = min(r.right, s->w); r.bottom = min(r.bottom, s->h);
+	return r;
+}
+
+// The game has drawn into a rectangle of a surface through GDI (pop-ups, sprites, borders).
+// Whatever HD art was there is gone, even where a new pixel happens to have the same value as
+// the old one, so the unchanged-value test must not be trusted for these pixels.
+static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h)
+{
+	int bw, bh, stride;
+	BOOL bottomUp;
+	const WORD *bits = g_main.frame ? dc_pixels(dst, &bw, &bh, &stride, &bottomUp) : NULL;
+	HdSurface *s = !bits ? NULL : bits == g_main.bits ? &g_main : bits == g_map.bits ? &g_map : NULL;
+	if (!s) return;
+	RECT r = device_rect(dst, s, x, y, w, h);
 	for (int row = r.top; row < r.bottom && r.right > r.left; row++) {
-		memset(g_hdState + (size_t)row * g_hdW + r.left, 0, (size_t)(r.right - r.left));
+		memset(s->state + (size_t)row * s->w + r.left, 0, (size_t)(r.right - r.left));
 	}
 }
 
-// Brings the big frame up to date for a rectangle of the 1x frame before it is shown.
-static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1)
+// The game is copying part of the map buffer into the frame: HD blocks go with it.
+static BOOL hd_transfer_map(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
-	// The bitmap being shown tells us which buffer this is and how its rows are laid out.
-	DIBSECTION ds;
-	HGDIOBJ bmp = GetCurrentObject(source, OBJ_BITMAP);
-	if (!hd_ready() || !bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || !ds.dsBm.bmBits) return FALSE;
-	if (ds.dsBm.bmBitsPixel != 16 || ds.dsBm.bmWidth != g_hdW || ds.dsBm.bmHeight != GAME_H) return FALSE;
-	const WORD *frame = ds.dsBm.bmBits;
-	int stride = ds.dsBm.bmWidthBytes / 2;
-	BOOL bottomUp = ds.dsBmih.biHeight > 0;
-	hd_track_frame(frame);
-	x0 = max(x0, 0); y0 = max(y0, 0); x1 = min(x1, g_hdW); y1 = min(y1, GAME_H);
-	if (x1 <= x0 || y1 <= y0) return TRUE;
-#define FRAME_ROW(yy) (frame + (size_t)(bottomUp ? GAME_H - 1 - (yy) : (yy)) * stride)
+	int dw, dh, dstride, mw, mh, mstride;
+	BOOL dBottomUp, mBottomUp;
+	if (rop != SRCCOPY || !g_map.frame || !g_main.frame) return FALSE;
+	const WORD *mapBits = dc_pixels(src, &mw, &mh, &mstride, &mBottomUp);
+	if (!mapBits || mapBits != g_map.bits || dc_pixels(dst, &dw, &dh, &dstride, &dBottomUp) != g_main.bits) return FALSE;
+
+	POINT d = { x, y }, m = { sx, sy };
+	LPtoDP(dst, &d, 1);
+	LPtoDP(src, &m, 1);
+	RECT r = device_rect(dst, &g_main, x, y, w, h);
+	for (int row = r.top; row < r.bottom; row++) {
+		int my = m.y + (row - d.y);
+		if (my < 0 || my >= g_map.h) continue;
+		const WORD *mapRow = mapBits + (size_t)(mBottomUp ? g_map.h - 1 - my : my) * mstride;
+		for (int col = r.left; col < r.right; col++) {
+			int mx = m.x + (col - d.x);
+			size_t at = (size_t)row * g_main.w + col;
+			if (mx < 0 || mx >= g_map.w) { g_main.state[at] = 0; continue; }
+			size_t mat = (size_t)my * g_map.w + mx;
+			if (g_map.state[mat] != 1 || g_map.shadow[mat] != mapRow[mx]) { g_main.state[at] = 0; continue; }
+			g_main.state[at] = 1;
+			g_main.shadow[at] = mapRow[mx];
+			for (int half = 0; half < 2; half++) {
+				const DWORD *from = g_map.frame + (size_t)(my * 2 + half) * g_map.w * 2 + mx * 2;
+				DWORD *to = g_main.frame + (size_t)(row * 2 + half) * g_main.w * 2 + col * 2;
+				to[0] = from[0];
+				to[1] = from[1];
+			}
+		}
+	}
+	return TRUE;
+}
+
+// Brings a surface's 2x frame up to date for a rectangle of its 1x buffer.
+static void surface_compose(HdSurface *s, const WORD *frame, int stride, BOOL bottomUp, int x0, int y0, int x1, int y1)
+{
+	x0 = max(x0, 0); y0 = max(y0, 0); x1 = min(x1, s->w); y1 = min(y1, s->h);
+	if (x1 <= x0 || y1 <= y0) return;
+#define FRAME_ROW(yy) (frame + (size_t)(bottomUp ? s->h - 1 - (yy) : (yy)) * stride)
 
 	// Pass 1: find the pixels the game has changed since their 2x block was written.
 	for (int y = y0; y < y1; y++) {
 		const WORD *row = FRAME_ROW(y);
-		size_t at = (size_t)y * g_hdW;
+		size_t at = (size_t)y * s->w;
 		for (int x = x0; x < x1; x++) {
 			WORD p = row[x];
-			if (g_hdState[at + x] && g_hdShadow[at + x] == p) continue;
-			g_hdState[at + x] = 2;
-			g_hdShadow[at + x] = p;
-			g_hdDirty[at + x] = 1;
+			if (s->state[at + x] && s->shadow[at + x] == p) continue;
+			s->state[at + x] = 2;
+			s->shadow[at + x] = p;
+			s->dirty[at + x] = 1;
 		}
 	}
 
 	// Pass 2: redraw the non-HD blocks that changed or touch a change. Each 1x pixel becomes four,
 	// each a 9:3:3:1 mix of it and its three neighbours on that side, which smooths text and
 	// sprites instead of doubling their pixels.
-	int bx0 = max(x0 - 1, 0), by0 = max(y0 - 1, 0), bx1 = min(x1 + 1, g_hdW), by1 = min(y1 + 1, GAME_H);
+	int bx0 = max(x0 - 1, 0), by0 = max(y0 - 1, 0), bx1 = min(x1 + 1, s->w), by1 = min(y1 + 1, s->h);
 	for (int y = by0; y < by1; y++) {
-		const WORD *rows[3] = { FRAME_ROW(max(y - 1, 0)), FRAME_ROW(y), FRAME_ROW(min(y + 1, GAME_H - 1)) };
-		size_t at = (size_t)y * g_hdW;
-		DWORD *out = g_hdFrame + (size_t)y * 2 * g_hdW * 2;
+		const WORD *rows[3] = { FRAME_ROW(max(y - 1, 0)), FRAME_ROW(y), FRAME_ROW(min(y + 1, s->h - 1)) };
+		size_t at = (size_t)y * s->w;
+		DWORD *out = s->frame + (size_t)y * 2 * s->w * 2;
 		for (int x = bx0; x < bx1; x++) {
-			if (g_hdState[at + x] != 2) continue;
+			if (s->state[at + x] != 2) continue;
 			BOOL touched = FALSE;
-			for (int ny = max(y - 1, 0); ny <= min(y + 1, GAME_H - 1) && !touched; ny++) {
-				for (int nx = max(x - 1, 0); nx <= min(x + 1, g_hdW - 1); nx++) {
-					if (g_hdDirty[(size_t)ny * g_hdW + nx]) { touched = TRUE; break; }
+			for (int ny = max(y - 1, 0); ny <= min(y + 1, s->h - 1) && !touched; ny++) {
+				for (int nx = max(x - 1, 0); nx <= min(x + 1, s->w - 1); nx++) {
+					if (s->dirty[(size_t)ny * s->w + nx]) { touched = TRUE; break; }
 				}
 			}
 			if (!touched) continue;
 			WORD p = rows[1][x];
 			for (int sub = 0; sub < 4; sub++) {
-				int nx = sub & 1 ? min(x + 1, g_hdW - 1) : max(x - 1, 0);
+				int nx = sub & 1 ? min(x + 1, s->w - 1) : max(x - 1, 0);
 				const WORD *other = rows[sub & 2 ? 2 : 0];
 				WORD ph = rows[1][nx], pv = other[x], pd = other[nx];
 				DWORD c = 0;
@@ -1868,13 +2085,42 @@ static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1)
 					v >>= 1; // 0..496 (16 x 31) -> 0..248, the same 5-to-8-bit expansion GDI uses
 					c |= v << (shift == 0 ? 0 : shift == 5 ? 8 : 16);
 				}
-				out[(sub & 2 ? g_hdW * 2 : 0) + x * 2 + (sub & 1)] = c;
+				out[(sub & 2 ? s->w * 2 : 0) + x * 2 + (sub & 1)] = c;
 			}
 		}
 	}
-	for (int y = y0; y < y1; y++) memset(g_hdDirty + (size_t)y * g_hdW + x0, 0, (size_t)(x1 - x0));
+	for (int y = y0; y < y1; y++) memset(s->dirty + (size_t)y * s->w + x0, 0, (size_t)(x1 - x0));
 #undef FRAME_ROW
+}
+
+// Brings the frame that is shown up to date for a rectangle, given the DC holding the 1x frame.
+static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1)
+{
+	int w, h, stride;
+	BOOL bottomUp;
+	const WORD *frame = hd_ready() ? dc_pixels(source, &w, &h, &stride, &bottomUp) : NULL;
+	if (!frame || w != g_main.w || h != g_main.h) return FALSE;
+	surface_track(&g_main, frame);
+	surface_compose(&g_main, frame, stride, bottomUp, x0, y0, x1, y1);
 	return TRUE;
+}
+
+// The game sometimes copies a piece of the map buffer straight to the window (the hover outline,
+// the blinking unit). Show it from the map's 2x frame so those tiles do not drop out of HD.
+static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
+{
+	int mw, mh, stride;
+	BOOL bottomUp;
+	if (rop != SRCCOPY || !g_map.frame || !g_view || WindowFromDC(dst) != g_view) return FALSE;
+	const WORD *mapBits = dc_pixels(src, &mw, &mh, &stride, &bottomUp);
+	if (!mapBits || mapBits != g_map.bits) return FALSE;
+	POINT m = { sx, sy };
+	LPtoDP(src, &m, 1);
+	surface_compose(&g_map, mapBits, stride, bottomUp, m.x, m.y, m.x + w, m.y + h);
+	int mode = g_twoStage ? SetStretchBltMode(dst, COLORONCOLOR) : 0;
+	BOOL ok = StretchBlt(dst, x, y, w, h, g_map.dc, m.x * 2, m.y * 2, w * 2, h * 2, SRCCOPY);
+	if (mode) SetStretchBltMode(dst, mode);
+	return ok;
 }
 
 static void hd_install(void)
@@ -1950,6 +2196,7 @@ static void install(HMODULE self)
 	g_dumpViews = GetPrivateProfileIntA("Debug", "DumpViews", 0, ini);
 	g_timing = GetPrivateProfileIntA("Debug", "Timing", 0, ini);
 	g_twoStage = g_smooth && GetPrivateProfileIntA("Display", "FastScale", 1, ini);
+	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 1, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
