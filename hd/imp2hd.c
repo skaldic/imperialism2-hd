@@ -57,6 +57,7 @@ static HWND g_frame, g_view;
 
 // HD artwork layer (defined further down).
 static BOOL g_hd;
+static BOOL g_marginArt = TRUE, g_screenOnTop;
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
@@ -653,6 +654,7 @@ static void watch_screens(void)
 	// Whatever is on top decides how the frame is presented. Only the map uses the full width;
 	// with no screen at all (the intro movies) the 800-wide layout is centred too.
 	int offset = g_gameW > BASE_W && !(top && is_map_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
+	g_screenOnTop = top != NULL;
 	if (offset != g_offsetX) {
 		g_offsetX = offset;
 		relayout_children();
@@ -941,6 +943,68 @@ static int WINAPI h_StretchDIBits(HDC dst, int x, int y, int w, int h, int sx, i
 	return o_StretchDIBits(dst, x, y, w, h, sx, sy, sw, sh, bits, info, usage, rop);
 }
 
+// Beside a centred 800-wide screen: a dimmed, heavily blurred continuation of the screen's own
+// edge instead of plain black bars. "src" holds the 1x frame.
+static void draw_margins(HDC dst, HDC src)
+{
+	static HDC small, blurred;
+	static DWORD *tiny, *soft;
+	RECT left = { -g_offsetX, 0, 0, GAME_H }, right = { BASE_W, 0, BASE_W + g_offsetX, GAME_H };
+	BOOL showLeft = RectVisible(dst, &left), showRight = RectVisible(dst, &right);
+	if (!showLeft && !showRight) return;
+	if (!g_marginArt || !g_screenOnTop) {
+		FillRect(dst, &left, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		FillRect(dst, &right, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		return;
+	}
+	enum { TW = 16, TH = 40, BW = 64, BH = 300 };
+	if (!small) {
+		BITMAPINFO bi = { 0 };
+		bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		HDC screen = GetDC(NULL);
+		small = CreateCompatibleDC(screen);
+		bi.bmiHeader.biWidth = TW;
+		bi.bmiHeader.biHeight = -TH;
+		SelectObject(small, CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&tiny, NULL, 0));
+		SetStretchBltMode(small, HALFTONE);
+		blurred = CreateCompatibleDC(screen);
+		bi.bmiHeader.biWidth = BW * 2;
+		bi.bmiHeader.biHeight = -BH;
+		SelectObject(blurred, CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&soft, NULL, 0));
+		ReleaseDC(NULL, screen);
+		if (!tiny || !soft) { g_marginArt = FALSE; return; }
+	}
+	// Shrink each 48-pixel edge strip to 8x40, then enlarge it again with interpolation and
+	// dimmed: a soft wash of the screen's edge colours.
+	StretchBlt(small, 0, 0, 8, TH, src, 0, 0, 48, GAME_H, SRCCOPY);
+	StretchBlt(small, 8, 0, 8, TH, src, BASE_W - 48, 0, 48, GAME_H, SRCCOPY);
+	GdiFlush();
+	for (int side = 0; side < 2; side++) {
+		for (int y = 0; y < BH; y++) {
+			float fy = 1 + (y + 0.5f) * (TH - 2) / BH - 0.5f;
+			int y0 = (int)fy, y1 = min(y0 + 1, TH - 1);
+			float ty = fy - y0;
+			for (int x = 0; x < BW; x++) {
+				float fx = side * 8 + 1 + (x + 0.5f) * 6 / BW - 0.5f;
+				int x0 = (int)fx, x1 = min(x0 + 1, side * 8 + 7);
+				float tx = fx - x0;
+				DWORD c = 0;
+				for (int shift = 0; shift <= 16; shift += 8) {
+					float top = ((tiny[y0 * TW + x0] >> shift) & 255) * (1 - tx) + ((tiny[y0 * TW + x1] >> shift) & 255) * tx;
+					float bottom = ((tiny[y1 * TW + x0] >> shift) & 255) * (1 - tx) + ((tiny[y1 * TW + x1] >> shift) & 255) * tx;
+					c |= (DWORD)((top * (1 - ty) + bottom * ty) * 0.38f) << shift;
+				}
+				soft[y * BW * 2 + side * BW + x] = c;
+			}
+		}
+	}
+	int mode = SetStretchBltMode(dst, COLORONCOLOR);
+	if (showLeft) StretchBlt(dst, left.left, 0, g_offsetX, GAME_H, blurred, 0, 0, BW, BH, SRCCOPY);
+	if (showRight) StretchBlt(dst, right.left, 0, g_offsetX, GAME_H, blurred, BW, 0, BW, BH, SRCCOPY);
+	SetStretchBltMode(dst, mode);
+}
 static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
 	ensure_mapped(dst);
@@ -1000,11 +1064,7 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 			g_presentTicks += t1.QuadPart - t0.QuadPart;
 			g_presentPixels += w * h;
 		}
-		if (g_offsetX) {
-			RECT left = { -g_offsetX, 0, 0, GAME_H }, right = { BASE_W, 0, GAME_W - g_offsetX, GAME_H };
-			FillRect(dst, &left, (HBRUSH)GetStockObject(BLACK_BRUSH));
-			FillRect(dst, &right, (HBRUSH)GetStockObject(BLACK_BRUSH));
-		}
+		if (g_offsetX) draw_margins(dst, src);
 		RestoreDC(dst, saved);
 		return ok;
 	}
@@ -1635,7 +1695,7 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0])) return NULL;
 	HdImage *img = &g_hdImages[g_hdImageCount++];
 	img->hash = hash; img->w = w; img->h = h; img->bpp = -8; img->pixels = NULL; // -8: matched as a cell
-	int best = -1, bestSame = 0, sampled = 0;
+	int best = -1, bestSame = 0, secondSame = 0, sampled = 0;
 	for (int i = 0; i < g_hdIndexCount; i++) {
 		if (g_hdIndex[i].bpp != 8 || g_hdIndex[i].w != w || g_hdIndex[i].h != h || !g_hdIndex[i].data8) continue;
 		int same = 0;
@@ -1646,10 +1706,18 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 			for (int col = 0; col < w; col++) same += mem[col] == file[col];
 			sampled += w;
 		}
-		if (same > bestSame) { bestSame = same; best = i; }
+		if (same > bestSame) { secondSame = bestSame; bestSame = same; best = i; }
+		else if (same > secondSame) secondSame = same;
 	}
 	for (int i = best; i >= 0 && i == best; i++) {
 		if (bestSame * 100 < sampled * 80) break; // under 80% agreement: not the same picture
+		// Two archive pictures that both fit (animation frames, colour variants) cannot be told
+		// apart reliably unless the winner is near-exact or clearly ahead of the runner-up.
+		if (bestSame * 100 < sampled * 97 && (bestSame - secondSame) * 100 < sampled * 5) {
+			logf_("HD: %dx%d 8-bit picture is ambiguous (%d%% vs %d%%): left as is", w, h,
+				bestSame * 100 / max(sampled, 1), secondSame * 100 / max(sampled, 1));
+			break;
+		}
 		char path[MAX_PATH];
 		snprintf(path, sizeof path, "%s\\%s\\%d.png", g_hdAssets, g_hdIndex[i].archive, g_hdIndex[i].id);
 		img->pixels = hd_load_png(path, w * 2, h * 2);
@@ -1677,6 +1745,7 @@ typedef struct {
 } HdSurface;
 
 #define MAP_SURFACE_H 728
+#define HD_KEY 0xff00ffu // transparent pixels in upscaled sprites
 static HdSurface g_main, g_map;
 
 static BOOL surface_create(HdSurface *s, int w, int h)
@@ -1941,15 +2010,29 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 			continue;
 		}
 		// Keyed: the game skipped the pixels holding the key index, and so do we.
+		// The upscaled sprite's outline is rounded at 2x, so within a block some of the four
+		// pixels can be sprite and some background (marked with the key colour, magenta).
 		for (int x = 0; x < w; x++) {
-			if (srcRow[x] == key) continue;
-			s->shadow[at + x] = row[x];
-			s->state[at + x] = 1;
+			const DWORD *from[2];
+			DWORD *to[2], solid = HD_KEY;
 			for (int half = 0; half < 2; half++) {
-				const DWORD *from = pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + (ax + x) * 2;
-				DWORD *to = s->frame + (size_t)((dy + y) * 2 + half) * s->w * 2 + (dx + x) * 2;
-				to[0] = from[0];
-				to[1] = from[1];
+				from[half] = pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + (ax + x) * 2;
+				to[half] = s->frame + (size_t)((dy + y) * 2 + half) * s->w * 2 + (dx + x) * 2;
+				for (int k = 0; k < 2; k++) if ((from[half][k] & 0xffffff) != HD_KEY) solid = from[half][k];
+			}
+			if (solid == HD_KEY) continue; // nothing of the sprite in this block
+			BOOL drawn = srcRow[x] != key;
+			// Background pixels of a block keep what is there, if what is there is known.
+			BOOL keepBackground = s->state[at + x] != 0;
+			for (int half = 0; half < 2; half++) {
+				for (int k = 0; k < 2; k++) {
+					if ((from[half][k] & 0xffffff) != HD_KEY) to[half][k] = from[half][k];
+					else if (drawn && !keepBackground) to[half][k] = solid;
+				}
+			}
+			if (drawn) {
+				s->shadow[at + x] = row[x];
+				s->state[at + x] = 1;
 			}
 		}
 	}
@@ -2197,6 +2280,7 @@ static void install(HMODULE self)
 	g_timing = GetPrivateProfileIntA("Debug", "Timing", 0, ini);
 	g_twoStage = g_smooth && GetPrivateProfileIntA("Display", "FastScale", 1, ini);
 	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 1, ini);
+	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 1, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
