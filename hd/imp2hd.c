@@ -57,6 +57,7 @@ static HWND g_frame, g_view;
 
 // HD artwork layer (defined further down).
 static BOOL g_hd;
+static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
 static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h);
@@ -327,6 +328,11 @@ static void adopt_popup(HWND hwnd)
 static BOOL g_knownBuild, g_dumpViews;
 static void widen_globals(void);
 static int g_wideSteps = 7;
+static BOOL g_timing;
+static LONGLONG g_presentTicks;
+static int g_presentPixels;
+static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks;
+static int g_copyCalls;
 static int g_traceBudget; // diagnostic: number of paint calls still to be logged
 static BOOL g_wideMap; // tile cache relocated, so the map view itself may be widened
 
@@ -656,6 +662,20 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		watch_screens();
 		return 0;
 	}
+	if (msg == WM_PAINT && g_timing) {
+		// Diagnostic: how long the game takes to paint, and how much of that is presenting.
+		LARGE_INTEGER a, b, freq;
+		QueryPerformanceFrequency(&freq);
+		QueryPerformanceCounter(&a);
+		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = 0; g_copyCalls = 0;
+		LRESULT r = CallWindowProcA(g_viewProc, hwnd, msg, wp, lp);
+		QueryPerformanceCounter(&b);
+		double ms = (b.QuadPart - a.QuadPart) * 1000.0 / freq.QuadPart;
+		double k = 1000.0 / freq.QuadPart;
+		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f; %d game pixels", ms,
+			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_presentPixels);
+		return r;
+	}
 	switch (msg) {
 	case WM_PARENTNOTIFY:
 		if (LOWORD(wp) == WM_CREATE) adopt_child(hwnd, (HWND)lp);
@@ -954,10 +974,25 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 		// holds whatever the map screen left there, so it is not shown and the margins are black.
 		int width = g_offsetX ? BASE_W : GAME_W;
 		BOOL ok;
-		if (g_hd && rop == SRCCOPY && hd_compose(src, x - 2, y - 2, x + w + 2, y + h + 2)) {
+		LARGE_INTEGER t0, t1;
+		if (g_timing) QueryPerformanceCounter(&t0);
+		// Smooth scaling in two stages: the frame is first doubled with interpolation into the
+		// 2x frame (which is also where HD art lives), and that is then enlarged the rest of the
+		// way without filtering. GDI's own smooth mode costs 60-90 ms for a full frame here.
+		BOOL composed = (g_hd || g_twoStage) && rop == SRCCOPY && hd_compose(src, x - 2, y - 2, x + w + 2, y + h + 2);
+		if (g_timing) { LARGE_INTEGER tc; QueryPerformanceCounter(&tc); g_composeTicks += tc.QuadPart - t0.QuadPart; }
+		if (composed) {
+			int mode = g_twoStage ? SetStretchBltMode(dst, COLORONCOLOR) : 0;
 			ok = StretchBlt(dst, 0, 0, width, GAME_H, g_hdDC, 0, 0, width * 2, GAME_H * 2, rop);
+			if (mode) SetStretchBltMode(dst, mode);
 		} else {
 			ok = StretchBlt(dst, 0, 0, width, GAME_H, src, 0, 0, width, GAME_H, rop);
+		}
+		if (g_timing) {
+			GdiFlush();
+			QueryPerformanceCounter(&t1);
+			g_presentTicks += t1.QuadPart - t0.QuadPart;
+			g_presentPixels += w * h;
 		}
 		if (g_offsetX) {
 			RECT left = { -g_offsetX, 0, 0, GAME_H }, right = { BASE_W, 0, GAME_W - g_offsetX, GAME_H };
@@ -1645,9 +1680,11 @@ static BOOL hd_ready(void)
 	if (!g_hdDC || !bmp || !g_hdShadow || !g_hdState || !g_hdDirty) { g_hdFrame = NULL; return FALSE; }
 	SelectObject(g_hdDC, bmp);
 	g_hdW = g_gameW;
-	hd_build_index();
+	if (g_hd) hd_build_index();
 	return TRUE;
 }
+
+static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, int h, int dx, int dy, DWORD transparent);
 
 // The 1x frame the HD state describes: the pixel buffer the game last copied artwork into. The
 // game has several offscreen buffers of the same size, so they are told apart by address.
@@ -1662,8 +1699,19 @@ static void hd_track_frame(const WORD *bits)
 static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
 	int dx, int dy, DWORD transparent)
 {
+	LARGE_INTEGER c0, c1, c2;
+	QueryPerformanceCounter(&c0);
 	((CopyPixelsFn)0x00487790)(src, dst, sx, sy, w, h, dx, dy, transparent);
+	QueryPerformanceCounter(&c1);
+	hd_copy_pixels_after(src, dst, sx, sy, w, h, dx, dy, transparent);
+	QueryPerformanceCounter(&c2);
+	g_origCopyTicks += c1.QuadPart - c0.QuadPart;
+	g_copyTicks += c2.QuadPart - c1.QuadPart;
+	g_copyCalls++;
+}
 
+static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, int h, int dx, int dy, DWORD transparent)
+{
 	if (!readable(src, 0x14) || !readable(dst, 0x14) || !hd_ready()) return;
 	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
 	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
@@ -1900,6 +1948,8 @@ static void install(HMODULE self)
 	g_smooth = GetPrivateProfileIntA("Display", "Smooth", 1, ini);
 	g_integerScale = GetPrivateProfileIntA("Display", "IntegerScale", 0, ini);
 	g_dumpViews = GetPrivateProfileIntA("Debug", "DumpViews", 0, ini);
+	g_timing = GetPrivateProfileIntA("Debug", "Timing", 0, ini);
+	g_twoStage = g_smooth && GetPrivateProfileIntA("Display", "FastScale", 1, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
