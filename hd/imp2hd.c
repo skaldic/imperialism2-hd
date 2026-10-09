@@ -1032,15 +1032,19 @@ static HDC margin_texture(void)
 
 static const WORD *dc_pixels(HDC dc, int *w, int *h, int *stride, BOOL *bottomUp);
 
-// Margin extension: continues the background at each side of a centred screen. The outermost
-// strip of the screen is repeated outward, alternately flipped so copies meet edge to edge, and
-// shaded darker toward the outside. Things that are not background but reach the edge (ribbon
-// ends, ornaments) show up as short runs of rows much brighter than the rows around them; those
-// rows are replaced by the background just below or above before the strip is used.
+// Margin extension: continues the background at each side of a centred screen by reflecting it
+// about the screen's edge, shaded darker toward the outside.
+//
+// Each row is reflected only as far in as its background goes: the scan stops where something
+// clearly brighter than the row's edge begins (a button, a scroll, a frame). A row whose
+// background is at least a margin wide is reflected once with no repeat; a shorter one bounces
+// back and forth within its own background. Things that reach the very edge (ribbon ends) show
+// up as short runs of rows much brighter than the rows around them, and take their pixels from
+// the background rows just below or above instead.
 // Returns a DC holding both margins at 2x, left then right, or NULL.
 static HDC margin_extension(HDC src)
 {
-	enum { STRIP = 24, WINDOW = 90, RUN_MAX = 110 };
+	enum { EDGE = 24, WINDOW = 90, RUN_MAX = 110, SPAN = 6, ERODE = 8, SMOOTH = 4 };
 	static HDC dc;
 	static DWORD *out;
 	static WORD *flat;
@@ -1062,38 +1066,54 @@ static HDC margin_extension(HDC src)
 		HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&out, NULL, 0);
 		ReleaseDC(NULL, screen);
 		flat = malloc((size_t)marginW * GAME_H * sizeof(WORD));
-		if (!dc || !dib || !flat || marginW <= 0) { dc = NULL; return NULL; }
+		if (!dc || !dib || !flat || marginW <= EDGE) { dc = NULL; return NULL; }
 		SelectObject(dc, dib);
 	}
 
-	static WORD strip[GAME_H][STRIP];
-	static int lum[GAME_H], sorted[2 * WINDOW + 1];
+	static int rgb[GAME_H][3]; // each row's average edge colour, 5 bits a channel
+	static int chroma[GAME_H], sortedChroma[2 * WINDOW + 1];
+	static int lum[GAME_H], mean[GAME_H], sorted[2 * WINDOW + 1], from[GAME_H], width[GAME_H], eroded[GAME_H];
 	static BYTE object[GAME_H];
+// Pixel k columns in from the screen's edge on this side, and a 0..248 brightness.
+#define EDGE_PX(y, k) frame[(size_t)(bottomUp ? GAME_H - 1 - (y) : (y)) * stride + (side ? BASE_W - 1 - (k) : (k))]
+#define BRIGHTNESS(p) ((((p) >> 10) & 31) * 2 + (((p) >> 5) & 31) * 5 + ((p) & 31))
 	for (int side = 0; side < 2; side++) {
-		// The strip, stored so that column 0 is the screen's outermost column.
+		// A row's edge brightness is that of its brightest few pixels, so an object that only
+		// partly crosses the edge strip (the tip of a ribbon) still stands out.
 		for (int y = 0; y < GAME_H; y++) {
-			const WORD *row = frame + (size_t)(bottomUp ? GAME_H - 1 - y : y) * stride;
-			// A row's brightness is that of its brightest few pixels, so an object that only
-			// partly crosses the strip (the tip of a ribbon) still stands out.
-			int top[4] = { 0, 0, 0, 0 };
-			for (int k = 0; k < STRIP; k++) {
-				WORD p = row[side ? BASE_W - 1 - k : k];
-				strip[y][k] = p;
-				int v = ((p >> 10) & 31) * 2 + ((p >> 5) & 31) * 5 + (p & 31);
+			int top[4] = { 0, 0, 0, 0 }, total = 0, vivid = 0;
+			for (int k = 0; k < EDGE; k++) {
+				WORD p = EDGE_PX(y, k);
+				int v = BRIGHTNESS(p);
+				total += v;
+				int r5 = (p >> 10) & 31, g5 = (p >> 5) & 31, b5 = p & 31;
+				vivid += max(r5, max(g5, b5)) - min(r5, min(g5, b5));
+				for (int c = 0; c < 3; c++) rgb[y][c] = (k ? rgb[y][c] : 0) + ((p >> (c * 5)) & 31);
 				for (int t = 0; t < 4; t++) if (v > top[t]) { int swap = top[t]; top[t] = v; v = swap; }
 			}
-			lum[y] = (top[0] + top[1] + top[2] + top[3]) / 4; // 0..248
+			lum[y] = (top[0] + top[1] + top[2] + top[3]) / 4;
+			mean[y] = total / EDGE;
+			chroma[y] = vivid * 8 / EDGE; // average colourfulness, in eighths
+			for (int c = 0; c < 3; c++) rgb[y][c] /= EDGE;
+			from[y] = y;
 		}
-		// Rows much brighter than the median of the rows around them belong to an object.
+		// Rows much brighter than the darker rows around them belong to an object.
 		for (int y = 0; y < GAME_H; y++) {
 			int n = 0;
 			for (int j = max(0, y - WINDOW); j <= min(GAME_H - 1, y + WINDOW); j++) {
-				int v = lum[j], at = n++;
+				int v = mean[j], at = n;
 				while (at > 0 && sorted[at - 1] > v) { sorted[at] = sorted[at - 1]; at--; }
 				sorted[at] = v;
+				v = chroma[j]; at = n++;
+				while (at > 0 && sortedChroma[at - 1] > v) { sortedChroma[at] = sortedChroma[at - 1]; at--; }
+				sortedChroma[at] = v;
 			}
-			int median = sorted[n / 2];
-			object[y] = lum[y] > median * 8 / 5 + 14;
+			// The background level is a low percentile, not the median: at the top and bottom of
+			// the screen a ribbon can fill half of the rows in reach. A row stands out by being
+			// brighter on average, or by being more colourful (gold against grey engraving, whose
+			// thin light lines are as bright as the gold but have no colour).
+			object[y] = mean[y] > sorted[n * 3 / 10] * 8 / 5 + 14 ||
+				(chroma[y] > sortedChroma[n * 3 / 10] * 8 / 5 + 20 && mean[y] > sorted[n * 3 / 10]);
 		}
 		for (int y = 0; y < GAME_H;) {
 			if (!object[y]) { y++; continue; }
@@ -1102,23 +1122,54 @@ static HDC margin_extension(HDC src)
 			a = max(0, a - 3);
 			b = min(GAME_H, b + 3);
 			if (b - a <= RUN_MAX) {
-				// Mirror the background below the run into it, or the background above.
 				for (int r = a; r < b; r++) {
 					int below = b + (b - 1 - r), above = a - 1 - (r - a);
-					int from = below < GAME_H ? below : above >= 0 ? above : -1;
-					if (from >= 0) memcpy(strip[r], strip[from], sizeof strip[r]);
+					if (below < GAME_H) from[r] = below; else if (above >= 0) from[r] = above;
 				}
 			}
 			y = b;
 		}
-		// Lay the strip out across the margin, column 0 of the margin being nearest the screen,
-		// then write it at 2x with the usual smoothing and a shade that deepens outward.
+		// How far in each row's background goes.
 		for (int y = 0; y < GAME_H; y++) {
-			for (int d = 0; d < marginW; d++) {
-				int k = d % (2 * STRIP);
-				flat[y * marginW + d] = strip[y][k < STRIP ? k : 2 * STRIP - 1 - k];
+			// The limit sits between the edge's average and its highlights: above a drape's folds,
+			// below the shaded rim of a parchment scroll.
+			int sy = from[y], limit = (mean[sy] + lum[sy]) / 2 * 7 / 5 + 10, sum = 0, tint[3] = { 0, 0, 0 };
+			width[y] = marginW;
+			for (int k = EDGE - SPAN; k < marginW; k++) {
+				WORD in = EDGE_PX(sy, k), gone = k >= EDGE ? EDGE_PX(sy, k - SPAN) : 0;
+				sum += BRIGHTNESS(in) - (k >= EDGE ? BRIGHTNESS(gone) : 0);
+				int shift = 0;
+				for (int c = 0; c < 3; c++) {
+					tint[c] += ((in >> (c * 5)) & 31) - (k >= EDGE ? (gone >> (c * 5)) & 31 : 0);
+					shift += abs(tint[c] - rgb[sy][c] * SPAN);
+				}
+				if (k < EDGE - 1) continue;
+				// Something else begins where it gets clearly brighter than the edge, or
+				// somewhat brighter and of a different colour (a gold ribbon's shaded tail).
+				BOOL brighter = sum > limit * SPAN;
+				BOOL tinted = shift > 16 * SPAN && sum > mean[sy] * SPAN * 6 / 5;
+				if (brighter || tinted) { width[y] = max(EDGE, k - SPAN + 1); break; }
 			}
 		}
+		// Neighbouring rows must reflect at nearly the same place or the picture shears, so each
+		// row takes the smallest width near it, then the widths are smoothed. (Both steps only
+		// ever shorten a row's own width.)
+		for (int y = 0; y < GAME_H; y++) {
+			int m = marginW;
+			for (int j = max(0, y - ERODE); j <= min(GAME_H - 1, y + ERODE); j++) m = min(m, width[j]);
+			eroded[y] = m;
+		}
+		for (int y = 0; y < GAME_H; y++) {
+			int sum = 0, n = 0;
+			for (int j = max(0, y - SMOOTH); j <= min(GAME_H - 1, y + SMOOTH); j++) { sum += eroded[j]; n++; }
+			int w = max(EDGE, sum / n), sy = from[y];
+			for (int d = 0; d < marginW; d++) {
+				int k = d % (2 * w);
+				flat[y * marginW + d] = EDGE_PX(sy, k < w ? k : 2 * w - 1 - k);
+			}
+		}
+		// Written at 2x with the usual smoothing and a shade that deepens outward. Column 0 of
+		// "flat" is nearest the screen.
 		for (int y = 0; y < GAME_H; y++) {
 			for (int d = 0; d < marginW; d++) {
 				WORD p = flat[y * marginW + d];
@@ -1139,6 +1190,8 @@ static HDC margin_extension(HDC src)
 			}
 		}
 	}
+#undef EDGE_PX
+#undef BRIGHTNESS
 	return dc;
 }
 
