@@ -687,6 +687,7 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		if (msg >= WM_MOUSEFIRST && msg <= WM_MBUTTONDBLCLK && scaled()) {
 			int rawX = (short)LOWORD(lp), rawY = (short)HIWORD(lp);
 			lp = MAKELPARAM(to_game_x(rawX) - g_offsetX, to_game_y(rawY));
+			if (g_dumpViews && msg == WM_LBUTTONDOWN) g_traceBudget = 40;
 			if (g_dumpViews && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP)) {
 				logf_("%s at view %d,%d -> game %d,%d (offset %d)", msg == WM_LBUTTONDOWN ? "press" : "release",
 					rawX, rawY, (short)LOWORD(lp), (short)HIWORD(lp), g_offsetX);
@@ -922,7 +923,10 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 		BITMAP bm = { 0 };
 		HGDIOBJ obj = src ? GetCurrentObject(src, OBJ_BITMAP) : NULL;
 		if (obj) GetObjectA(obj, sizeof bm, &bm);
-		logf_("  blit to view %d,%d %dx%d from %d,%d of %ldx%ld bitmap", x, y, w, h, sx, sy, bm.bmWidth, bm.bmHeight);
+		RECT clip = { 0 };
+		int kind = o_GetClipBox ? o_GetClipBox(dst, &clip) : GetClipBox(dst, &clip);
+		logf_("  blit to view %d,%d %dx%d from %d,%d of %ldx%ld bitmap; clip kind %d box %ld,%ld-%ld,%ld", x, y, w, h, sx, sy,
+			bm.bmWidth, bm.bmHeight, kind, clip.left, clip.top, clip.right, clip.bottom);
 	}
 
 	// Reading the screen back (the blinking unit does this to composite its sprite over what is
@@ -1217,7 +1221,11 @@ static BOOL relocate_tile_cache(void)
 // Fixed "the map is 576 pixels / 9 tiles wide" numbers in the map code.
 static BOOL widen_map_constants(int extra)
 {
-	BOOL ok = patch_imm8(0x0055d22c, 9, MAP_COLUMNS_WIDE);          // Draw: columns kept in the cache
+	// Draw marks a cache slot "on screen" when its tile lies within a span of rows and columns
+	// from the view's corner. The row span is this constant (first row + 9, ten rows); the column
+	// span is a global, set in widen_globals. With 127 slots the wide view affords 14 columns by
+	// 9 rows, so the row span drops by one.
+	BOOL ok = patch_imm8(0x0055d22c, 9, 8);
 	ok &= patch_imm32(0x0055aaee, 576, 576 + extra);                // SetUpperLeft: area to invalidate
 	ok &= patch_imm32(0x0055ab1a, 640, 640 + extra);                // SetUpperLeft: scroll area
 	ok &= patch_imm32(0x0055db92, 576, 576 + extra);                // DrawTile: clip rectangle
@@ -1770,7 +1778,7 @@ static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1)
 				DWORD c = 0;
 				for (int shift = 0; shift <= 10; shift += 5) {
 					DWORD v = 9 * ((p >> shift) & 31) + 3 * ((ph >> shift) & 31) + 3 * ((pv >> shift) & 31) + ((pd >> shift) & 31);
-					v = (v * 255 + 248) / 496; // 0..496 (16 x 31) -> 0..255
+					v >>= 1; // 0..496 (16 x 31) -> 0..248, the same 5-to-8-bit expansion GDI uses
 					c |= v << (shift == 0 ? 0 : shift == 5 ? 8 : 16);
 				}
 				out[(sub & 2 ? g_hdW * 2 : 0) + x * 2 + (sub & 1)] = c;
@@ -1818,13 +1826,16 @@ static void widen_screen(int width)
 static void widen_globals(void)
 {
 	if (g_gameW <= BASE_W) return;
-	int *screenW = (int *)0x0075bc88, *columns = (int *)0x0075c048, *rows = (int *)0x0075c0d0;
+	int *screenW = (int *)0x0075bc88, *columns = (int *)0x0075c048, *cachedColumnSpan = (int *)0x0075c0d0;
 	logf_("globals before: screen width %d, map columns+1 %d, cached row span %d", *screenW,
-		(short)*columns, (short)*rows);
+		(short)*columns, (short)*cachedColumnSpan);
 	*screenW = g_gameW; // also sizes the map's composition buffer
 	if (g_wideMap) {
 		*columns = MAP_COLUMNS_WIDE + 1; // limits how far right the map can scroll
-		*rows = 8;                       // rows kept in the cache: 9, down from 11
+		// Columns whose cache slots count as on screen: first column + 13, fourteen in all (it
+		// was 10 for the 9-column view). The game only un-draws the hover outline on a tile
+		// whose slot is marked on screen, so too small a span leaves outlines behind.
+		*cachedColumnSpan = MAP_COLUMNS_WIDE;
 		short *minimapColumns = (short *)0x0076091c; // minimap rectangle width for the close-up map
 		logf_("minimap close-up columns before: %d", *minimapColumns);
 		if (*minimapColumns == 10) *minimapColumns = MAP_COLUMNS_WIDE + 1; // stored as columns + 1
