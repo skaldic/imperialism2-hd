@@ -5,8 +5,8 @@ reverse-engineering tooling used to build it.
 
 The game is hard-wired to 800x600. Out of the box it either switches your monitor to that
 resolution or draws a small box in the middle of the desktop. With this patch the desktop stays at
-its native resolution and the whole game is scaled to the largest 4:3 size that fits, centred with
-black bars at the sides.
+its native resolution and the game is scaled to fit. Optionally the map screen is widened to use a
+16:9 display, and the artwork is replaced by 2x upscaled versions.
 
 You need your own copy of the game. Nothing from the game is included here, and the game's files
 are never modified.
@@ -15,20 +15,21 @@ are never modified.
 
 Developed and tested against the GOG release (v1.03 executable) on Windows 11.
 
-Working:
+| Feature | Setting | State |
+|---|---|---|
+| Scaling to the display | always on | Works on every screen tried |
+| Wide map (13 tile columns instead of 9) | `Wide=1` | Works; land map and zoomed-out overview |
+| HD artwork | `HD=1` | Works; quality varies, see below |
 
-- main menu, map, load/save screens
-- pop-ups and the pause menu
-- intro movies
-- text entry fields
-- mouse input and the game's custom cursors
-
-Not yet checked: city, trade, diplomacy and tactical battle screens, and multiplayer.
+Not yet checked: tactical battles and multiplayer, with any of the options on.
 
 Known limits:
 
-- The picture is still 4:3. Using the full width of a widescreen display is the next stage.
-- Scaling is done on the CPU by GDI. On very large displays, scrolling may be slower than stock.
+- Only the map screen is widened. Every other screen stays 800 wide and is shown centred, with
+  its own background continued into the margins.
+- HD art is an automatic upscale. Line art and icons come out well; fine textures and very small
+  figures less so.
+- The zoomed-out overview is not HD.
 
 ## Install
 
@@ -44,18 +45,25 @@ Optional. Create `imp2hd.ini` next to the exe:
 
 ```ini
 [Display]
-Enabled=1
-Smooth=1
-IntegerScale=0
+Wide=1
+HD=1
 ```
 
 | Key | Default | Effect |
 |---|---|---|
 | `Enabled` | 1 | 0 turns the patch off without removing the DLL |
-| `Smooth` | 1 | 0 uses faster, blockier nearest-neighbour scaling |
-| `IntegerScale` | 0 | 1 snaps to a whole-number scale for the sharpest pixels |
+| `Smooth` | 1 | 0 uses blocky nearest-neighbour scaling |
+| `FastScale` | 1 | 0 uses GDI's own smooth scaling, which is much slower on large displays |
+| `IntegerScale` | 0 | 1 snaps to a whole-number scale |
+| `Wide` | 0 | 1 widens the map screen to 1056x600 |
+| `MarginArt` | 3 | Beside centred screens in wide mode: 0 black, 1 blurred edge, 2 tiled game texture, 3 the screen's background continued |
+| `HD` | 0 | 1 uses upscaled artwork (needs the assets, see below) |
+| `HDAssets` | `decomp\assets\x2` in the game folder | Where the upscaled artwork is |
+| `HDCaptureTiles` | 1 | Save new map tiles for upscaling as they are met |
+| `HDAutoUpscale` | 1 | Upscale newly captured tiles when the game closes |
 
 `imp2hd.log` is rewritten in the game folder on each launch and records what the patch did.
+`[Debug]` keys (`DumpViews`, `TraceCopies`, `Timing`, `WideSteps`) add diagnostics to it.
 
 ## Build
 
@@ -69,21 +77,61 @@ The DLL must be 32-bit. It is built with [llvm-mingw](https://github.com/mstorsj
 `build.ps1` has the compiler path hard-coded near the top; change it to match your install. The
 `-Install` switch assumes this repository sits in a folder directly inside the game folder.
 
+## HD artwork
+
+The upscaled art is made from your own copy of the game and is not part of this repository.
+It needs [Real-ESRGAN ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN/releases); the scripts
+expect it in `D:\Tools\realesrgan` unless told otherwise with `-Upscaler`.
+
+```powershell
+.\tools\extract_rsrc.ps1   # Data\*.rsrc -> assets\orig\<archive>\<id>.png
+.\tools\upscale_all.ps1    # assets\orig -> assets\x2, a few minutes on a recent GPU
+```
+
+`upscale_all.ps1` runs each picture through the `realesrgan-x4plus` model and reduces the result
+to 2x. Along real outlines the model's output is kept; elsewhere most of it is replaced by a plain
+enlargement, so dithered textures are not redrawn as patterns that were never there (`-Grain`,
+`-EdgeLow`, `-EdgeHigh`). Pictures with the magenta transparency key have the key area filled from
+the sprite before upscaling and stamped back afterwards with a rounded mask. `-Only <archive>`
+limits a run; `-NewOnly` skips pictures that are already up to date.
+
+Map tiles are different: the game composes each one at run time, so there is no picture to upscale
+in advance. With `HD=1` the patch saves every new tile it meets to `assets\orig\_tiles` and, when
+the game closes, upscales them into `assets\x2\_tiles`. A part of the map therefore turns HD the
+second time you visit it.
+
 ## How it works
 
 `ddraw.dll` is a proxy: the game loads it in place of the system DirectDraw library, and every
-DirectDraw call is forwarded to the real one. While loading, it does three things in memory:
+DirectDraw call is forwarded to the real one. Everything else is done in memory while it loads; all
+addresses are for the v1.03 executable, and patches are only applied if the build matches.
 
-- **Skips the mode switch.** One function in the game sets the monitor to 800x600x16. It is
-  patched to report success without touching the display. The patch is only applied if the
-  executable matches the expected v1.03 build.
-- **Scales drawing.** The game paints each frame into an 800x600 offscreen bitmap and copies it to
-  its window. The window is enlarged, and every device context for it is given a GDI mapping from
-  800x600 units to its real size, so the game's own drawing calls come out enlarged.
-- **Scales everything else to match.** Mouse coordinates, invalidation rectangles and client-size
-  queries are converted between the two sizes. Pop-up windows, the movie player and text fields
-  are repositioned and resized, text fields get an enlarged font, and the game's 1999-style masked
-  cursors are rebuilt as alpha cursors.
+**Scaling.** One function in the game sets the monitor to 800x600x16; it is patched to report
+success without touching the display. The game paints each frame into an offscreen bitmap and
+copies it to its window. The window is enlarged and the copy is intercepted: the frame is doubled
+with interpolation into a 2x frame and that is stretched to the window. Mouse coordinates,
+invalidation rectangles and client-size queries are converted between the two sizes. Pop-up
+windows, the movie player and text fields are repositioned and resized, text fields get an
+enlarged font, and the game's masked cursors are rebuilt as alpha cursors.
+
+**Wide map.** The game's emulated Mac screen, its frame buffer and its window-centring are widened
+from 800 to 1056. Screens are trees of view objects built in code; when the map screen appears,
+its views are moved and resized. The map view keeps a cache of rendered tiles with bookkeeping in
+a fixed 110-slot array inside the view object, sized for a 9-column view. That array is relocated
+to the end of an enlarged object by repointing every instruction that indexes it, and the slot
+counts, cache bitmaps and visible-column constants are raised to match. The zoomed-out overview
+has no cache, only loop bounds and limits to change. The map screen's background picture is drawn
+by a replacement routine that moves the side panel's art to the new edge and fills the gap with a
+repeated slice of the border. Other screens are left at 800 and shifted when shown.
+
+**HD artwork.** The game keeps drawing at 1x. Its picture-copy routine is intercepted; when it
+copies a picture for which an upscaled version exists, the same rectangle is also copied at 2x
+into the 2x frame, and the 1x pixels written are remembered. When the frame is shown, pixels that
+still hold the remembered value come from the HD art and everything else is smoothed from the 1x
+frame. Full-colour pictures are matched to files by hashing their pixel data against the game's
+archives; 8-bit pictures, whose palette indices the game remaps on load, by similarity. The map is
+assembled in a second buffer before it reaches the frame, so that buffer gets the same treatment
+and its HD blocks travel with it.
 
 All of it is in `hd/imp2hd.c`.
 
@@ -121,17 +169,20 @@ shifts that lands the most map functions on real function starts. About 93% of g
 placed this way, and a spot check against class names embedded in the executable found roughly 95%
 of those correct. Treat names as strong hints, not facts.
 
-`ghidra_scripts/Probe.java` is a helper for decompiling an address range or listing references to
-an address when a function did not get a name.
+`Probe.java` decompiles an address range or lists references to an address, for functions that
+did not get a name. `FindInstructions.java` lists instructions matching a regular expression,
+which is how patch sites were enumerated.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `hd/imp2hd.c`, `hd/imp2hd.def` | the scaling DLL |
+| `hd/imp2hd.c`, `hd/imp2hd.def` | the DLL |
 | `hd/build.ps1` | build and install |
-| `hd/shot.ps1`, `hd/cursorshot.ps1` | launch the game and capture screenshots for testing |
-| `tools/` | linker-map conversion and name matching |
+| `hd/drive.ps1` | launch the game and play back clicks, keys and screenshots |
+| `hd/widetest.ps1`, `hd/menutest.ps1`, `hd/shot.ps1`, `hd/cursorshot.ps1` | test runs built on it |
+| `tools/extract_rsrc.ps1`, `tools/upscale_all.ps1`, `tools/upscale_compare.ps1` | artwork pipeline |
+| `tools/map_to_csv.ps1`, `tools/match_names.ps1` | linker-map conversion and name matching |
 | `ghidra_scripts/` | Ghidra headless scripts |
 
 ## Legal

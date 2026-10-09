@@ -67,6 +67,7 @@ static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h);
 static BOOL hd_transfer_map(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 static void hd_forget_art(void);
+static void hd_on_exit(void);
 static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
 	int dx, int dy, DWORD transparent);
@@ -744,7 +745,10 @@ static LRESULT CALLBACK frame_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	}
 	LRESULT res = CallWindowProcA(g_frameProc, hwnd, msg, wp, lp);
 	if (msg == WM_SIZE && g_view && wp != SIZE_MINIMIZED) place_view();
-	if (msg == WM_NCDESTROY) g_frame = NULL;
+	if (msg == WM_NCDESTROY) {
+		g_frame = NULL;
+		hd_on_exit();
+	}
 	return res;
 }
 
@@ -2579,6 +2583,32 @@ static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int
 	return ok;
 }
 
+// When the game closes after meeting new map tiles, upscale them in the background so they are
+// HD on the next run. Runs tools\upscale_all.ps1 from the folder the assets live in.
+static BOOL g_autoUpscale = TRUE;
+
+static void hd_on_exit(void)
+{
+	if (!g_hd || !g_autoUpscale || g_tilesCaptured == 0) return;
+	char script[MAX_PATH], command[2 * MAX_PATH + 128];
+	snprintf(script, sizeof script, "%s\\..\\..\\tools\\upscale_all.ps1", g_hdAssets);
+	if (GetFileAttributesA(script) == INVALID_FILE_ATTRIBUTES) {
+		logf_("HD: %d new map tiles captured; run upscale_all.ps1 -Only _tiles to upscale them", g_tilesCaptured);
+		return;
+	}
+	snprintf(command, sizeof command,
+		"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"%s\" -Only _tiles -NewOnly", script);
+	STARTUPINFOA si = { sizeof si };
+	PROCESS_INFORMATION pi;
+	if (CreateProcessA(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+		logf_("HD: upscaling %d new map tiles in the background", g_tilesCaptured);
+	} else {
+		logf_("HD: could not start the tile upscaler (error %lu)", GetLastError());
+	}
+}
+
 static void hd_install(void)
 {
 	const DWORD thunk = 0x00403125, target = 0x00487790;
@@ -2653,6 +2683,7 @@ static void install(HMODULE self)
 	g_timing = GetPrivateProfileIntA("Debug", "Timing", 0, ini);
 	g_twoStage = g_smooth && GetPrivateProfileIntA("Display", "FastScale", 1, ini);
 	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 1, ini);
+	g_autoUpscale = GetPrivateProfileIntA("Display", "HDAutoUpscale", 1, ini);
 	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 

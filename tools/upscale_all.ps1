@@ -13,7 +13,10 @@ param(
     [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe",
     [string[]]$Only = @(),              # archive names to process; empty means all
     [string[]]$Terrain = @('MapTiles'), # archives whose key-less 64x64 pictures are repeating terrain
-    [double]$Grain = 0.75               # share of a plain enlargement used away from outlines (0 = none)
+    [double]$Grain = 0.75,              # share of a plain enlargement used away from outlines (0 = none)
+    [double]$EdgeLow = 8,               # blurred-brightness step below which nothing counts as an outline
+    [double]$EdgeHigh = 20,            # ... and at which it fully does
+    [switch]$NewOnly                    # skip pictures whose upscaled version is already up to date
 )
 
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
@@ -269,9 +272,11 @@ public static class KeyedUpscale
 }
 '@
 
+[KeyedUpscale]::EdgeLow = $EdgeLow
+[KeyedUpscale]::EdgeHigh = $EdgeHigh
 $orig = "$Assets\orig"
-$tempIn = "$Assets\_in"
-$tempOut = "$Assets\_out"
+$tempIn = "$Assets\_in$PID"   # per process, so a run started by the game cannot collide with another
+$tempOut = "$Assets\_out$PID"
 $total = 0; $keyed = 0; $tiles = 0
 foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
     if ($Only.Count -gt 0 -and $Only -notcontains $dir.Name) { continue }
@@ -280,12 +285,17 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
 
     $info = @{}
     foreach ($file in Get-ChildItem -LiteralPath $dir.FullName -Filter *.png) {
+        if ($NewOnly) {
+            $have = Get-Item -LiteralPath "$Assets\x2\$($dir.Name)\$($file.Name)" -ErrorAction SilentlyContinue
+            if ($have -and $have.LastWriteTime -ge $file.LastWriteTime) { continue }
+        }
         $w = 0; $h = 0
         $mask = [KeyedUpscale]::Prepare($file.FullName, "$tempIn\$($file.Name)", [ref]$w, [ref]$h)
         $tile = $null -eq $mask -and $Terrain -contains $dir.Name -and $w -eq 64 -and $h -eq 64
         if ($tile) { [KeyedUpscale]::PrepareTile($file.FullName, "$tempIn\$($file.Name)") }
         $info[$file.Name] = @{ Mask = $mask; W = $w; H = $h; Tile = $tile; Source = $file.FullName }
     }
+    if ($info.Count -eq 0) { continue }
     & $Upscaler -i $tempIn -o $tempOut -n realesrgan-x4plus -s 4 -f png 2>$null
 
     $done = 0
