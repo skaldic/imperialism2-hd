@@ -57,7 +57,9 @@ static HWND g_frame, g_view;
 
 // HD artwork layer (defined further down).
 static BOOL g_hd;
-static BOOL g_marginArt = TRUE, g_screenOnTop;
+static int g_marginArt = 2; // beside centred screens: 0 black, 1 blurred screen edge, 2 tiled texture
+static BOOL g_screenOnTop;
+static char g_gameDir[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
@@ -944,8 +946,92 @@ static int WINAPI h_StretchDIBits(HDC dst, int x, int y, int w, int h, int sx, i
 	return o_StretchDIBits(dst, x, y, w, h, sx, sy, sw, sh, bits, info, usage, rop);
 }
 
-// Beside a centred 800-wide screen: a dimmed, heavily blurred continuation of the screen's own
-// edge instead of plain black bars. "src" holds the 1x frame.
+// Margin texture: the dark damask pattern from the map screen's side panel, read from the
+// player's own Data\MapView.rsrc (picture 4122) and tiled. The pattern repeats exactly every
+// 56x91 pixels. Built once as a 2x picture one margin wide; NULL if it cannot be loaded.
+static HDC margin_texture(void)
+{
+	enum { PICTURE = 4122, CELL_X = 60, CELL_Y = 160, CELL_W = 56, CELL_H = 91 };
+	static HDC dc;
+	static BOOL tried;
+	if (tried) return dc;
+	tried = TRUE;
+
+	int marginW = (g_gameW - BASE_W) / 2;
+	WORD *cell = malloc(CELL_W * CELL_H * sizeof(WORD)), *flat = malloc((size_t)marginW * GAME_H * sizeof(WORD));
+	char path[MAX_PATH];
+	snprintf(path, sizeof path, "%sData\\MapView.rsrc", g_gameDir);
+	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+	BOOL loaded = FALSE;
+	DWORD got, header[4];
+	if (cell && flat && marginW > 0 && f != INVALID_HANDLE_VALUE && ReadFile(f, header, sizeof header, &got, NULL) &&
+		got == sizeof header && header[0] == 0x63727372 && header[3] < 4096) {
+		DWORD *dir = malloc(header[3] * 16);
+		if (dir && ReadFile(f, dir, header[3] * 16, &got, NULL) && got == header[3] * 16) {
+			for (DWORD i = 0; i < header[3] && !loaded; i++) {
+				BITMAPINFOHEADER bih;
+				if (dir[i * 4] != 0x50494354 || dir[i * 4 + 1] != PICTURE) continue;
+				SetFilePointer(f, dir[i * 4 + 2], NULL, FILE_BEGIN);
+				if (!ReadFile(f, &bih, sizeof bih, &got, NULL) || got != sizeof bih) break;
+				int w = bih.biWidth, h = abs(bih.biHeight), rowBytes = ((w + 1) & ~1) * 2;
+				if (bih.biBitCount != 16 || bih.biCompression != BI_RGB || w < CELL_X + CELL_W || h < CELL_Y + CELL_H) break;
+				loaded = TRUE;
+				for (int y = 0; y < CELL_H && loaded; y++) {
+					int row = bih.biHeight > 0 ? h - 1 - (CELL_Y + y) : CELL_Y + y;
+					SetFilePointer(f, dir[i * 4 + 2] + 40 + bih.biClrUsed * 4 + row * rowBytes + CELL_X * 2, NULL, FILE_BEGIN);
+					loaded = ReadFile(f, cell + y * CELL_W, CELL_W * 2, &got, NULL) && got == CELL_W * 2;
+				}
+			}
+		}
+		free(dir);
+	}
+	if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+
+	DWORD *out = NULL;
+	if (loaded) {
+		BITMAPINFO bi = { 0 };
+		bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+		bi.bmiHeader.biWidth = marginW * 2;
+		bi.bmiHeader.biHeight = -GAME_H * 2;
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		HDC screen = GetDC(NULL);
+		dc = CreateCompatibleDC(screen);
+		HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&out, NULL, 0);
+		ReleaseDC(NULL, screen);
+		if (dc && dib) SelectObject(dc, dib); else dc = NULL;
+	}
+	if (dc) {
+		for (int y = 0; y < GAME_H; y++) {
+			for (int x = 0; x < marginW; x++) flat[y * marginW + x] = cell[(y % CELL_H) * CELL_W + x % CELL_W];
+		}
+		// Doubled with the same 9:3:3:1 smoothing as the rest of the picture, slightly dimmed so
+		// the screen in the middle stays the brightest thing.
+		for (int y = 0; y < GAME_H; y++) {
+			for (int x = 0; x < marginW; x++) {
+				WORD p = flat[y * marginW + x];
+				for (int sub = 0; sub < 4; sub++) {
+					int nx = sub & 1 ? min(x + 1, marginW - 1) : max(x - 1, 0);
+					int ny = sub & 2 ? min(y + 1, GAME_H - 1) : max(y - 1, 0);
+					WORD ph = flat[y * marginW + nx], pv = flat[ny * marginW + x], pd = flat[ny * marginW + nx];
+					DWORD c = 0;
+					for (int shift = 0; shift <= 10; shift += 5) {
+						DWORD v = 9 * ((p >> shift) & 31) + 3 * ((ph >> shift) & 31) + 3 * ((pv >> shift) & 31) + ((pd >> shift) & 31);
+						c |= ((v >> 1) * 4 / 5) << (shift == 0 ? 0 : shift == 5 ? 8 : 16);
+					}
+					out[(size_t)(y * 2 + (sub >> 1)) * marginW * 2 + x * 2 + (sub & 1)] = c;
+				}
+			}
+		}
+	}
+	logf_("margin texture %s", dc ? "loaded" : "not available: using the blurred fill");
+	free(cell);
+	free(flat);
+	return dc;
+}
+
+// Beside a centred 800-wide screen, instead of plain black bars: the tiled panel texture, or a
+// dimmed, heavily blurred continuation of the screen's own edge. "src" holds the 1x frame.
 static void draw_margins(HDC dst, HDC src)
 {
 	static HDC small, blurred;
@@ -956,6 +1042,14 @@ static void draw_margins(HDC dst, HDC src)
 	if (!g_marginArt || !g_screenOnTop) {
 		FillRect(dst, &left, (HBRUSH)GetStockObject(BLACK_BRUSH));
 		FillRect(dst, &right, (HBRUSH)GetStockObject(BLACK_BRUSH));
+		return;
+	}
+	HDC texture = g_marginArt == 2 ? margin_texture() : NULL;
+	if (texture) {
+		int mode = SetStretchBltMode(dst, g_twoStage ? COLORONCOLOR : HALFTONE);
+		if (showLeft) StretchBlt(dst, left.left, 0, g_offsetX, GAME_H, texture, 0, 0, g_offsetX * 2, GAME_H * 2, SRCCOPY);
+		if (showRight) StretchBlt(dst, right.left, 0, g_offsetX, GAME_H, texture, 0, 0, g_offsetX * 2, GAME_H * 2, SRCCOPY);
+		SetStretchBltMode(dst, mode);
 		return;
 	}
 	enum { TW = 16, TH = 40, BW = 64, BH = 300 };
@@ -975,7 +1069,7 @@ static void draw_margins(HDC dst, HDC src)
 		bi.bmiHeader.biHeight = -BH;
 		SelectObject(blurred, CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&soft, NULL, 0));
 		ReleaseDC(NULL, screen);
-		if (!tiny || !soft) { g_marginArt = FALSE; return; }
+		if (!tiny || !soft) { g_marginArt = 0; return; }
 	}
 	// Shrink each 48-pixel edge strip to 8x40, then enlarge it again with interpolation and
 	// dimmed: a soft wash of the screen's edge colours.
@@ -2386,7 +2480,7 @@ static void install(HMODULE self)
 	g_timing = GetPrivateProfileIntA("Debug", "Timing", 0, ini);
 	g_twoStage = g_smooth && GetPrivateProfileIntA("Display", "FastScale", 1, ini);
 	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 1, ini);
-	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 1, ini);
+	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 2, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
