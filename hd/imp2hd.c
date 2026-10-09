@@ -57,7 +57,7 @@ static HWND g_frame, g_view;
 
 // HD artwork layer (defined further down).
 static BOOL g_hd;
-static int g_marginArt = 2; // beside centred screens: 0 black, 1 blurred screen edge, 2 tiled texture
+static int g_marginArt = 3; // beside centred screens: 0 black, 1 blurred edge, 2 tiled texture, 3 extended background
 static BOOL g_screenOnTop;
 static char g_gameDir[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
@@ -1030,8 +1030,120 @@ static HDC margin_texture(void)
 	return dc;
 }
 
-// Beside a centred 800-wide screen, instead of plain black bars: the tiled panel texture, or a
-// dimmed, heavily blurred continuation of the screen's own edge. "src" holds the 1x frame.
+static const WORD *dc_pixels(HDC dc, int *w, int *h, int *stride, BOOL *bottomUp);
+
+// Margin extension: continues the background at each side of a centred screen. The outermost
+// strip of the screen is repeated outward, alternately flipped so copies meet edge to edge, and
+// shaded darker toward the outside. Things that are not background but reach the edge (ribbon
+// ends, ornaments) show up as short runs of rows much brighter than the rows around them; those
+// rows are replaced by the background just below or above before the strip is used.
+// Returns a DC holding both margins at 2x, left then right, or NULL.
+static HDC margin_extension(HDC src)
+{
+	enum { STRIP = 24, WINDOW = 90, RUN_MAX = 110 };
+	static HDC dc;
+	static DWORD *out;
+	static WORD *flat;
+	static int marginW;
+	int fw, fh, stride;
+	BOOL bottomUp;
+	const WORD *frame = dc_pixels(src, &fw, &fh, &stride, &bottomUp);
+	if (!frame || fw < BASE_W || fh != GAME_H) return NULL;
+	if (!dc) {
+		marginW = (g_gameW - BASE_W) / 2;
+		BITMAPINFO bi = { 0 };
+		bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+		bi.bmiHeader.biWidth = marginW * 4;
+		bi.bmiHeader.biHeight = -GAME_H * 2;
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		HDC screen = GetDC(NULL);
+		dc = CreateCompatibleDC(screen);
+		HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&out, NULL, 0);
+		ReleaseDC(NULL, screen);
+		flat = malloc((size_t)marginW * GAME_H * sizeof(WORD));
+		if (!dc || !dib || !flat || marginW <= 0) { dc = NULL; return NULL; }
+		SelectObject(dc, dib);
+	}
+
+	static WORD strip[GAME_H][STRIP];
+	static int lum[GAME_H], sorted[2 * WINDOW + 1];
+	static BYTE object[GAME_H];
+	for (int side = 0; side < 2; side++) {
+		// The strip, stored so that column 0 is the screen's outermost column.
+		for (int y = 0; y < GAME_H; y++) {
+			const WORD *row = frame + (size_t)(bottomUp ? GAME_H - 1 - y : y) * stride;
+			// A row's brightness is that of its brightest few pixels, so an object that only
+			// partly crosses the strip (the tip of a ribbon) still stands out.
+			int top[4] = { 0, 0, 0, 0 };
+			for (int k = 0; k < STRIP; k++) {
+				WORD p = row[side ? BASE_W - 1 - k : k];
+				strip[y][k] = p;
+				int v = ((p >> 10) & 31) * 2 + ((p >> 5) & 31) * 5 + (p & 31);
+				for (int t = 0; t < 4; t++) if (v > top[t]) { int swap = top[t]; top[t] = v; v = swap; }
+			}
+			lum[y] = (top[0] + top[1] + top[2] + top[3]) / 4; // 0..248
+		}
+		// Rows much brighter than the median of the rows around them belong to an object.
+		for (int y = 0; y < GAME_H; y++) {
+			int n = 0;
+			for (int j = max(0, y - WINDOW); j <= min(GAME_H - 1, y + WINDOW); j++) {
+				int v = lum[j], at = n++;
+				while (at > 0 && sorted[at - 1] > v) { sorted[at] = sorted[at - 1]; at--; }
+				sorted[at] = v;
+			}
+			int median = sorted[n / 2];
+			object[y] = lum[y] > median * 8 / 5 + 14;
+		}
+		for (int y = 0; y < GAME_H;) {
+			if (!object[y]) { y++; continue; }
+			int a = y, b = y;
+			while (b < GAME_H && object[b]) b++;
+			a = max(0, a - 3);
+			b = min(GAME_H, b + 3);
+			if (b - a <= RUN_MAX) {
+				// Mirror the background below the run into it, or the background above.
+				for (int r = a; r < b; r++) {
+					int below = b + (b - 1 - r), above = a - 1 - (r - a);
+					int from = below < GAME_H ? below : above >= 0 ? above : -1;
+					if (from >= 0) memcpy(strip[r], strip[from], sizeof strip[r]);
+				}
+			}
+			y = b;
+		}
+		// Lay the strip out across the margin, column 0 of the margin being nearest the screen,
+		// then write it at 2x with the usual smoothing and a shade that deepens outward.
+		for (int y = 0; y < GAME_H; y++) {
+			for (int d = 0; d < marginW; d++) {
+				int k = d % (2 * STRIP);
+				flat[y * marginW + d] = strip[y][k < STRIP ? k : 2 * STRIP - 1 - k];
+			}
+		}
+		for (int y = 0; y < GAME_H; y++) {
+			for (int d = 0; d < marginW; d++) {
+				WORD p = flat[y * marginW + d];
+				int shade = 215 - 150 * d / marginW; // of 256
+				int x = side ? d : marginW - 1 - d;  // position within this margin's picture
+				for (int sub = 0; sub < 4; sub++) {
+					int towardRight = sub & 1;
+					int nd = (towardRight != 0) == (side != 0) ? min(d + 1, marginW - 1) : max(d - 1, 0);
+					int ny = sub & 2 ? min(y + 1, GAME_H - 1) : max(y - 1, 0);
+					WORD ph = flat[y * marginW + nd], pv = flat[ny * marginW + d], pd = flat[ny * marginW + nd];
+					DWORD c = 0;
+					for (int shift = 0; shift <= 10; shift += 5) {
+						DWORD v = 9 * ((p >> shift) & 31) + 3 * ((ph >> shift) & 31) + 3 * ((pv >> shift) & 31) + ((pd >> shift) & 31);
+						c |= (((v >> 1) * shade) >> 8) << (shift == 0 ? 0 : shift == 5 ? 8 : 16);
+					}
+					out[(size_t)(y * 2 + (sub >> 1)) * marginW * 4 + side * marginW * 2 + x * 2 + towardRight] = c;
+				}
+			}
+		}
+	}
+	return dc;
+}
+
+// Beside a centred 800-wide screen, instead of plain black bars: the screen's own background
+// continued outward, the tiled panel texture, or a dimmed, heavily blurred wash of its edge. "src" holds the 1x frame.
 static void draw_margins(HDC dst, HDC src)
 {
 	static HDC small, blurred;
@@ -1044,7 +1156,15 @@ static void draw_margins(HDC dst, HDC src)
 		FillRect(dst, &right, (HBRUSH)GetStockObject(BLACK_BRUSH));
 		return;
 	}
-	HDC texture = g_marginArt == 2 ? margin_texture() : NULL;
+	HDC extended = g_marginArt == 3 ? margin_extension(src) : NULL;
+	if (extended) {
+		int mode = SetStretchBltMode(dst, g_twoStage ? COLORONCOLOR : HALFTONE);
+		if (showLeft) StretchBlt(dst, left.left, 0, g_offsetX, GAME_H, extended, 0, 0, g_offsetX * 2, GAME_H * 2, SRCCOPY);
+		if (showRight) StretchBlt(dst, right.left, 0, g_offsetX, GAME_H, extended, g_offsetX * 2, 0, g_offsetX * 2, GAME_H * 2, SRCCOPY);
+		SetStretchBltMode(dst, mode);
+		return;
+	}
+	HDC texture = g_marginArt >= 2 ? margin_texture() : NULL;
 	if (texture) {
 		int mode = SetStretchBltMode(dst, g_twoStage ? COLORONCOLOR : HALFTONE);
 		if (showLeft) StretchBlt(dst, left.left, 0, g_offsetX, GAME_H, texture, 0, 0, g_offsetX * 2, GAME_H * 2, SRCCOPY);
@@ -2480,7 +2600,7 @@ static void install(HMODULE self)
 	g_timing = GetPrivateProfileIntA("Debug", "Timing", 0, ini);
 	g_twoStage = g_smooth && GetPrivateProfileIntA("Display", "FastScale", 1, ini);
 	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 1, ini);
-	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 2, ini);
+	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
