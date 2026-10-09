@@ -65,6 +65,7 @@ static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h);
 static BOOL hd_transfer_map(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 static void hd_forget_art(void);
+static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
 	int dx, int dy, DWORD transparent);
 static WNDPROC g_frameProc, g_viewProc;
@@ -1010,6 +1011,7 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 	ensure_mapped(dst);
 	if (g_hd) {
 		if (hd_map_to_window(dst, x, y, w, h, src, sx, sy, rop)) return TRUE;
+		if (hd_small_to_window(dst, x, y, w, h, src, sx, sy, rop)) return TRUE;
 		if (!hd_transfer_map(dst, x, y, w, h, src, sx, sy, rop)) hd_note_gdi_draw(dst, x, y, w, h);
 	}
 	if (g_traceBudget > 0 && WindowFromDC(dst) == g_view) {
@@ -1900,7 +1902,7 @@ static const DWORD *tile_art(const BYTE *bits, int pw, int ph, BOOL bottomUp8, i
 		if (t->pixels) g_tilesLoaded++; else t->onDisk = 0;
 		return t->pixels;
 	}
-	if (g_captureTiles && !t->captured) {
+	if (g_captureTiles && !t->captured && frame) {
 		t->captured = 1;
 		save_tile(t->hash, frame, stride, bottomUp, surfaceH, dx, dy);
 	}
@@ -2202,6 +2204,110 @@ static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int s
 	surface_compose(&g_map, mapBits, stride, bottomUp, m.x, m.y, m.x + w, m.y + h);
 	int mode = g_twoStage ? SetStretchBltMode(dst, COLORONCOLOR) : 0;
 	BOOL ok = StretchBlt(dst, x, y, w, h, g_map.dc, m.x * 2, m.y * 2, w * 2, h * 2, SRCCOPY);
+	if (mode) SetStretchBltMode(dst, mode);
+	return ok;
+}
+
+// The selected unit blinks by copying small pictures straight to the window, alternately a
+// 16-bit picture the game composed itself (tile plus highlighted unit) and the tile's 8-bit cache
+// cell. Shown as they are, that tile would flip between HD and low resolution on every blink and
+// its stippled shadows would look different from the rest of the map. Instead the picture is
+// rebuilt at 2x here: pixels that match what the map buffer holds at that spot take the map's HD
+// block, the rest are smoothed like any other non-HD pixel.
+#define MAP_VIEW_X 10 // the land map view's position in the frame
+#define MAP_VIEW_Y 58
+#define SMALL_MAX 256
+
+static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
+{
+	static HDC scratchDC;
+	static DWORD *scratch; // top-down, 2*SMALL_MAX square
+	DIBSECTION ds;
+	if (rop != SRCCOPY || g_offsetX || !g_map.frame || !g_view || WindowFromDC(dst) != g_view) return FALSE;
+	if (w <= 0 || h <= 0 || w > SMALL_MAX || h > SMALL_MAX) return FALSE;
+	HGDIOBJ bmp = GetCurrentObject(src, OBJ_BITMAP);
+	if (!bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || !ds.dsBm.bmBits) return FALSE;
+	const BYTE *bits = ds.dsBm.bmBits;
+	if ((const WORD *)bits == g_map.bits || (const WORD *)bits == g_main.bits) return FALSE;
+	int bw = ds.dsBm.bmWidth, bh = ds.dsBm.bmHeight;
+	BOOL bottomUp = ds.dsBmih.biHeight > 0;
+	if (sx < 0 || sy < 0 || sx + w > bw || sy + h > bh) return FALSE;
+
+	if (!scratchDC) {
+		BITMAPINFO bi = { 0 };
+		bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+		bi.bmiHeader.biWidth = SMALL_MAX * 2;
+		bi.bmiHeader.biHeight = -SMALL_MAX * 2;
+		bi.bmiHeader.biPlanes = 1;
+		bi.bmiHeader.biBitCount = 32;
+		HDC screen = GetDC(NULL);
+		scratchDC = CreateCompatibleDC(screen);
+		HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, (void **)&scratch, NULL, 0);
+		ReleaseDC(NULL, screen);
+		if (!scratchDC || !dib) { scratchDC = NULL; return FALSE; }
+		SelectObject(scratchDC, dib);
+	}
+
+	if (ds.dsBm.bmBitsPixel == 8) {
+		// A tile's cache cell: use its upscaled version if there is one.
+		if (w != 64 || h != 64) return FALSE;
+		// The row order reported for these bitmaps is not reliable, so both are tried.
+		const DWORD *art = tile_art(bits, bw, bh, bottomUp, sx, sy, NULL, 0, FALSE, 0, 0, 0);
+		if (!art) art = tile_art(bits, bw, bh, !bottomUp, sx, sy, NULL, 0, FALSE, 0, 0, 0);
+		if (!art) return FALSE;
+		for (int row = 0; row < 128; row++) memcpy(scratch + (size_t)row * SMALL_MAX * 2, art + row * 128, 128 * 4);
+	} else if (ds.dsBm.bmBitsPixel == 16) {
+		const WORD *pixels = (const WORD *)bits;
+		int stride = ds.dsBm.bmWidthBytes / 2;
+		// Where this rectangle lies in the map buffer, which has a 64-pixel margin.
+		int mx0 = x - MAP_VIEW_X + 64, my0 = y - MAP_VIEW_Y + 64;
+		// The row order reported for these bitmaps is not reliable: ask GDI for a few pixels and
+		// see which order agrees with them.
+		int agree[2] = { 0, 0 };
+		for (int i = 0; i < 12; i++) {
+			int px = (i * 37 + 5) % w, py = (i * 23 + 3) % h;
+			COLORREF c = GetPixel(src, sx + px, sy + py);
+			if (c == CLR_INVALID) continue;
+			WORD want = (WORD)((GetRValue(c) >> 3) << 10 | (GetGValue(c) >> 3) << 5 | GetBValue(c) >> 3);
+			agree[0] += pixels[(size_t)(sy + py) * stride + sx + px] == want;
+			agree[1] += pixels[(size_t)(bh - 1 - (sy + py)) * stride + sx + px] == want;
+		}
+		if (agree[0] == agree[1]) return FALSE; // cannot tell: leave it to the plain copy
+		bottomUp = agree[1] > agree[0];
+#define SRC_AT(xx, yy) pixels[(size_t)(bottomUp ? bh - 1 - (sy + (yy)) : sy + (yy)) * stride + sx + (xx)]
+		for (int row = 0; row < h; row++) {
+			for (int col = 0; col < w; col++) {
+				WORD p = SRC_AT(col, row);
+				int mx = mx0 + col, my = my0 + row;
+				DWORD *out = scratch + (size_t)row * 2 * SMALL_MAX * 2 + col * 2;
+				if (mx >= 0 && my >= 0 && mx < g_map.w && my < g_map.h) {
+					size_t at = (size_t)my * g_map.w + mx;
+					if (g_map.state[at] == 1 && g_map.shadow[at] == p) {
+						const DWORD *from = g_map.frame + (size_t)my * 2 * g_map.w * 2 + mx * 2;
+						out[0] = from[0]; out[1] = from[1];
+						out[SMALL_MAX * 2] = from[g_map.w * 2]; out[SMALL_MAX * 2 + 1] = from[g_map.w * 2 + 1];
+						continue;
+					}
+				}
+				for (int sub = 0; sub < 4; sub++) {
+					int nc = sub & 1 ? min(col + 1, w - 1) : max(col - 1, 0);
+					int nr = sub & 2 ? min(row + 1, h - 1) : max(row - 1, 0);
+					WORD ph = SRC_AT(nc, row), pv = SRC_AT(col, nr), pd = SRC_AT(nc, nr);
+					DWORD c = 0;
+					for (int shift = 0; shift <= 10; shift += 5) {
+						DWORD v = 9 * ((p >> shift) & 31) + 3 * ((ph >> shift) & 31) + 3 * ((pv >> shift) & 31) + ((pd >> shift) & 31);
+						c |= (v >> 1) << (shift == 0 ? 0 : shift == 5 ? 8 : 16);
+					}
+					out[(sub & 2 ? SMALL_MAX * 2 : 0) + (sub & 1)] = c;
+				}
+			}
+		}
+#undef SRC_AT
+	} else {
+		return FALSE;
+	}
+	int mode = g_twoStage ? SetStretchBltMode(dst, COLORONCOLOR) : 0;
+	BOOL ok = StretchBlt(dst, x, y, w, h, scratchDC, 0, 0, w * 2, h * 2, SRCCOPY);
 	if (mode) SetStretchBltMode(dst, mode);
 	return ok;
 }
