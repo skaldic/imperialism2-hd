@@ -39,6 +39,12 @@ typedef struct {
 	// tab). An entry with `picture` set gives the fill for that artwork only. Views are placed by
 	// the plain entry, so its insertions must not be far from that one's: no view may lie between.
 	short picture;
+	// Pictures over the background keep their size and move with their middle, instead of being
+	// lengthened like the background under them (for panels with no plain stretch of their own).
+	char fixedPictures;
+	// A game routine (thiscall, no arguments, on the screen) that works out drawing positions
+	// from the views; called again once they have been moved.
+	unsigned long rebuild;
 } ScreenLayout;
 
 #define LID(a, b, c, d) (((unsigned long)(a) << 24) | ((unsigned long)(b) << 16) | ((unsigned long)(c) << 8) | (unsigned long)(d))
@@ -86,6 +92,38 @@ static const ScreenLayout g_screenLayouts[] = {
 			{ 553, 600, { { 170, 128, 170, 32, 'M' }, { 604, 128, 604, 32, 'M' } } },
 		},
 	},
+	{
+		// Diplomacy, on its usual background: a white panel in an ornate frame over a sea chart.
+		// The panel is lengthened inside its plain interior, so the panel views over it (one per
+		// tab, swapped in and out) grow with it; the chart is lengthened clear of its sun and
+		// moon, either side of the map of nations.
+		"diplomacy (off)", "TDiplomacyMapView-disabled", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600, {
+			{ 0, 55, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
+			// The frame's floral border along the top.
+			{ 55, 96, { { 135, 128, 140, 40, 'R' }, { 660, 128, 600, 40, 'R' } } },
+			// The panel's interior.
+			{ 96, 216, { { 135, 128, 135, 64, 'M' }, { 660, 128, 596, 64, 'M' } } },
+			// The frame's lower edge and the gold rope under it.
+			{ 216, 245, { { 135, 128, 160, 8, 'T' }, { 660, 128, 600, 8, 'T' } } },
+			{ 245, 600, { { 100, 128, 80, 20, 'S' }, { 705, 128, 705, 20, 'S' } } },
+		},
+		// The Information panel is a picture filled to its edges (its colour key), and the map of
+		// nations is laid out by TDiplomacyMapView::CreateDrawGeometries from the map view.
+		0, 1, 0x00527c20,
+	},
+	{
+		// The same screen on its other background, a red cloth (the same places, other fill).
+		"diplomacy (cloth, off)", "TDiplomacyMapView-disabled", LID('m', 'a', 'i', 'n'), 0, 800, 600, {
+			{ 0, 55, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
+			{ 55, 96, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
+			{ 96, 216, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
+			{ 216, 245, { { 135, 128, 160, 11, 'T' }, { 660, 128, 600, 11, 'T' } } },
+			{ 245, 600, { { 100, 128, 80, 20, 'S' }, { 705, 128, 705, 20, 'S' } } },
+		},
+		4100,
+	},
+	// (No layout for the technology screen: both its panels are filled edge to edge by controls
+	// and its frame is too thin to take the width, so it stays centred.)
 	{
 		// The industry screen's page (workers, production or shipyard): its margins, outside the
 		// rows, which draw their bars at a fixed place.

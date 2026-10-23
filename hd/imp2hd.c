@@ -934,7 +934,7 @@ static int sync_layout(BYTE *screen, BYTE *view, const LayoutContext *ctx, int p
 			} else if (drawn_as_picture(child)) {
 				// A picture is lengthened the same way as the background under it; one that cannot
 				// be (its fill would come from outside it) keeps its size and moves with its middle.
-				if (layout_derive(ctx->layout, origX - ctx->origLeft, y, w, h, &derived))
+				if (!ctx->layout->fixedPictures && layout_derive(ctx->layout, origX - ctx->origLeft, y, w, h, &derived))
 					wide = register_wide_picture(child, screen, &derived);
 				if (!wide) {
 					const LayoutBand *band = layout_band(ctx->layout, y + h / 2);
@@ -989,6 +989,10 @@ static BOOL widen_layout_screen(BYTE *screen)
 	if (!register_wide_picture(screen, screen, s)) return FALSE;
 	widen_parents(screen);
 	sync_layout_screen(screen);
+	if (s->rebuild) {
+		typedef void (__attribute__((thiscall)) *Rebuild)(void *);
+		((Rebuild)s->rebuild)(screen);
+	}
 	logf_("screen '%s' widened", s->name);
 	return TRUE;
 }
