@@ -58,7 +58,7 @@ static HWND g_frame, g_view;
 // HD artwork layer (defined further down).
 static BOOL g_hd;
 static int g_marginArt = 3; // beside centred screens: 0 black, 1 blurred edge, 2 tiled texture, 3 extended background
-static BOOL g_screenOnTop;
+static BOOL g_screenOnTop, g_mapOnTop;
 static char g_gameDir[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
@@ -273,12 +273,17 @@ static void view_placement(RECT *out);
 
 // The game positions a pop-up at (view origin + game offset) in frame coordinates and sizes it in
 // game pixels. Keep the origin, scale the offset and the size.
-static void popup_rect_to_frame(int *x, int *y, int *cx, int *cy)
+// gameWidth: the pop-up's width in game pixels, or 0 if not known.
+static void popup_rect_to_frame(int *x, int *y, int *cx, int *cy, int gameWidth)
 {
 	RECT v;
 	view_placement(&v);
-	// The game centres pop-ups for an 800-wide layout; shift them by half the extra width.
-	if (x) *x = v.left + to_view_x(*x - v.left + (g_gameW - BASE_W) / 2);
+	// Most pop-ups are placed for an 800-wide layout and are shifted by half the extra width. Some
+	// are centred by TWindow::Center, which wide mode already makes centre on the full width;
+	// those are left where they are.
+	int shift = (g_gameW - BASE_W) / 2;
+	if (x && gameWidth > 0 && abs((*x - v.left) * 2 + gameWidth - g_gameW) <= 4) shift = 0;
+	if (x) *x = v.left + to_view_x(*x - v.left + shift);
 	if (y) *y = v.top + to_view_y(*y - v.top);
 	if (cx) *cx = to_view_x(*cx);
 	if (cy) *cy = to_view_y(*cy);
@@ -291,8 +296,11 @@ static LRESULT CALLBACK popup_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	case WM_WINDOWPOSCHANGING:
 		if (scaled()) {
 			WINDOWPOS *pos = (WINDOWPOS *)lp;
-			if (!(pos->flags & SWP_NOMOVE)) popup_rect_to_frame(&pos->x, &pos->y, NULL, NULL);
-			if (!(pos->flags & SWP_NOSIZE)) popup_rect_to_frame(NULL, NULL, &pos->cx, &pos->cy);
+			int gameWidth = 0;
+			if (!(pos->flags & SWP_NOSIZE)) gameWidth = pos->cx;
+			else { RECT r; if (GetWindowRect(hwnd, &r)) gameWidth = to_game_x(r.right - r.left); }
+			if (!(pos->flags & SWP_NOMOVE)) popup_rect_to_frame(&pos->x, &pos->y, NULL, NULL, gameWidth);
+			if (!(pos->flags & SWP_NOSIZE)) popup_rect_to_frame(NULL, NULL, &pos->cx, &pos->cy, 0);
 		}
 		break;
 	case WM_SIZE:
@@ -342,6 +350,8 @@ static int g_presentPixels;
 static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks;
 static int g_copyCalls;
 static int g_traceBudget; // diagnostic: number of paint calls still to be logged
+static int g_drawTrace; // diagnostic: direct-to-window drawing calls still to be logged
+static int g_moveTraces; // diagnostic: mouse moves traced on the current screen
 static BOOL g_wideMap; // tile cache relocated, so the map view itself may be widened
 
 static BOOL readable(const void *p, size_t n) { return p && !IsBadReadPtr(p, n); }
@@ -640,7 +650,7 @@ static void watch_screens(void)
 				if (g_gameW > BASE_W) {
 					if (map) widen_map_screen(screen);
 				}
-				if (g_dumpViews) g_traceBudget = 60;
+				if (g_dumpViews) { g_traceBudget = 60; g_moveTraces = 0; }
 				DWORD id = (DWORD)VIEW_INT(screen, V_ID);
 				logf_("screen %s '%c%c%c%c' at %d,%d size %dx%d", view_class(screen), (char)(id >> 24),
 					(char)(id >> 16), (char)(id >> 8), (char)id, VIEW_INT(screen, V_X), VIEW_INT(screen, V_Y),
@@ -659,6 +669,7 @@ static void watch_screens(void)
 	// with no screen at all (the intro movies) the 800-wide layout is centred too.
 	int offset = g_gameW > BASE_W && !(top && is_map_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
 	g_screenOnTop = top != NULL;
+	g_mapOnTop = top && is_map_screen(top);
 	if (offset != g_offsetX) {
 		g_offsetX = offset;
 		relayout_children();
@@ -718,6 +729,9 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 			int rawX = (short)LOWORD(lp), rawY = (short)HIWORD(lp);
 			lp = MAKELPARAM(to_game_x(rawX) - g_offsetX, to_game_y(rawY));
 			if (g_dumpViews && msg == WM_LBUTTONDOWN) g_traceBudget = 40;
+			if (g_dumpViews && msg == WM_MOUSEMOVE && g_drawTrace < 12) {
+				if (g_moveTraces++ < 40) { g_drawTrace = 12; logf_("move to game %d,%d", (short)LOWORD(lp), (short)HIWORD(lp)); }
+			}
 			if (g_dumpViews && (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP)) {
 				logf_("%s at view %d,%d -> game %d,%d (offset %d)", msg == WM_LBUTTONDOWN ? "press" : "release",
 					rawX, rawY, (short)LOWORD(lp), (short)HIWORD(lp), g_offsetX);
@@ -773,7 +787,7 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 		lstrcmpA(cls, POPUP_CLASS) == 0;
 	if (popup) {
 		logf_("pop-up requested at %d,%d %dx%d", x, y, w, h);
-		if (scaled()) popup_rect_to_frame(&x, &y, &w, &h);
+		if (scaled()) popup_rect_to_frame(&x, &y, &w, &h, w);
 	}
 	HWND hwnd = o_CreateWindowExA(ex, cls, title, style, x, y, w, h, parent, menu, inst, param);
 	if (hwnd && popup) adopt_popup(hwnd);
@@ -1277,8 +1291,112 @@ static void draw_margins(HDC dst, HDC src)
 	if (showRight) StretchBlt(dst, right.left, 0, g_offsetX, GAME_H, blurred, BW, 0, BW, BH, SRCCOPY);
 	SetStretchBltMode(dst, mode);
 }
+static BOOL (WINAPI *o_LineTo)(HDC, int, int);
+static BOOL (WINAPI *o_PatBlt)(HDC, int, int, int, int, DWORD);
+static int (WINAPI *o_SetROP2)(HDC, int);
+static int (WINAPI *o_FrameRect)(HDC, const RECT *, HBRUSH);
+
+static BOOL drawing_on_view(HDC dc) { return g_drawTrace > 0 && g_view && WindowFromDC(dc) == g_view && g_drawTrace--; }
+
+static BOOL (WINAPI *o_MoveToEx)(HDC, int, int, POINT *);
+static BOOL (WINAPI *o_Polyline)(HDC, const POINT *, int);
+static int (WINAPI *o_FillRect)(HDC, const RECT *, HBRUSH);
+static BOOL (WINAPI *o_Rectangle)(HDC, int, int, int, int);
+
+static BOOL WINAPI h_MoveToEx(HDC dc, int x, int y, POINT *old)
+{
+	ensure_mapped(dc);
+	return o_MoveToEx(dc, x, y, old);
+}
+
+static BOOL WINAPI h_Polyline(HDC dc, const POINT *pts, int count)
+{
+	ensure_mapped(dc);
+	return o_Polyline(dc, pts, count);
+}
+
+static int WINAPI h_FillRect(HDC dc, const RECT *r, HBRUSH brush)
+{
+	ensure_mapped(dc);
+	return o_FillRect(dc, r, brush);
+}
+
+static BOOL WINAPI h_Rectangle(HDC dc, int l, int t, int r, int b)
+{
+	ensure_mapped(dc);
+	return o_Rectangle(dc, l, t, r, b);
+}
+
+// A one-pixel line drawn straight onto an enlarged game window is drawn by GDI centred on the
+// enlarged pixel's edge, so part of it falls outside the pixels the game later repaints to erase
+// it. Horizontal and vertical ones are drawn instead as the exact band of enlarged pixels.
+static BOOL scaled_line(HDC dc, int x, int y)
+{
+	if (!scaled() || !is_game_window(WindowFromDC(dc)) || GetROP2(dc) != R2_COPYPEN) return FALSE;
+	POINT from;
+	LOGPEN pen;
+	HGDIOBJ current = GetCurrentObject(dc, OBJ_PEN);
+	if (!GetCurrentPositionEx(dc, &from) || !current || !GetObjectA(current, sizeof pen, &pen)) return FALSE;
+	if (pen.lopnStyle != PS_SOLID || pen.lopnWidth.x > 1) return FALSE;
+	RECT band;
+	if (from.y == y && from.x != x) {
+		// LineTo leaves out its end point.
+		band.left = from.x < x ? from.x : x + 1;
+		band.right = from.x < x ? x : from.x + 1;
+		band.top = y;
+		band.bottom = y + 1;
+	} else if (from.x == x && from.y != y) {
+		band.top = from.y < y ? from.y : y + 1;
+		band.bottom = from.y < y ? y : from.y + 1;
+		band.left = x;
+		band.right = x + 1;
+	} else {
+		return FALSE;
+	}
+	HBRUSH brush = CreateSolidBrush(pen.lopnColor);
+	o_FillRect(dc, &band, brush);
+	DeleteObject(brush);
+	o_MoveToEx(dc, x, y, NULL);
+	return TRUE;
+}
+
+static BOOL WINAPI h_LineTo(HDC dc, int x, int y)
+{
+	ensure_mapped(dc);
+	if (scaled_line(dc, x, y)) return TRUE;
+	if (drawing_on_view(dc)) { POINT p; GetCurrentPositionEx(dc, &p); logf_("  LineTo view %ld,%ld -> %d,%d rop2 %d", p.x, p.y, x, y, GetROP2(dc)); }
+	return o_LineTo(dc, x, y);
+}
+
+static BOOL WINAPI h_PatBlt(HDC dc, int x, int y, int w, int h, DWORD rop)
+{
+	ensure_mapped(dc);
+	if (drawing_on_view(dc)) logf_("  PatBlt view %d,%d %dx%d rop %08lx", x, y, w, h, (unsigned long)rop);
+	return o_PatBlt(dc, x, y, w, h, rop);
+}
+
+static int WINAPI h_SetROP2(HDC dc, int mode)
+{
+	if (drawing_on_view(dc)) logf_("  SetROP2 view %d", mode);
+	return o_SetROP2(dc, mode);
+}
+
+static int WINAPI h_FrameRect(HDC dc, const RECT *r, HBRUSH brush)
+{
+	ensure_mapped(dc);
+	if (r && drawing_on_view(dc)) logf_("  FrameRect view %ld,%ld-%ld,%ld rop2 %d", r->left, r->top, r->right, r->bottom, GetROP2(dc));
+	return o_FrameRect(dc, r, brush);
+}
+
 static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
+	if (drawing_on_view(dst)) {
+		BITMAP bm = { 0 };
+		HGDIOBJ obj = src ? GetCurrentObject(src, OBJ_BITMAP) : NULL;
+		if (obj) GetObjectA(obj, sizeof bm, &bm);
+		logf_("  BitBlt view %d,%d %dx%d from %d,%d of %ldx%ld %dbpp%s rop %08lx", x, y, w, h, sx, sy, bm.bmWidth, bm.bmHeight,
+			bm.bmBitsPixel, bm.bmBits ? " dib" : " ddb", (unsigned long)rop);
+	}
 	ensure_mapped(dst);
 	if (g_hd) {
 		if (hd_map_to_window(dst, x, y, w, h, src, sx, sy, rop)) return TRUE;
@@ -1301,7 +1419,17 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 	// default shrink mode ANDs pixels together and turns the patch nearly black, so average them.
 	if (scaled() && src && is_game_window(WindowFromDC(src))) {
 		ensure_mapped(src);
-		int mode = SetStretchBltMode(dst, HALFTONE);
+		// HALFTONE into a 256-colour bitmap dithers to the halftone palette, which shows up as
+		// coloured noise (the battle screen's corner ornaments read back that way).
+		BITMAP into = { 0 };
+		HGDIOBJ target = GetCurrentObject(dst, OBJ_BITMAP);
+		BOOL deep = target && GetObjectA(target, sizeof into, &into) && into.bmBitsPixel >= 16;
+		// HALFTONE reading from the window comes out as coloured noise on some drivers, and
+		// averaging gains nothing when the patch is only put back where it came from.
+		(void)deep;
+		int mode = SetStretchBltMode(dst, COLORONCOLOR);
+		if (g_drawTrace > 0) logf_("  readback %d,%d %dx%d from view %d,%d into %ldx%ld %dbpp%s", x, y, w, h, sx, sy,
+			into.bmWidth, into.bmHeight, into.bmBitsPixel, into.bmBits ? " dib" : " ddb");
 		SetBrushOrgEx(dst, 0, 0, NULL);
 		BOOL ok = o_BitBlt(dst, x, y, w, h, src, sx, sy, rop);
 		SetStretchBltMode(dst, mode);
@@ -1311,8 +1439,13 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 	// instead, so every partial update lands on the same pixel grid as a full one.
 	if (scaled() && src && x == sx && y == sy && WindowFromDC(dst) == g_view && holds_game_frame(src)) {
 		int saved = SaveDC(dst);
-		// (Widened by the margin so the black bars are repainted along with the screen's edge.)
-		IntersectClipRect(dst, x - 1 - g_offsetX, y - 1, x + w + 1 + g_offsetX, y + h + 1);
+		// Exactly the rectangle the game asked for: anything more would wipe what it drew
+		// straight onto the window next to it (the battle screen's selection brackets) and never
+		// restore. Updates that reach a side of a centred screen also repaint that margin.
+		int left = x, right = x + w;
+		if (g_offsetX && left <= 0) left -= g_offsetX;
+		if (g_offsetX && right >= BASE_W) right += g_offsetX;
+		IntersectClipRect(dst, left, y, right, y + h);
 		// A centred screen only owns the left 800 columns of the frame buffer; the rest still
 		// holds whatever the map screen left there, so it is not shown and the margins are black.
 		int width = g_offsetX ? BASE_W : GAME_W;
@@ -2294,19 +2427,20 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 				for (int k = 0; k < 2; k++) if ((from[half][k] & 0xffffff) != HD_KEY) solid = from[half][k];
 			}
 			if (solid == HD_KEY) continue; // nothing of the sprite in this block
-			BOOL drawn = srcRow[x] != key;
+			// Only blocks the game itself drew into: anything written beside them would never be
+			// cleaned up (nothing changes there in the 1x frame), leaving bits of selection
+			// brackets and sprite edges behind.
+			if (srcRow[x] == key) continue;
 			// Background pixels of a block keep what is there, if what is there is known.
 			BOOL keepBackground = s->state[at + x] != 0;
 			for (int half = 0; half < 2; half++) {
 				for (int k = 0; k < 2; k++) {
 					if ((from[half][k] & 0xffffff) != HD_KEY) to[half][k] = from[half][k];
-					else if (drawn && !keepBackground) to[half][k] = solid;
+					else if (!keepBackground) to[half][k] = solid;
 				}
 			}
-			if (drawn) {
-				s->shadow[at + x] = row[x];
-				s->state[at + x] = 1;
-			}
+			s->shadow[at + x] = row[x];
+			s->state[at + x] = 1;
 		}
 	}
 }
@@ -2494,7 +2628,8 @@ static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int
 	static HDC scratchDC;
 	static DWORD *scratch; // top-down, 2*SMALL_MAX square
 	DIBSECTION ds;
-	if (rop != SRCCOPY || g_offsetX || !g_map.frame || !g_view || WindowFromDC(dst) != g_view) return FALSE;
+	// Only on the world map screen: elsewhere the map buffer has nothing to do with what is shown.
+	if (rop != SRCCOPY || g_offsetX || !g_mapOnTop || !g_map.frame || !g_view || WindowFromDC(dst) != g_view) return FALSE;
 	if (w <= 0 || h <= 0 || w > SMALL_MAX || h > SMALL_MAX) return FALSE;
 	HGDIOBJ bmp = GetCurrentObject(src, OBJ_BITMAP);
 	if (!bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || !ds.dsBm.bmBits) return FALSE;
@@ -2704,6 +2839,14 @@ static void install(HMODULE self)
 	HOOK("GDI32.dll", StretchBlt);
 	HOOK("GDI32.dll", GetClipBox);
 	HOOK("GDI32.dll", StretchDIBits);
+	HOOK("GDI32.dll", MoveToEx);
+	HOOK("GDI32.dll", LineTo);
+	HOOK("GDI32.dll", Polyline);
+	HOOK("GDI32.dll", Rectangle);
+	HOOK("GDI32.dll", PatBlt);
+	HOOK("USER32.dll", FillRect);
+	HOOK("USER32.dll", FrameRect);
+	if (g_dumpViews) HOOK("GDI32.dll", SetROP2);
 	BOOL native = skip_mode_switch();
 	lstrcpynA(g_gameDir, ini, sizeof g_gameDir);
 	char *lastSlash = strrchr(g_gameDir, '\\');

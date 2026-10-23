@@ -31,6 +31,11 @@ $ox = ($b.Width - $GameW * $scale) / 2
 $oy = ($b.Height - 600 * $scale) / 2
 
 function Move-To([int]$gx, [int]$gy) {
+    # The screen size can change while the game runs (the stock game switches display modes).
+    $script:b = [Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $script:scale = [Math]::Min($b.Width / [double]$GameW, $b.Height / 600.0)
+    $script:ox = ($b.Width - $GameW * $scale) / 2
+    $script:oy = ($b.Height - 600 * $scale) / 2
     $sx = [int]($ox + $gx * $scale); $sy = [int]($oy + $gy * $scale)
     # Arrive in a few steps so the game sees ordinary mouse movement.
     for ($i = 8; $i -ge 0; $i--) { [void][Native.Drive]::SetCursorPos($sx - $i * 5, $sy - $i * 3); Start-Sleep -Milliseconds 25 }
