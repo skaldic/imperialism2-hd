@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <limits.h>
+#include "layouts.h"
 
 #define BASE_W 800 // the width every screen was designed for
 #define GAME_W g_gameW
@@ -706,6 +708,325 @@ static void widen_battle_screen(BYTE *picture)
 	logf_("battle screen widened by %d", extra);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Wide mode: screens with a layout in layouts.h
+//
+// Their backgrounds are TBackgroundPictures, and some of their views are pictures too (a greyed-out
+// row, for one). TPicture::Draw, which draws all of them, is redirected here: a picture that has
+// been widened is drawn column by column from its layout, anything else as before.
+
+#define MAX_WIDE_PICTURES 96
+typedef struct {
+	BYTE *picture, *screen;     // the picture and the screen it belongs to
+	ScreenLayout layout;        // places its views
+	ScreenLayout look;          // fills it: the layout or its variant for the artwork shown
+	short lookPicture;          // the artwork `look` was chosen for
+	short map[LAYOUT_MAX_BANDS][LAYOUT_MAX_W]; // from `look`
+} WidePicture;
+static WidePicture g_widePictures[MAX_WIDE_PICTURES];
+static BOOL g_layoutDrawHooked;
+static BYTE *g_pictureDrawRest; // TPicture::Draw's first instructions, then a jump to the rest
+
+static WidePicture *wide_picture(const BYTE *picture)
+{
+	for (int i = 0; i < MAX_WIDE_PICTURES; i++)
+		if (g_widePictures[i].picture && g_widePictures[i].picture == picture) return &g_widePictures[i];
+	return NULL;
+}
+
+static void layout_stretch_fill(BYTE *src, BYTE *dst, int sx, int sw, int top, int bottom, int dx, int dy,
+	int dw, int clipLeft, int clipRight);
+
+// Picks the fill for the artwork a picture shows now: a variant entry for that artwork if there
+// is one, or else the picture's own layout.
+static void choose_look(WidePicture *wide, short artwork)
+{
+	const ScreenLayout *base = &wide->layout, *look = base;
+	for (int i = 0; i < (int)(sizeof g_screenLayouts / sizeof g_screenLayouts[0]); i++) {
+		const ScreenLayout *v = &g_screenLayouts[i];
+		if (v->picture && v->picture == artwork && v->id == base->id && !strcmp(v->cls, base->cls) &&
+			v->width == base->width && v->height == base->height && layout_extra(v) == layout_extra(base) &&
+			layout_valid(v)) look = v;
+	}
+	wide->look = *look;
+	wide->lookPicture = artwork;
+	for (int b = 0; b < LAYOUT_MAX_BANDS && look->bands[b].bottom; b++)
+		layout_band_map(&wide->look, &wide->look.bands[b], wide->map[b]);
+}
+
+static void __attribute__((thiscall)) layout_background_draw(BYTE *self, const int *area)
+{
+	typedef void (__attribute__((thiscall)) *DrawFn)(void *, const int *);
+	typedef void (__attribute__((thiscall)) *CopyPixels)(void *src, void *dst, int sx, int sy, int w, int h, int dx, int dy, DWORD transparent);
+	typedef void *(__cdecl *QuickOffscreenDib)(void);
+	WidePicture *wide = wide_picture(self);
+	// (A view that has since changed size, or another one at the same address, is drawn as before.)
+	if (wide && (VIEW_INT(self, V_W) != wide->layout.width + layout_extra(&wide->layout) ||
+		VIEW_INT(self, V_H) != wide->layout.height)) wide = NULL;
+	void *src = *(void **)(self + 0x90), *dst = wide ? ((QuickOffscreenDib)0x004a8540)() : NULL;
+	if (!wide || !src || !dst) {
+		((DrawFn)g_pictureDrawRest)(self, area); // TPicture::Draw as it was
+		return;
+	}
+	short artwork = *(short *)(self + 0x88);
+	if (wide->layout.id && artwork != wide->lookPicture) choose_look(wide, artwork);
+	CopyPixels copy = g_hd ? (CopyPixels)hd_copy_pixels : (CopyPixels)0x00487790;
+	const ScreenLayout *s = &wide->look;
+	int originX = VIEW_INT(self, 0x2c), originY = VIEW_INT(self, 0x30);
+	int width = s->width + layout_extra(s);
+	for (int b = 0; b < LAYOUT_MAX_BANDS && s->bands[b].bottom; b++) {
+		int top = max(area[1], s->bands[b].top), bottom = min(area[3], s->bands[b].bottom);
+		if (bottom <= top) continue;
+		const short *map = wide->map[b];
+		// Runs of columns that come from consecutive source columns are copied in one go.
+		int left = max(area[0], 0), right = min(area[2], width);
+		for (int x = left; x < right;) {
+			int run = 1;
+			while (x + run < right && map[x + run] == map[x] + run) run++;
+			copy(src, dst, map[x], top, run, bottom - top, originX + x, originY + top, 0xffffffff);
+			x += run;
+		}
+		// Stretched columns were copied as repeats of the nearest source column; they are redrawn
+		// blended between neighbours.
+		int before = 0;
+		for (int i = 0; i < LAYOUT_MAX_INSERTS && s->bands[b].ins[i].width; i++) {
+			const LayoutInsert *in = &s->bands[b].ins[i];
+			if (in->mode == 'S') {
+				int from = in->src + before, total = in->srcW + in->width;
+				layout_stretch_fill(src, dst, in->src, in->srcW, top, bottom, originX + from, originY,
+					total, originX + max(left, from), originX + min(right, from + total));
+			}
+			before += in->width;
+		}
+	}
+}
+
+// TPicture::Draw starts "sub esp,30h; push ebx; push ebp", five bytes that become a jump here. They
+// are copied, followed by a jump back past them, to make the original callable.
+static void hook_layout_draw(void)
+{
+	BYTE *site = (BYTE *)0x004a3e20;
+	static const BYTE expected[] = { 0x83, 0xec, 0x30, 0x53, 0x55 };
+	if (g_layoutDrawHooked) return;
+	if (memcmp(site, expected, sizeof expected)) {
+		logf_("TPicture::Draw not as expected: wide screen layouts off");
+		return;
+	}
+	g_pictureDrawRest = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!g_pictureDrawRest) return;
+	memcpy(g_pictureDrawRest, expected, sizeof expected);
+	g_pictureDrawRest[5] = 0xe9;
+	*(int *)(g_pictureDrawRest + 6) = (int)((site + 5) - (g_pictureDrawRest + 10));
+	DWORD old;
+	VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old);
+	site[0] = 0xe9;
+	*(int *)(site + 1) = (int)((BYTE *)layout_background_draw - (site + 5));
+	VirtualProtect(site, 5, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, 5);
+	g_layoutDrawHooked = TRUE;
+}
+
+static const ScreenLayout *find_layout(BYTE *picture)
+{
+	for (int i = 0; i < (int)(sizeof g_screenLayouts / sizeof g_screenLayouts[0]); i++) {
+		const ScreenLayout *s = &g_screenLayouts[i];
+		if (s->picture) continue; // fill for one artwork only (see choose_look)
+		if (strcmp(view_class(picture), s->cls) || (DWORD)VIEW_INT(picture, V_ID) != s->id) continue;
+		if (VIEW_INT(picture, V_W) != s->width || VIEW_INT(picture, V_H) != s->height) continue;
+		if (s->child && !child_view(picture, s->child)) continue;
+		return s;
+	}
+	return NULL;
+}
+
+static WidePicture *register_wide_picture(BYTE *picture, BYTE *screen, const ScreenLayout *layout)
+{
+	WidePicture *slot = wide_picture(picture);
+	for (int i = 0; i < MAX_WIDE_PICTURES && !slot; i++) if (!g_widePictures[i].picture) slot = &g_widePictures[i];
+	if (!slot) return NULL;
+	slot->picture = picture;
+	slot->screen = screen;
+	slot->layout = *layout;
+	slot->look = *layout;
+	slot->lookPicture = -1;
+	for (int b = 0; b < LAYOUT_MAX_BANDS && layout->bands[b].bottom; b++)
+		layout_band_map(&slot->look, &slot->look.bands[b], slot->map[b]);
+	return slot;
+}
+
+// Whether a view is drawn by TPicture::Draw: its virtual table leads there.
+static BOOL drawn_as_picture(const BYTE *view)
+{
+	void **vtable = *(void ***)view;
+	if (!readable(vtable, 0x100 * sizeof(void *))) return FALSE;
+	for (int slot = 0; slot < 0x100; slot++) {
+		const BYTE *fn = (const BYTE *)vtable[slot];
+		if (readable(fn, 5) && fn[0] == 0xe9) fn += 5 + *(const int *)(fn + 1);
+		DWORD target = (DWORD)(DWORD_PTR)fn;
+		if (target == 0x004a3e20 || target == 0x005c7d60) return TRUE; // TPicture, TBackgroundPicture
+	}
+	return FALSE;
+}
+
+// The game keeps moving some views after a screen is built: tabs and panels are swapped by moving
+// them between their place and a parking spot far off screen, and some views are created later.
+// So the layout is not applied once but kept: every view's position as the game set it (in the
+// 800-wide layout) is remembered, and whenever the game has changed it since, the view is placed
+// again from the new value.
+#define VIEW_RECORDS 4096
+typedef struct { BYTE *view, *screen; int origX, origW, setX, setW; } ViewRecord;
+static ViewRecord g_viewRecords[VIEW_RECORDS];
+
+static ViewRecord *view_record(BYTE *view, BYTE *screen)
+{
+	unsigned h = ((unsigned)(DWORD_PTR)view >> 3) % VIEW_RECORDS;
+	for (int probe = 0; probe < VIEW_RECORDS; probe++, h = (h + 1) % VIEW_RECORDS) {
+		ViewRecord *r = &g_viewRecords[h];
+		if (r->view == view) return r;
+		if (!r->view) {
+			r->view = view;
+			r->screen = screen;
+			r->origX = VIEW_INT(view, V_X);
+			r->origW = VIEW_INT(view, V_W);
+			r->setX = INT_MIN;
+			return r;
+		}
+	}
+	return NULL;
+}
+
+// The layout in force below a picture, and where that picture's left edge was and is.
+typedef struct { const ScreenLayout *layout; int origLeft, newLeft, top; } LayoutContext;
+
+static int sync_layout(BYTE *screen, BYTE *view, const LayoutContext *ctx, int parentOrigX, int parentNewX)
+{
+	int changed = 0;
+	BYTE *list = *(BYTE **)(view + V_SUBVIEWS);
+	if (!readable(list, 8)) return 0;
+	for (void **node = *(void ***)(list + 4); readable(node, 12); node = (void **)node[0]) {
+		BYTE *child = (BYTE *)node[2];
+		if (!readable(child, 0x54)) continue;
+		ViewRecord *rec = view_record(child, screen);
+		if (!rec) return changed;
+		if (rec->setX != INT_MIN && (VIEW_INT(child, V_X) != rec->setX || VIEW_INT(child, V_W) != rec->setW)) {
+			if (g_dumpViews) {
+				static int logged;
+				DWORD id = (DWORD)VIEW_INT(child, V_ID);
+				if (logged++ < 200) logf_("  game moved '%c%c%c%c' (%s): x %d -> %d, w %d -> %d (originally %d)", (char)(id >> 24),
+					(char)(id >> 16), (char)(id >> 8), (char)id, view_class(child), rec->setX, VIEW_INT(child, V_X),
+					rec->setW, VIEW_INT(child, V_W), rec->origX);
+			}
+			rec->origX = VIEW_INT(child, V_X); // moved or resized by the game since
+			rec->origW = VIEW_INT(child, V_W);
+		}
+		int origX = parentOrigX + rec->origX, w = rec->origW;
+		int y = VIEW_INT(child, 0x30) - ctx->top, h = VIEW_INT(child, V_H);
+		int nx, nw;
+		layout_place(ctx->layout, origX - ctx->origLeft, y, w, h, &nx, &nw);
+		LayoutContext inner = *ctx;
+		WidePicture *wide = wide_picture(child);
+		if (nw != w && !wide) {
+			const ScreenLayout *own = find_layout(child);
+			ScreenLayout derived;
+			if (own && own->width + layout_extra(own) == nw && layout_valid(own)) {
+				// A picture with a layout of its own (identified while it still has its old size).
+				wide = register_wide_picture(child, screen, own);
+			} else if (drawn_as_picture(child)) {
+				// A picture is lengthened the same way as the background under it; one that cannot
+				// be (its fill would come from outside it) keeps its size and moves with its middle.
+				if (layout_derive(ctx->layout, origX - ctx->origLeft, y, w, h, &derived))
+					wide = register_wide_picture(child, screen, &derived);
+				if (!wide) {
+					const LayoutBand *band = layout_band(ctx->layout, y + h / 2);
+					nx = origX - ctx->origLeft + layout_shift_left(band, origX - ctx->origLeft + w / 2);
+					nw = w;
+				}
+			}
+		}
+		if (wide && wide->layout.id) {
+			// The views inside a picture with its own layout follow that layout.
+			inner.layout = &wide->layout;
+			inner.origLeft = origX;
+			inner.newLeft = ctx->newLeft + nx;
+			inner.top = VIEW_INT(child, 0x30);
+		}
+		int newX = ctx->newLeft + nx;
+		if (VIEW_INT(child, V_X) != newX - parentNewX || VIEW_INT(child, V_W) != nw) {
+			VIEW_INT(child, V_X) = newX - parentNewX;
+			VIEW_INT(child, V_W) = nw;
+			update_coordinates(child);
+			changed++;
+		}
+		rec->setX = newX - parentNewX;
+		rec->setW = nw;
+		changed += sync_layout(screen, child, &inner, origX, newX);
+	}
+	return changed;
+}
+
+static void sync_layout_screen(BYTE *screen)
+{
+	WidePicture *wide = wide_picture(screen);
+	if (!wide) return;
+	LayoutContext ctx = { &wide->layout, 0, 0, VIEW_INT(screen, 0x30) };
+	if (sync_layout(screen, screen, &ctx, 0, 0)) {
+		// Through the game (TView::InvalidateRect), so that the views themselves are redrawn and
+		// not just the last frame shown again.
+		typedef void (__attribute__((thiscall)) *Invalidate)(void *, const RECT *, int);
+		RECT all = { 0, 0, VIEW_INT(screen, V_W), VIEW_INT(screen, V_H) };
+		((Invalidate)0x0049fbf0)(screen, &all, 1);
+	}
+}
+
+static BOOL widen_layout_screen(BYTE *screen)
+{
+	const ScreenLayout *s = find_layout(screen);
+	if (!s || !g_layoutDrawHooked || g_gameW != BASE_W + LAYOUT_EXTRA) return FALSE;
+	if (!layout_valid(s) || layout_extra(s) != LAYOUT_EXTRA || VIEW_INT(screen, 0x2c) != 0) {
+		logf_("layout '%s' is not valid here", s->name);
+		return FALSE;
+	}
+	if (!register_wide_picture(screen, screen, s)) return FALSE;
+	widen_parents(screen);
+	sync_layout_screen(screen);
+	logf_("screen '%s' widened", s->name);
+	return TRUE;
+}
+
+// Forgets the widened pictures and view records of screens that have gone (their memory may be
+// reused for other views).
+static void forget_layout_screens(BYTE **current, int count)
+{
+	BOOL any = FALSE;
+	for (int i = 0; i < MAX_WIDE_PICTURES; i++) {
+		if (!g_widePictures[i].picture) continue;
+		BOOL alive = FALSE;
+		for (int j = 0; j < count; j++) alive |= current[j] == g_widePictures[i].screen;
+		if (!alive) {
+			if (g_widePictures[i].picture == g_widePictures[i].screen) any = TRUE;
+			g_widePictures[i].picture = g_widePictures[i].screen = NULL;
+		}
+	}
+	if (!any) return;
+	// Rebuilt without the records of the screens gone, so the probe chains stay intact.
+	static ViewRecord keep[VIEW_RECORDS];
+	int kept = 0;
+	for (int i = 0; i < VIEW_RECORDS; i++) {
+		if (!g_viewRecords[i].view) continue;
+		for (int j = 0; j < MAX_WIDE_PICTURES; j++) {
+			if (g_widePictures[j].screen == g_viewRecords[i].screen && g_widePictures[j].picture) {
+				keep[kept++] = g_viewRecords[i];
+				break;
+			}
+		}
+	}
+	memset(g_viewRecords, 0, sizeof g_viewRecords);
+	for (int i = 0; i < kept; i++) {
+		ViewRecord *r = view_record(keep[i].view, keep[i].screen);
+		if (r) *r = keep[i];
+	}
+}
+
 // Every screen is a child of the 'base' view inside the game window's view tree:
 //   TGameWindow 'WIND' > TIncludeView 'Incl' > TView 'base' > one picture per screen.
 // The game window hangs off the object at 0x0075a60c.
@@ -725,7 +1046,8 @@ static BOOL is_battle_screen(const BYTE *screen) { return strcmp(view_class(scre
 // Screens laid out for the full width; every other screen is presented centred.
 static BOOL is_wide_screen(BYTE *screen)
 {
-	return is_map_screen(screen) || (is_battle_screen(screen) && VIEW_INT(screen, V_W) == g_gameW);
+	return is_map_screen(screen) || (is_battle_screen(screen) && VIEW_INT(screen, V_W) == g_gameW) ||
+		wide_picture(screen) != NULL;
 }
 
 
@@ -771,11 +1093,21 @@ static void watch_screens(void)
 	BYTE *current[32], *top = NULL;
 	int count = 0;
 	BYTE *list = base ? *(BYTE **)(base + V_SUBVIEWS) : NULL;
+	// Records of screens that have gone are dropped before any new screen is laid out: its views
+	// may be where the old screen's were.
+	if (readable(list, 8)) {
+		BYTE *present[32];
+		int n = 0;
+		for (void **node = *(void ***)(list + 4); readable(node, 12) && n < 32; node = (void **)node[0]) present[n++] = (BYTE *)node[2];
+		forget_layout_screens(present, n);
+	}
 	if (readable(list, 8)) {
 		for (void **node = *(void ***)(list + 4); readable(node, 12) && count < 32; node = (void **)node[0]) {
 			BYTE *screen = (BYTE *)node[2];
 			if (!readable(screen, 0x54)) continue;
-			top = screen;
+			// Some screens attach a small view of their own here too (the trade screen's help
+			// text); what is on top is the last full-size one.
+			if (VIEW_INT(screen, V_W) >= BASE_W && VIEW_INT(screen, V_H) >= GAME_H) top = screen;
 
 			BOOL seen = FALSE;
 			for (int i = 0; i < handledCount; i++) seen |= handled[i] == screen;
@@ -787,7 +1119,8 @@ static void watch_screens(void)
 
 				if (g_gameW > BASE_W) {
 					if (map) widen_map_screen(screen);
-					if (battle) widen_battle_screen(screen);
+					else if (battle) widen_battle_screen(screen);
+					else widen_layout_screen(screen);
 				}
 				if (g_dumpViews) { g_traceBudget = 60; g_moveTraces = 0; }
 				DWORD id = (DWORD)VIEW_INT(screen, V_ID);
@@ -795,7 +1128,7 @@ static void watch_screens(void)
 					(char)(id >> 16), (char)(id >> 8), (char)id, VIEW_INT(screen, V_X), VIEW_INT(screen, V_Y),
 					VIEW_INT(screen, V_W), VIEW_INT(screen, V_H));
 				if (g_dumpViews) {
-					int budget = 400;
+					int budget = 3000;
 					dump_view(screen, 1, &budget);
 				}
 			}
@@ -804,6 +1137,8 @@ static void watch_screens(void)
 	}
 	memcpy(handled, current, sizeof(BYTE *) * count);
 	handledCount = count;
+	forget_layout_screens(current, count);
+	for (int i = 0; i < count; i++) sync_layout_screen(current[i]);
 	// Whatever is on top decides how the frame is presented. Only the map and battle screens use the full width;
 	// with no screen at all (the intro movies) the 800-wide layout is centred too.
 	int offset = g_gameW > BASE_W && !(top && is_wide_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
@@ -1920,6 +2255,28 @@ static BOOL patch_imm16(DWORD address, WORD expected, WORD value)
 	return TRUE;
 }
 
+// Fixed positions in the drawing code of screens with a layout (layouts.h), moved to match it.
+// Each is a "push imm32" found by scanning the function, so that a mismatch is noticed.
+static BOOL patch_push_in(DWORD function, DWORD length, DWORD value, DWORD moved)
+{
+	BYTE *site = NULL;
+	int found = 0;
+	for (BYTE *p = (BYTE *)function; p + 5 <= (BYTE *)function + length; p++)
+		if (p[0] == 0x68 && *(DWORD *)(p + 1) == value) { site = p; found++; }
+	if (found != 1) {
+		logf_("push %lu in %08lx: found %d times, not patched", (unsigned long)value, (unsigned long)function, found);
+		return FALSE;
+	}
+	return patch_imm32((DWORD)(DWORD_PTR)(site + 1), value, moved);
+}
+
+static void widen_layout_constants(void)
+{
+	// TTradeScreenPicture::Draw draws each row's goods icon at x=171, in the table's Item
+	// column, which the trade layout moves 128 to the right.
+	patch_push_in(0x00653870, 0x3b0, 171, 171 + 128);
+}
+
 // TTacticalBattleView::DrawDecorativeCorners places the four gilt corner pieces of the battlefield
 // at fixed positions in a 775x480 view; the right-hand two move over with the right edge. The
 // positions are "mov [esp+disp8], imm32" stores into its local rectangles, except the shared right
@@ -2617,6 +2974,105 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	}
 }
 
+// One pixel of a game picture (8-bit with its colour table, or 16-bit) as a 16-bit 5-5-5 value.
+static WORD picture_pixel(const BITMAPINFOHEADER *h, const BYTE *bits, int x, int y)
+{
+	int w = h->biWidth, ht = abs(h->biHeight);
+	int row = h->biHeight > 0 ? ht - 1 - y : y;
+	if (h->biBitCount == 16) return ((const WORD *)(bits + (size_t)row * ((w * 2 + 3) & ~3)))[x];
+	const RGBQUAD *table = (const RGBQUAD *)((const BYTE *)h + h->biSize);
+	RGBQUAD c = table[bits[(size_t)row * ((w + 3) & ~3) + x]];
+	return (WORD)((c.rgbRed >> 3) << 10 | (c.rgbGreen >> 3) << 5 | (c.rgbBlue >> 3));
+}
+
+static WORD blend555(WORD a, WORD b, int t) // t from 0 (a) to 256 (b)
+{
+	int r = ((a >> 10 & 31) * (256 - t) + (b >> 10 & 31) * t + 128) >> 8;
+	int g = ((a >> 5 & 31) * (256 - t) + (b >> 5 & 31) * t + 128) >> 8;
+	int bl = ((a & 31) * (256 - t) + (b & 31) * t + 128) >> 8;
+	return (WORD)(r << 10 | g << 5 | bl);
+}
+
+static DWORD blend888(DWORD a, DWORD b, int t)
+{
+	DWORD out = 0;
+	for (int shift = 0; shift < 24; shift += 8) {
+		int c = ((int)(a >> shift & 255) * (256 - t) + (int)(b >> shift & 255) * t + 128) >> 8;
+		out |= (DWORD)c << shift;
+	}
+	return out | 0xff000000;
+}
+
+// Where output column k of n_out falls among n_in source columns: the left one and the blend.
+static void stretch_position(int k, int nOut, int nIn, int *i, int *t)
+{
+	int p = ((2 * k + 1) * nIn * 256) / (2 * nOut) - 128; // in 1/256 of a source column
+	if (p < 0) p = 0;
+	*i = p >> 8;
+	*t = p & 255;
+	if (*i >= nIn - 1) { *i = nIn - 1; *t = 0; }
+}
+
+// Draws source columns [sx, sx+sw) of a picture's rows [top, bottom) stretched smoothly to dw
+// columns at dx in the frame (rows at dy + row), within columns [clipLeft, clipRight). The HD
+// frame gets the same stretch of the picture's HD art when there is one.
+static void layout_stretch_fill(BYTE *src, BYTE *dst, int sx, int sw, int top, int bottom, int dx, int dy,
+	int dw, int clipLeft, int clipRight)
+{
+	if (!readable(src, 0x14) || !readable(dst, 0x14) || sw < 2) return;
+	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
+	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
+	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh) || dh->biBitCount != 16) return;
+	if (sh->biBitCount != 8 && sh->biBitCount != 16) return;
+	const BYTE *srcBits = *(const BYTE **)(src + 0x0c);
+	WORD *frame = *(WORD **)(dst + 0x0c);
+	int fw = dh->biWidth, fh = abs(dh->biHeight), stride = (fw + 1) & ~1;
+	if (!srcBits || !frame || sx < 0 || sx + sw > sh->biWidth || bottom > abs(sh->biHeight)) return;
+	clipLeft = max(clipLeft, max(dx, 0));
+	clipRight = min(clipRight, min(dx + dw, fw));
+
+	HdSurface *hd = NULL;
+	const DWORD *art = NULL;
+	if (hd_ready() && fw == g_main.w && fh == g_main.h && g_main.bits == frame) {
+		const HdImage *image = hd_find(srcBits, sh->biWidth, abs(sh->biHeight), sh->biBitCount);
+		if (image && image->pixels) { hd = &g_main; art = image->pixels; }
+	}
+	int pw = sh->biWidth;
+	for (int y = top; y < bottom; y++) {
+		int fy = dy + y;
+		if (fy < 0 || fy >= fh) continue;
+		WORD *row = frame + (size_t)(dh->biHeight > 0 ? fh - 1 - fy : fy) * stride;
+		for (int x = clipLeft; x < clipRight; x++) {
+			int i, t;
+			stretch_position(x - dx, dw, sw, &i, &t);
+			WORD a = picture_pixel(sh, srcBits, sx + i, y);
+			WORD v = t ? blend555(a, picture_pixel(sh, srcBits, sx + i + 1, y), t) : a;
+			row[x] = v;
+			if (!hd) continue;
+			size_t at = (size_t)fy * hd->w + x;
+			for (int half = 0; half < 2; half++) {
+				const DWORD *from = art + (size_t)(y * 2 + half) * pw * 2;
+				DWORD *to = hd->frame + (size_t)(fy * 2 + half) * hd->w * 2;
+				for (int k = 0; k < 2; k++) {
+					int i2, t2;
+					stretch_position((x - dx) * 2 + k, dw * 2, sw * 2, &i2, &t2);
+					DWORD c = from[sx * 2 + i2];
+					to[x * 2 + k] = t2 ? blend888(c, from[sx * 2 + i2 + 1], t2) : c;
+				}
+			}
+			hd->shadow[at] = v;
+			hd->state[at] = 1;
+		}
+	}
+	if (!hd && g_main.bits == frame && fw == g_main.w && fh == g_main.h && g_main.state) {
+		// No HD art: these pixels are smoothed from the 1x frame.
+		for (int y = top; y < bottom; y++) {
+			int fy = dy + y;
+			if (fy >= 0 && fy < fh && clipRight > clipLeft) memset(g_main.state + (size_t)fy * g_main.w + clipLeft, 0, (size_t)(clipRight - clipLeft));
+		}
+	}
+}
+
 // The 16-bit pixel buffer selected into a device context, with its layout; NULL if there is none.
 static const WORD *dc_pixels(HDC dc, int *w, int *h, int *stride, BOOL *bottomUp)
 {
@@ -2948,6 +3404,8 @@ static void widen_screen(int width)
 	logf_("wide map %s", g_wideMap ? "enabled" : "NOT enabled: the map stays 576 wide");
 	g_wideBattle = widen_battle_constants(width - BASE_W);
 	build_bg_layouts();
+	hook_layout_draw();
+	if (g_layoutDrawHooked) widen_layout_constants();
 }
 
 // Globals the game fills in before WinMain; adjusted once its windows exist.
