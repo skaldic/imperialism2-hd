@@ -8,6 +8,7 @@
 param(
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Steps,
     [switch]$KeepRunning,
+    [switch]$Attach,     # play the steps on the game that is already running instead of starting it
     [int]$GameW = 800   # width of the game's frame: 1056 when testing wide mode
 )
 
@@ -22,7 +23,8 @@ Add-Type -Namespace Native -Name Drive -MemberDefinition @'
 $outDir = "$PSScriptRoot\shots"
 New-Item -ItemType Directory -Force $outDir | Out-Null
 $game = Resolve-Path "$PSScriptRoot\..\.."
-$proc = Start-Process -FilePath "$game\Imperialism II.exe" -WorkingDirectory $game -PassThru
+$proc = if ($Attach) { Get-Process "Imperialism II" | Select-Object -First 1 }
+        else { Start-Process -FilePath "$game\Imperialism II.exe" -WorkingDirectory $game -PassThru }
 
 # The view is the largest rectangle of the game's shape centred on the primary screen.
 $b = [Windows.Forms.Screen]::PrimaryScreen.Bounds

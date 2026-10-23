@@ -432,11 +432,81 @@ static void update_coordinates(BYTE *view)
 #define RIBBON_LEFT 112
 #define RIBBON_RIGHT 488
 
-static void *g_backgroundVtable[0x101];
+// The battle screen's background: a stone title bar, thin pillars either side of the battlefield
+// and the toolbar's panel along the bottom (the toolbar itself draws nothing but its buttons).
+#define TAC_HOLE_X 12
+#define TAC_HOLE_Y 29
+#define TAC_HOLE_W 775
+#define TAC_HOLE_H 480
+#define TAC_TITLE_SPLIT 400    // the title bar is plain stone from about x=220 to x=560
+#define TAC_TITLE_SLICE 300
+#define TAC_PANEL_SPLIT1 212   // plain panel between the 'done' button and the unit description
+#define TAC_PANEL_SPLIT2 404   // and between the description and the 'retreat' button
+#define TAC_PANEL_SLICE 160    // two repeats of the panel's bottom ornament, 26 pixels each
+#define TAC_SLICE_W 52
 
 // One horizontal run of the widened background: destination columns [dstStart, dstEnd) come from
 // the picture starting at srcStart. With tile > 0 the source is a strip that wide, repeated.
 typedef struct { int dstStart, dstEnd, srcStart, tile; } BgSpan;
+
+// A widened screen background. The rectangle of the view it frames (the map or the battlefield)
+// is never painted: the game does not redraw that view after the background, it relies on the
+// background leaving that area alone. Rows above and beside it are built from the upper spans,
+// rows below it from the lower spans.
+typedef struct {
+	RECT hole;
+	BgSpan upper[5], lower[5];
+	int upperCount, lowerCount;
+} BgLayout;
+
+enum { BG_MAP, BG_BATTLE, BG_KINDS };
+static BgLayout g_bgLayouts[BG_KINDS];
+static void *g_backgroundVtables[BG_KINDS][0x101];
+
+static void build_bg_layouts(void)
+{
+	int extra = g_gameW - BASE_W, half = extra / 2;
+	// Map: everything from BG_SPLIT on moves right with the panel. The toolbar ribbon in the
+	// bottom border is moved half the extra width so it stays centred under the map, with plain
+	// border either side of it.
+	BgLayout map = {
+		{ MAP_HOLE_X, MAP_HOLE_Y, MAP_HOLE_X + MAP_HOLE_W + extra, MAP_HOLE_Y + MAP_HOLE_H },
+		{
+			{ 0, BG_SPLIT, 0, 0 },
+			{ BG_SPLIT, BG_SPLIT + extra, BG_SLICE, BG_SLICE_W },
+			{ BG_SPLIT + extra, g_gameW, BG_SPLIT, 0 },
+		},
+		{
+			{ 0, RIBBON_LEFT, 0, 0 },
+			{ RIBBON_LEFT, RIBBON_LEFT + half, RIBBON_RIGHT, BG_SPLIT - RIBBON_RIGHT },
+			{ RIBBON_LEFT + half, RIBBON_RIGHT + half, RIBBON_LEFT, 0 },
+			{ RIBBON_RIGHT + half, BG_SPLIT + extra, RIBBON_RIGHT, BG_SPLIT - RIBBON_RIGHT },
+			{ BG_SPLIT + extra, g_gameW, BG_SPLIT, 0 },
+		},
+		3, 5,
+	};
+	// Battle: the title bar is lengthened in its middle. The toolbar panel is lengthened in two
+	// places, half the extra width each, and its buttons are spread out to match (see
+	// widen_battle_screen).
+	BgLayout battle = {
+		{ TAC_HOLE_X, TAC_HOLE_Y, TAC_HOLE_X + TAC_HOLE_W + extra, TAC_HOLE_Y + TAC_HOLE_H },
+		{
+			{ 0, TAC_TITLE_SPLIT, 0, 0 },
+			{ TAC_TITLE_SPLIT, TAC_TITLE_SPLIT + extra, TAC_TITLE_SLICE, TAC_SLICE_W },
+			{ TAC_TITLE_SPLIT + extra, g_gameW, TAC_TITLE_SPLIT, 0 },
+		},
+		{
+			{ 0, TAC_PANEL_SPLIT1, 0, 0 },
+			{ TAC_PANEL_SPLIT1, TAC_PANEL_SPLIT1 + half, TAC_PANEL_SLICE, TAC_SLICE_W },
+			{ TAC_PANEL_SPLIT1 + half, TAC_PANEL_SPLIT2 + half, TAC_PANEL_SPLIT1, 0 },
+			{ TAC_PANEL_SPLIT2 + half, TAC_PANEL_SPLIT2 + extra, TAC_PANEL_SLICE, TAC_SLICE_W },
+			{ TAC_PANEL_SPLIT2 + extra, g_gameW, TAC_PANEL_SPLIT2, 0 },
+		},
+		3, 5,
+	};
+	g_bgLayouts[BG_MAP] = map;
+	g_bgLayouts[BG_BATTLE] = battle;
+}
 
 static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int *area)
 {
@@ -446,33 +516,15 @@ static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int
 	void *dst = ((QuickOffscreenDib)0x004a8540)();
 	if (!src || !dst) return;
 
-	int extra = g_gameW - BASE_W;
-	// Top border and side columns: everything from BG_SPLIT on moves right with the panel.
-	const BgSpan upper[] = {
-		{ 0, BG_SPLIT, 0, 0 },
-		{ BG_SPLIT, BG_SPLIT + extra, BG_SLICE, BG_SLICE_W },
-		{ BG_SPLIT + extra, g_gameW, BG_SPLIT, 0 },
-	};
-	// Bottom border: the toolbar ribbon is moved half the extra width so it stays centred under
-	// the map, with plain border either side of it.
-	const BgSpan lower[] = {
-		{ 0, RIBBON_LEFT, 0, 0 },
-		{ RIBBON_LEFT, RIBBON_LEFT + extra / 2, RIBBON_RIGHT, BG_SPLIT - RIBBON_RIGHT },
-		{ RIBBON_LEFT + extra / 2, RIBBON_RIGHT + extra / 2, RIBBON_LEFT, 0 },
-		{ RIBBON_RIGHT + extra / 2, BG_SPLIT + extra, RIBBON_RIGHT, BG_SPLIT - RIBBON_RIGHT },
-		{ BG_SPLIT + extra, g_gameW, BG_SPLIT, 0 },
-	};
-
-	// The map's rectangle is never painted: the game does not redraw the map after the
-	// background, it relies on the background leaving that area alone.
-	const int holeLeft = MAP_HOLE_X, holeRight = MAP_HOLE_X + MAP_HOLE_W + extra;
-	const int bands[3][2] = { { 0, MAP_HOLE_Y }, { MAP_HOLE_Y, MAP_HOLE_Y + MAP_HOLE_H }, { MAP_HOLE_Y + MAP_HOLE_H, GAME_H } };
+	const BgLayout *layout = &g_bgLayouts[*(void ***)self == &g_backgroundVtables[BG_BATTLE][1] ? BG_BATTLE : BG_MAP];
+	const int holeLeft = layout->hole.left, holeRight = layout->hole.right;
+	const int bands[3][2] = { { 0, layout->hole.top }, { layout->hole.top, layout->hole.bottom }, { layout->hole.bottom, GAME_H } };
 
 	for (int band = 0; band < 3; band++) {
 		int top = max(area[1], bands[band][0]), bottom = min(area[3], bands[band][1]);
 		if (bottom <= top) continue;
-		const BgSpan *spans = band == 2 ? lower : upper;
-		int count = band == 2 ? (int)(sizeof lower / sizeof lower[0]) : (int)(sizeof upper / sizeof upper[0]);
+		const BgSpan *spans = band == 2 ? layout->lower : layout->upper;
+		int count = band == 2 ? layout->lowerCount : layout->upperCount;
 
 		for (int i = 0; i < count; i++) {
 			for (int dx = spans[i].dstStart; dx < spans[i].dstEnd;) {
@@ -502,25 +554,56 @@ static void __attribute__((thiscall)) wide_background_draw(BYTE *self, const int
 	}
 }
 // Gives this one picture object its own copy of its class's virtual table with Draw replaced.
-static BOOL hook_background_draw(BYTE *picture)
+// (One copy per kind of screen; the copy also tells wide_background_draw which layout to use.)
+static BOOL hook_background_draw(BYTE *picture, int kind)
 {
 	const DWORD originalDraw = 0x005c8800; // TOffLimitsPicture::Draw
-	void **vtable = *(void ***)picture;
-	if (vtable == &g_backgroundVtable[1]) return TRUE;
-	if (!readable(vtable - 1, sizeof g_backgroundVtable)) return FALSE;
+	void **vtable = *(void ***)picture, **copy = g_backgroundVtables[kind];
+	if (vtable == &copy[1]) return TRUE;
+	if (!readable(vtable - 1, sizeof g_backgroundVtables[kind])) return FALSE;
 
 	for (int slot = 0; slot < 0x100; slot++) {
 		const BYTE *fn = (const BYTE *)vtable[slot];
 		// Incremental-link builds reach functions through a "jmp" thunk.
 		if (readable(fn, 5) && fn[0] == 0xe9) fn += 5 + *(const int *)(fn + 1);
 		if ((DWORD)(DWORD_PTR)fn != originalDraw) continue;
-		memcpy(g_backgroundVtable, vtable - 1, sizeof g_backgroundVtable);
-		g_backgroundVtable[slot + 1] = (void *)wide_background_draw;
-		*(void ***)picture = &g_backgroundVtable[1];
+		memcpy(copy, vtable - 1, sizeof g_backgroundVtables[kind]);
+		copy[slot + 1] = (void *)wide_background_draw;
+		*(void ***)picture = &copy[1];
 		logf_("background draw replaced (vtable slot %d)", slot);
 		return TRUE;
 	}
+	logf_("background draw of %s not found", view_class(picture));
 	return FALSE;
+}
+
+// The background picture leaves a hole where the view it frames goes (TOffLimitsPicture); the
+// hole was cut for the old size when the screen was built.
+static void cut_background_hole(BYTE *picture, BYTE *view)
+{
+	typedef void **(__cdecl *NewRgnFn)(void);
+	typedef void (__cdecl *SetRectRgnFn)(void **, short, short, short, short);
+	typedef void (__attribute__((thiscall)) *SetRgnFn)(void *, void **);
+	typedef void **(__cdecl *DisposeRgnFn)(void **);
+	void **rgn = ((NewRgnFn)0x004a94e0)();
+	((SetRectRgnFn)0x004ac6c0)(rgn, (short)VIEW_INT(view, V_X), (short)VIEW_INT(view, V_Y),
+		(short)(VIEW_INT(view, V_X) + VIEW_INT(view, V_W)), (short)(VIEW_INT(view, V_Y) + VIEW_INT(view, V_H)));
+	((SetRgnFn)0x005c88b0)(picture, rgn);
+	((DisposeRgnFn)0x004a92d0)(rgn);
+}
+
+static void widen_parents(BYTE *picture)
+{
+	for (BYTE *v = picture; readable(v, 0x54); v = *(BYTE **)(v + V_PARENT)) {
+		if (VIEW_INT(v, V_W) == BASE_W) VIEW_INT(v, V_W) = g_gameW;
+	}
+}
+
+static void shift_view(BYTE *view, int dx)
+{
+	if (!view) return;
+	VIEW_INT(view, V_X) += dx;
+	update_coordinates(view); // only walks down when the view's own position changed
 }
 
 static void widen_map_screen(BYTE *picture)
@@ -533,11 +616,8 @@ static void widen_map_screen(BYTE *picture)
 	if (g_wideSteps & 1) {
 		// The picture is only widened if its drawing can be replaced: left alone at 1056 it
 		// reads past each 800-pixel row of its bitmap.
-		BOOL background = hook_background_draw(picture);
-		for (BYTE *v = picture; readable(v, 0x54); v = *(BYTE **)(v + V_PARENT)) {
-			if (v == picture && !background) continue;
-			if (VIEW_INT(v, V_W) == BASE_W) VIEW_INT(v, V_W) = g_gameW;
-		}
+		if (hook_background_draw(picture, BG_MAP)) widen_parents(picture);
+		else widen_parents(*(BYTE **)(picture + V_PARENT));
 	}
 	if (g_wideSteps & 2) {
 		static const DWORD shifted[] = { ID4('t', 'o', 'o', 'l'), ID4('s', 'e', 'n', 'd'), ID4('t', 'b', 'r', '4') };
@@ -581,18 +661,7 @@ static void widen_map_screen(BYTE *picture)
 	}
 	if ((g_wideSteps & 4) && g_wideMap) {
 		VIEW_INT(map, V_W) += extra;
-
-		// The background picture leaves a hole where the map goes (TOffLimitsPicture); the hole
-		// was cut for the old map size when the screen was built.
-		typedef void **(__cdecl *NewRgnFn)(void);
-		typedef void (__cdecl *SetRectRgnFn)(void **, short, short, short, short);
-		typedef void (__attribute__((thiscall)) *SetRgnFn)(void *, void **);
-		typedef void **(__cdecl *DisposeRgnFn)(void **);
-		void **rgn = ((NewRgnFn)0x004a94e0)();
-		((SetRectRgnFn)0x004ac6c0)(rgn, (short)VIEW_INT(map, V_X), (short)VIEW_INT(map, V_Y),
-			(short)(VIEW_INT(map, V_X) + VIEW_INT(map, V_W)), (short)(VIEW_INT(map, V_Y) + VIEW_INT(map, V_H)));
-		((SetRgnFn)0x005c88b0)(picture, rgn);
-		((DisposeRgnFn)0x004a92d0)(rgn);
+		cut_background_hole(picture, map);
 	}
 
 	if (g_wideSteps & 8) {
@@ -603,6 +672,38 @@ static void widen_map_screen(BYTE *picture)
 		InvalidateRect(g_view, NULL, FALSE);
 	}
 	logf_("map screen widened by %d (steps %d)", extra, g_wideSteps);
+}
+
+// The battle screen ('main', TTacMapUberPicture): a 775x480 battlefield ('DLOG', TTacArmyView)
+// framed by the background, the toolbar ('tool') below it, and the place name and turn count
+// ('locn', 'turn') in the title bar. The battlefield picture is about twice as wide as the view
+// and scrolls; the view's own width sets how far it scrolls, so it can simply be made wider.
+static BOOL g_wideBattle; // the decorative corners' fixed positions were moved for the wider field
+
+static void widen_battle_screen(BYTE *picture)
+{
+	int extra = g_gameW - BASE_W, half = extra / 2;
+	BYTE *field = child_view(picture, ID4('D', 'L', 'O', 'G'));
+	BYTE *toolbar = child_view(picture, ID4('t', 'o', 'o', 'l'));
+	if (extra <= 0 || !g_wideBattle || !field || !toolbar || VIEW_INT(picture, V_W) != BASE_W) return;
+	// Left at 800 wide the screen is presented centred, as before.
+	if (!hook_background_draw(picture, BG_BATTLE)) return;
+	widen_parents(picture);
+
+	VIEW_INT(field, V_W) += extra;
+	cut_background_hole(picture, field);
+
+	// The toolbar's buttons follow the two places its panel was lengthened.
+	VIEW_INT(toolbar, V_W) += extra;
+	static const DWORD middle[] = { ID4('s', 'e', 'l', 'd') };
+	static const DWORD right[] = { ID4('r', 'e', 't', 'r'), ID4('a', 'u', 't', 'o'), ID4('l', 'o', 'c', 'k'),
+		ID4('c', 'u', 'r', 's'), ID4('e', 'n', 'd', 't') };
+	for (int i = 0; i < (int)(sizeof middle / sizeof middle[0]); i++) shift_view(child_view(toolbar, middle[i]), half);
+	for (int i = 0; i < (int)(sizeof right / sizeof right[0]); i++) shift_view(child_view(toolbar, right[i]), extra);
+	shift_view(child_view(picture, ID4('t', 'u', 'r', 'n')), extra);
+
+	InvalidateRect(g_view, NULL, FALSE);
+	logf_("battle screen widened by %d", extra);
 }
 
 // Every screen is a child of the 'base' view inside the game window's view tree:
@@ -620,7 +721,43 @@ static BYTE *screens_container(void)
 }
 
 static BOOL is_map_screen(const BYTE *screen) { return strcmp(view_class(screen), "TMapUberPicture") == 0; }
+static BOOL is_battle_screen(const BYTE *screen) { return strcmp(view_class(screen), "TTacMapUberPicture") == 0; }
+// Screens laid out for the full width; every other screen is presented centred.
+static BOOL is_wide_screen(BYTE *screen)
+{
+	return is_map_screen(screen) || (is_battle_screen(screen) && VIEW_INT(screen, V_W) == g_gameW);
+}
 
+
+// The battlefield picture is drawn 29 columns wide (30 tiles and a half, for the odd rows) with
+// the battle's own columns at its right-hand end; a battle of fewer columns starts further into
+// the picture. A wide view on a small battle (fewer than about 20 columns) would reach past the
+// picture's right edge, so the view is scrolled left instead, onto the picture's unused terrain
+// beside the field. The game's scroll code never moves it back: it only scrolls a field wider
+// than the view, and CenterOnTile's reset to 0 is undone here before the next paint.
+static void keep_battlefield_in_picture(BYTE *screen)
+{
+	BYTE *field = child_view(screen, ID4('D', 'L', 'O', 'G'));
+	BYTE *battle = field ? *(BYTE **)(field + 100) : NULL;
+	if (!field || !readable(battle, 0x50)) return; // no battle loaded into the view yet
+	int tile = VIEW_INT(field, 0x88), columns = VIEW_INT(battle, 0x48);
+	short *scroll = (short *)(field + 0x78);
+	static BYTE *logged;
+	if (field != logged) {
+		logged = field;
+		logf_("battlefield: view %d wide, tile %d, %d columns, field %d wide, scroll %d", VIEW_INT(field, V_W),
+			tile, columns, *(short *)(field + 0x7a), *scroll);
+	}
+	if (tile <= 0 || columns <= 0 || columns > 29) return;
+	int offset = (29 - columns) * tile, pictureW = 30 * tile + tile / 2;
+	int furthest = pictureW - VIEW_INT(field, V_W) - offset;
+	if (*scroll > furthest && furthest >= -offset) {
+		*scroll = (short)furthest;
+		typedef void (__attribute__((thiscall)) *Invalidate)(void *, const RECT *, int);
+		RECT all = { 0, 0, VIEW_INT(field, V_W), VIEW_INT(field, V_H) };
+		((Invalidate)0x0049fbf0)(field, &all, 1); // TView::InvalidateRect, in the view's coordinates
+	}
+}
 
 // Called before each paint and from a timer. The map screen is widened when it is built; every
 // other screen was designed for 800 and is presented centred instead (see g_offsetX).
@@ -643,12 +780,14 @@ static void watch_screens(void)
 			BOOL seen = FALSE;
 			for (int i = 0; i < handledCount; i++) seen |= handled[i] == screen;
 			if (!seen) {
-				BOOL map = is_map_screen(screen);
+				BOOL map = is_map_screen(screen), battle = is_battle_screen(screen);
 				// The map view is one of the last things attached; wait until the screen is built.
-				if (map && !child_view(screen, ID4('D', 'L', 'O', 'G'))) continue;
+				if ((map || battle) && !child_view(screen, ID4('D', 'L', 'O', 'G'))) continue;
+				if (battle && !child_view(screen, ID4('t', 'u', 'r', 'n'))) continue;
 
 				if (g_gameW > BASE_W) {
 					if (map) widen_map_screen(screen);
+					if (battle) widen_battle_screen(screen);
 				}
 				if (g_dumpViews) { g_traceBudget = 60; g_moveTraces = 0; }
 				DWORD id = (DWORD)VIEW_INT(screen, V_ID);
@@ -665,9 +804,10 @@ static void watch_screens(void)
 	}
 	memcpy(handled, current, sizeof(BYTE *) * count);
 	handledCount = count;
-	// Whatever is on top decides how the frame is presented. Only the map uses the full width;
+	// Whatever is on top decides how the frame is presented. Only the map and battle screens use the full width;
 	// with no screen at all (the intro movies) the 800-wide layout is centred too.
-	int offset = g_gameW > BASE_W && !(top && is_map_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
+	int offset = g_gameW > BASE_W && !(top && is_wide_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
+	if (top && is_battle_screen(top)) keep_battlefield_in_picture(top);
 	g_screenOnTop = top != NULL;
 	g_mapOnTop = top && is_map_screen(top);
 	if (offset != g_offsetX) {
@@ -1780,6 +1920,38 @@ static BOOL patch_imm16(DWORD address, WORD expected, WORD value)
 	return TRUE;
 }
 
+// TTacticalBattleView::DrawDecorativeCorners places the four gilt corner pieces of the battlefield
+// at fixed positions in a 775x480 view; the right-hand two move over with the right edge. The
+// positions are "mov [esp+disp8], imm32" stores into its local rectangles, except the shared right
+// edge (0x307), which is loaded once into a register ("mov ecx, imm32") and stored from there.
+static BOOL widen_battle_constants(int extra)
+{
+	BYTE *start = (BYTE *)0x00628950, *end = start + 0x1c0;
+	BYTE *sites[8];
+	int found = 0;
+	for (BYTE *p = start; p + 8 <= end && found < 8; p++) {
+		if (p[0] >= 0xb8 && p[0] <= 0xbf && *(DWORD *)(p + 1) == 0x307) {
+			sites[found++] = p + 1;
+			continue;
+		}
+		// C7 /0 with a disp8 operand: ModRM 0x44 needs an SIB byte (esp-based), 0x45 is ebp-based.
+		if (p[0] != 0xc7 || (p[1] != 0x44 && p[1] != 0x45)) continue;
+		BYTE *imm = p + (p[1] == 0x44 ? 4 : 3);
+		DWORD v = *(DWORD *)imm;
+		if (v == 0x2ec || v == 0x2d8) sites[found++] = imm;
+	}
+	if (found != 3) {
+		logf_("battle corner positions: found %d sites, expected 3: field stays 775 wide", found);
+		return FALSE;
+	}
+	BOOL ok = TRUE;
+	for (int i = 0; i < found; i++) {
+		DWORD v = *(DWORD *)sites[i];
+		ok &= patch_imm32((DWORD)(DWORD_PTR)sites[i], v, v + extra);
+	}
+	return ok;
+}
+
 // The zoomed-out overview (TOceanDialog, 'DOOG') draws 16-pixel tiles: 36 columns by 32 rows in a
 // 576x512 view. Its drawing loop, right-edge test, scroll limit and the minimap's "you are here"
 // rectangle all carry that column count.
@@ -2774,6 +2946,8 @@ static void widen_screen(int width)
 	g_wideMap = relocate_tile_cache() && widen_map_constants(width - BASE_W) &&
 		widen_overview_constants(width - BASE_W);
 	logf_("wide map %s", g_wideMap ? "enabled" : "NOT enabled: the map stays 576 wide");
+	g_wideBattle = widen_battle_constants(width - BASE_W);
+	build_bg_layouts();
 }
 
 // Globals the game fills in before WinMain; adjusted once its windows exist.
