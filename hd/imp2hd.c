@@ -358,6 +358,7 @@ static BOOL g_timing;
 static LONGLONG g_presentTicks;
 static int g_presentPixels;
 static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks, g_findTicks;
+static int g_tileCalls, g_tileHits;
 static int g_copyCalls;
 static int g_traceBudget; // diagnostic: number of paint calls still to be logged
 static int g_drawTrace; // diagnostic: direct-to-window drawing calls still to be logged
@@ -1258,13 +1259,13 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		LARGE_INTEGER a, b, freq;
 		QueryPerformanceFrequency(&freq);
 		QueryPerformanceCounter(&a);
-		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = g_findTicks = 0; g_copyCalls = 0;
+		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = g_findTicks = 0; g_tileCalls = g_tileHits = 0; g_copyCalls = 0;
 		LRESULT r = CallWindowProcA(g_viewProc, hwnd, msg, wp, lp);
 		QueryPerformanceCounter(&b);
 		double ms = (b.QuadPart - a.QuadPart) * 1000.0 / freq.QuadPart;
 		double k = 1000.0 / freq.QuadPart;
-		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f); %d game pixels", ms,
-			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_findTicks * k, g_presentPixels);
+		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f), tiles %d/%d HD; %d game pixels", ms,
+			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_findTicks * k, g_tileHits, g_tileCalls, g_presentPixels);
 		return r;
 	}
 	switch (msg) {
@@ -2597,7 +2598,7 @@ typedef struct { DWORD hash; int w, h, bpp; DWORD *pixels; } HdImage; // pixels 
 static char g_hdAssets[MAX_PATH];
 static HdIndexEntry *g_hdIndex;
 static int g_hdIndexCount;
-static HdImage g_hdImages[512];
+static HdImage g_hdImages[4096];
 static int g_hdMissLog = 40; // diagnostic: unmatched pictures still to be reported
 static int g_hdImageCount;
 
@@ -2837,17 +2838,19 @@ static DWORD *hd_load_cached(const char *path, int w2, int h2)
 	return pixels;
 }
 
-// Makes room in the table of matched pictures: sprite cells (cheap to match again) go first.
+// Makes room in the table of matched pictures. The pixels belong to the decoded-picture cache, so
+// dropping entries frees nothing that is on screen: nothing needs redrawing. Misses (pictures with
+// no HD version, such as the animation buffers the game recomposes every frame) go first, then
+// sprite cells, which are cheap to match again.
 static void hd_make_room(void)
 {
 	int kept = 0;
-	for (int i = 0; i < g_hdImageCount; i++) if (g_hdImages[i].bpp != -8) g_hdImages[kept++] = g_hdImages[i];
-	if (kept < g_hdImageCount * 3 / 4) {
-		g_hdImageCount = kept;
-		return;
-	}
+	for (int i = 0; i < g_hdImageCount; i++) if (g_hdImages[i].pixels) g_hdImages[kept++] = g_hdImages[i];
+	if (kept < g_hdImageCount * 3 / 4) { g_hdImageCount = kept; return; }
+	kept = 0;
+	for (int i = 0; i < g_hdImageCount; i++) if (g_hdImages[i].pixels && g_hdImages[i].bpp != -8) g_hdImages[kept++] = g_hdImages[i];
+	if (kept < g_hdImageCount * 3 / 4) { g_hdImageCount = kept; return; }
 	g_hdImageCount = 0;
-	hd_forget_art(); // blocks referring to forgotten art are simply redrawn
 }
 
 // The upscaled picture for a picture in memory, or NULL.
@@ -3331,6 +3334,32 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	if (h > s->h - dy) h = s->h - dy;
 	if (w <= 0 || h <= 0) return;
 
+	// The map buffer copied into the frame: its HD blocks go with it, wherever the map buffer's
+	// pixel is still the one its block was made for. (Without this the map is shown at 1x until
+	// the game redraws a part of it straight onto the window.)
+	if (s == &g_main && sh->biBitCount == 16 && transparent == 0xffffffff && g_map.frame &&
+		srcBits == (const BYTE *)g_map.bits && pw == g_map.w && ph == g_map.h) {
+		BOOL mapBottomUp = sh->biHeight > 0;
+		int mapStride = (pw + 1) & ~1;
+		surface_track(s, frame);
+		for (int y = 0; y < h; y++) {
+			const WORD *row = frame + (size_t)(bottomUp ? s->h - 1 - (dy + y) : dy + y) * stride + dx;
+			const WORD *mrow = (const WORD *)srcBits + (size_t)(mapBottomUp ? ph - 1 - (sy + y) : sy + y) * mapStride + sx;
+			size_t at = (size_t)(dy + y) * s->w + dx, mat = (size_t)(sy + y) * g_map.w + sx;
+			for (int x = 0; x < w; x++) {
+				if (g_map.state[mat + x] != 1 || g_map.shadow[mat + x] != mrow[x]) { s->state[at + x] = 0; continue; }
+				for (int half = 0; half < 2; half++) {
+					const DWORD *from = g_map.frame + (size_t)((sy + y) * 2 + half) * g_map.w * 2 + (sx + x) * 2;
+					DWORD *to = s->frame + (size_t)((dy + y) * 2 + half) * s->w * 2 + (dx + x) * 2;
+					to[0] = from[0]; to[1] = from[1];
+				}
+				s->shadow[at + x] = row[x];
+				s->state[at + x] = 1;
+			}
+		}
+		return;
+	}
+
 	// Plain copies of 8- and 16-bit pictures, and 8-bit copies that skip one palette index, can
 	// have HD art: a map tile, the whole picture upscaled, or (8-bit only) the cell being copied.
 	LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
@@ -3340,8 +3369,10 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	BOOL tileCell = FALSE;
 	if (s == &g_map && eight && !keyed && w == 64 && h == 64) {
 		tileCell = TRUE;
+		g_tileCalls++;
 		pixels = tile_art(srcBits, pw, ph, bottomUp8, sx, sy, frame, stride, bottomUp, s->h, dx, dy);
 		ax = 0; ay = 0; aw = 64;
+		if (pixels) g_tileHits++;
 	} else if (sh->biBitCount == 16 && !keyed) {
 		const HdImage *art = hd_find(srcBits, pw, ph, 16);
 		if (art) pixels = art->pixels;
