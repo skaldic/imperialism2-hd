@@ -42,13 +42,23 @@ typedef struct {
 	// Pictures over the background keep their size and move with their middle, instead of being
 	// lengthened like the background under them (for panels with no plain stretch of their own).
 	char fixedPictures;
-	// A game routine (thiscall, no arguments, on the screen) that works out drawing positions
-	// from the views; called again once they have been moved.
-	unsigned long rebuild;
+
 } ScreenLayout;
 
 #define LID(a, b, c, d) (((unsigned long)(a) << 24) | ((unsigned long)(b) << 16) | ((unsigned long)(c) << 8) | (unsigned long)(d))
 
+// The diplomacy screens' bands. In the chart the map of nations moves 125, not 128: the patch
+// moves its drawing by whole map columns of 5 pixels (DIPLOMACY_MAP_SHIFT in imp2hd.c).
+#define DIPLOMACY_BANDS { \
+		{ 0, 55, { { 135, 128, 135, 20, 'S' }, { 667, 128, 647, 20, 'S' } } }, \
+		/* the frame's floral border along the top */ \
+		{ 55, 96, { { 135, 128, 140, 40, 'R' }, { 667, 128, 600, 40, 'R' } } }, \
+		/* the panel's interior (to its right end at 667, so the colour key, which ends at 666, keeps its size) */ \
+		{ 96, 216, { { 135, 128, 135, 64, 'M' }, { 667, 128, 603, 64, 'M' } } }, \
+		/* the frame's lower edge and the gold rope under it */ \
+		{ 216, 245, { { 135, 128, 160, 8, 'T' }, { 667, 128, 600, 8, 'T' } } }, \
+		{ 245, 600, { { 100, 125, 80, 20, 'S' }, { 705, 131, 705, 20, 'S' } } }, \
+	}
 static const ScreenLayout g_screenLayouts[] = {
 	{
 		"transport", "TBackgroundPicture", LID('m', 'a', 'i', 'n'), LID('w', 'o', 'o', 'l'), 800, 600, {
@@ -97,28 +107,25 @@ static const ScreenLayout g_screenLayouts[] = {
 		// The panel is lengthened inside its plain interior, so the panel views over it (one per
 		// tab, swapped in and out) grow with it; the chart is lengthened clear of its sun and
 		// moon, either side of the map of nations.
-		"diplomacy (off)", "TDiplomacyMapView-disabled", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600, {
-			{ 0, 55, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
-			// The frame's floral border along the top.
-			{ 55, 96, { { 135, 128, 140, 40, 'R' }, { 660, 128, 600, 40, 'R' } } },
-			// The panel's interior.
-			{ 96, 216, { { 135, 128, 135, 64, 'M' }, { 660, 128, 596, 64, 'M' } } },
-			// The frame's lower edge and the gold rope under it.
-			{ 216, 245, { { 135, 128, 160, 8, 'T' }, { 660, 128, 600, 8, 'T' } } },
-			{ 245, 600, { { 100, 128, 80, 20, 'S' }, { 705, 128, 705, 20, 'S' } } },
-		},
-		// The Information panel is a picture filled to its edges (its colour key), and the map of
-		// nations is laid out by TDiplomacyMapView::CreateDrawGeometries from the map view.
-		0, 1, 0x00527c20,
+		"diplomacy", "TDiplomacyMapView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
+		DIPLOMACY_BANDS,
+		// The Information panel is a picture filled to its edges (its colour key). The map of
+		// nations is drawn at fixed positions, moved by the patch (DIPLOMACY_MAP_SHIFT).
+		0, 1,
 	},
+	// The same map of nations on the screens for offers made to you and for the final vote.
+	{ "diplomatic offers", "TDiplomacyOfferView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
+		DIPLOMACY_BANDS, 0, 1 },
+	{ "final vote", "TDiplomacyFinalView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
+		DIPLOMACY_BANDS, 0, 1 },
 	{
 		// The same screen on its other background, a red cloth (the same places, other fill).
-		"diplomacy (cloth, off)", "TDiplomacyMapView-disabled", LID('m', 'a', 'i', 'n'), 0, 800, 600, {
-			{ 0, 55, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
-			{ 55, 96, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
-			{ 96, 216, { { 135, 128, 135, 20, 'S' }, { 660, 128, 640, 20, 'S' } } },
-			{ 216, 245, { { 135, 128, 160, 11, 'T' }, { 660, 128, 600, 11, 'T' } } },
-			{ 245, 600, { { 100, 128, 80, 20, 'S' }, { 705, 128, 705, 20, 'S' } } },
+		"diplomacy (cloth)", "TDiplomacyMapView", LID('m', 'a', 'i', 'n'), 0, 800, 600, {
+			{ 0, 55, { { 135, 128, 135, 20, 'S' }, { 667, 128, 647, 20, 'S' } } },
+			{ 55, 96, { { 135, 128, 135, 20, 'S' }, { 667, 128, 647, 20, 'S' } } },
+			{ 96, 216, { { 135, 128, 135, 20, 'S' }, { 667, 128, 647, 20, 'S' } } },
+			{ 216, 245, { { 135, 128, 160, 11, 'T' }, { 667, 128, 600, 11, 'T' } } },
+			{ 245, 600, { { 100, 125, 80, 20, 'S' }, { 705, 131, 705, 20, 'S' } } },
 		},
 		4100,
 	},

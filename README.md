@@ -5,7 +5,7 @@ reverse-engineering tooling used to build it.
 
 The game is hard-wired to 800x600. Out of the box it either switches your monitor to that
 resolution or draws a small box in the middle of the desktop. With this patch the desktop stays at
-its native resolution and the game is scaled to fit. Optionally the map and battle screens are widened to use a
+its native resolution and the game is scaled to fit. Optionally the map, battle and main management screens are widened to use a
 16:9 display, and the artwork is replaced by 2x upscaled versions.
 
 You need your own copy of the game. Nothing from the game is included here, and the game's files
@@ -20,13 +20,14 @@ Developed and tested against the GOG release (v1.03 executable) on Windows 11.
 | Scaling to the display | always on | Works on every screen tried |
 | Wide map (13 tile columns instead of 9) | `Wide=1` | Works; land map and zoomed-out overview |
 | Wide battlefield (1031 instead of 775 pixels) | `Wide=1` | Works on the battles tried |
+| Wide transport, industry, trade and diplomacy screens | `Wide=1` | Works on the screens tried |
 | HD artwork | `HD=1` | Works; quality varies, see below |
 
 Not yet checked: multiplayer, with any of the options on.
 
 Known limits:
 
-- Only the map and battle screens are widened. Every other screen stays 800 wide and is shown centred, with
+- The technology screen, city and battle-report screens, menus and dialogs are not widened: they stay 800 wide and is shown centred, with
   its own background continued into the margins.
 - HD art is an automatic upscale. Line art and icons come out well; fine textures and very small
   figures less so.
@@ -56,7 +57,7 @@ HD=1
 | `Smooth` | 1 | 0 uses blocky nearest-neighbour scaling |
 | `FastScale` | 1 | 0 uses GDI's own smooth scaling, which is much slower on large displays |
 | `IntegerScale` | 0 | 1 snaps to a whole-number scale |
-| `Wide` | 0 | 1 widens the map and battle screens to 1056x600 |
+| `Wide` | 0 | 1 widens the map, battle and management screens to 1056x600 |
 | `MarginArt` | 3 | Beside centred screens in wide mode: 0 black, 1 blurred edge, 2 tiled game texture, 3 the screen's background continued |
 | `HD` | 0 | 1 uses upscaled artwork (needs the assets, see below) |
 | `HDAssets` | `decomp\assets\x2` in the game folder | Where the upscaled artwork is |
@@ -132,6 +133,17 @@ lengthened like the map screen's: the title bar in its middle and the toolbar pa
 stretches, with the toolbar's buttons spread out to match. On a battle too small to fill the wider
 view, the view is scrolled onto the picture's unused terrain beside the field rather than past the
 picture's edge.
+
+**Wide management screens.** Screens drawn on a single background picture get a table-driven
+layout (`hd/layouts.h`). In each horizontal band of the picture, columns are inserted at chosen
+places and filled from plain artwork nearby: repeated, mirrored, scrambled in short runs, or
+smoothly stretched. Every view is moved by the insertions to its left and widened by any under it.
+The game moves views later (tabs and panels are swapped by moving them on and off screen), so the
+layout is re-applied whenever it does. A few positions are fixed in the game's drawing code and are
+patched to match: the trade screen's goods icons and the diplomacy screens' map of nations. That
+map's country shapes and drawing code are generated once at a fixed screen position, so the
+generator is shown the map view where the layout puts it. `hd/layouttool.c` previews a layout
+offline from the extracted artwork and a view dump (`tools/views_from_log.ps1`).
 
 **HD artwork.** The game keeps drawing at 1x. Its picture-copy routine is intercepted; when it
 copies a picture for which an upscaled version exists, the same rectangle is also copied at 2x

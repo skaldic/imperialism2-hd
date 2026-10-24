@@ -355,6 +355,8 @@ static int g_traceBudget; // diagnostic: number of paint calls still to be logge
 static int g_drawTrace; // diagnostic: direct-to-window drawing calls still to be logged
 static int g_moveTraces; // diagnostic: mouse moves traced on the current screen
 static BOOL g_wideMap; // tile cache relocated, so the map view itself may be widened
+#define DIPLOMACY_MAP_SHIFT 125 // must match the diplomacy layouts' chart band
+static BOOL g_diplomacyMapMoved; // the map of nations is drawn DIPLOMACY_MAP_SHIFT further right
 
 static BOOL readable(const void *p, size_t n) { return p && !IsBadReadPtr(p, n); }
 
@@ -744,7 +746,8 @@ static void choose_look(WidePicture *wide, short artwork)
 	const ScreenLayout *base = &wide->layout, *look = base;
 	for (int i = 0; i < (int)(sizeof g_screenLayouts / sizeof g_screenLayouts[0]); i++) {
 		const ScreenLayout *v = &g_screenLayouts[i];
-		if (v->picture && v->picture == artwork && v->id == base->id && !strcmp(v->cls, base->cls) &&
+		// (Matched by artwork, not class: screens sharing artwork share its fill.)
+		if (v->picture && v->picture == artwork && v->id == base->id &&
 			v->width == base->width && v->height == base->height && layout_extra(v) == layout_extra(base) &&
 			layout_valid(v)) look = v;
 	}
@@ -831,6 +834,7 @@ static const ScreenLayout *find_layout(BYTE *picture)
 	for (int i = 0; i < (int)(sizeof g_screenLayouts / sizeof g_screenLayouts[0]); i++) {
 		const ScreenLayout *s = &g_screenLayouts[i];
 		if (s->picture) continue; // fill for one artwork only (see choose_look)
+		if (!strncmp(s->cls, "TDiplomacy", 10) && !g_diplomacyMapMoved) continue; // its map would not follow
 		if (strcmp(view_class(picture), s->cls) || (DWORD)VIEW_INT(picture, V_ID) != s->id) continue;
 		if (VIEW_INT(picture, V_W) != s->width || VIEW_INT(picture, V_H) != s->height) continue;
 		if (s->child && !child_view(picture, s->child)) continue;
@@ -989,10 +993,6 @@ static BOOL widen_layout_screen(BYTE *screen)
 	if (!register_wide_picture(screen, screen, s)) return FALSE;
 	widen_parents(screen);
 	sync_layout_screen(screen);
-	if (s->rebuild) {
-		typedef void (__attribute__((thiscall)) *Rebuild)(void *);
-		((Rebuild)s->rebuild)(screen);
-	}
 	logf_("screen '%s' widened", s->name);
 	return TRUE;
 }
@@ -2274,11 +2274,56 @@ static BOOL patch_push_in(DWORD function, DWORD length, DWORD value, DWORD moved
 	return patch_imm32((DWORD)(DWORD_PTR)(site + 1), value, moved);
 }
 
+// TDiplomacyMapView::CreateDrawGeometries works out where the map of nations is (from the map
+// view, 'here') and compiles drawing code for each country's shape there. It cannot be run a
+// second time (the compiled code is appended to, not replaced), so it is made to see the map view
+// where the layout will put it while it runs the one time the game calls it.
+static BYTE *g_geometriesRest; // its first instructions, then a jump to the rest
+
+static void __attribute__((thiscall)) diplomacy_geometries(BYTE *self)
+{
+	typedef void (__attribute__((thiscall)) *Fn)(void *);
+	BYTE *here = child_view(self, ID4('h', 'e', 'r', 'e'));
+	BOOL moved = g_diplomacyMapMoved && here && VIEW_INT(self, V_W) == BASE_W && VIEW_INT(here, V_X) == 120;
+	if (moved) VIEW_INT(here, V_X) += DIPLOMACY_MAP_SHIFT;
+	((Fn)g_geometriesRest)(self);
+	if (moved) VIEW_INT(here, V_X) -= DIPLOMACY_MAP_SHIFT; // the layout moves it for good
+}
+
+static BOOL hook_diplomacy_geometries(void)
+{
+	BYTE *site = (BYTE *)0x00527c20;
+	static const BYTE expected[] = { 0x6a, 0xff, 0x68 }; // push -1; push <handler>
+	if (memcmp(site, expected, sizeof expected)) return FALSE;
+	g_geometriesRest = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!g_geometriesRest) return FALSE;
+	memcpy(g_geometriesRest, site, 7);
+	g_geometriesRest[7] = 0xe9;
+	*(int *)(g_geometriesRest + 8) = (int)((site + 7) - (g_geometriesRest + 12));
+	DWORD old;
+	VirtualProtect(site, 7, PAGE_EXECUTE_READWRITE, &old);
+	site[0] = 0xe9;
+	*(int *)(site + 1) = (int)((BYTE *)diplomacy_geometries - (site + 5));
+	site[5] = site[6] = 0x90;
+	VirtualProtect(site, 7, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, 7);
+	return TRUE;
+}
+
 static void widen_layout_constants(void)
 {
 	// TTradeScreenPicture::Draw draws each row's goods icon at x=171, in the table's Item
 	// column, which the trade layout moves 128 to the right.
 	patch_push_in(0x00653870, 0x3b0, 171, 171 + 128);
+
+	// The diplomacy screens' map of nations is drawn at fixed screen positions: the country
+	// regions are built with its top-left corner (120, 265) in AddTileToTinyRgn, and
+	// CreateDrawGeometries places names and capitals at (column + 24) * 5. Moved right by 25
+	// columns of 5 pixels, as the diplomacy layouts move the map view.
+	g_diplomacyMapMoved = hook_diplomacy_geometries() && patch_imm32(0x00547314, 120, 120 + DIPLOMACY_MAP_SHIFT) &&
+		patch_imm8(0x00527e86, 0x18, 0x18 + DIPLOMACY_MAP_SHIFT / 5) &&
+		patch_imm8(0x0052806d, 0x18, 0x18 + DIPLOMACY_MAP_SHIFT / 5);
+	if (!g_diplomacyMapMoved) logf_("diplomacy map positions not as expected: diplomacy screens stay centred");
 }
 
 // TTacticalBattleView::DrawDecorativeCorners places the four gilt corner pieces of the battlefield
@@ -3434,6 +3479,33 @@ static void widen_globals(void)
 
 #define HOOK(dll, name) hook_import(dll, #name, h_##name, &o_##name)
 
+// Diagnostic: access violations are logged with where they happened (the game may handle some
+// itself; those are logged too, as the first few seen).
+static LONG CALLBACK log_crash(EXCEPTION_POINTERS *e)
+{
+	static int logged;
+	if (e->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && logged++ < 5) {
+		CONTEXT *c = e->ContextRecord;
+		HMODULE mod = NULL;
+		GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			(LPCSTR)e->ExceptionRecord->ExceptionAddress, &mod);
+		char name[MAX_PATH] = "?";
+		if (mod) GetModuleFileNameA(mod, name, sizeof name);
+		const DWORD *stack = (const DWORD *)c->Esp;
+		logf_("ACCESS VIOLATION at %p (%s base %p) %s %08lx; eax %08lx ebx %08lx ecx %08lx edx %08lx esi %08lx edi %08lx ebp %08lx esp %08lx",
+			e->ExceptionRecord->ExceptionAddress, strrchr(name, '\\') ? strrchr(name, '\\') + 1 : name, (void *)mod,
+			e->ExceptionRecord->ExceptionInformation[0] ? "writing" : "reading",
+			(unsigned long)e->ExceptionRecord->ExceptionInformation[1], c->Eax, c->Ebx, c->Ecx, c->Edx, c->Esi, c->Edi, c->Ebp, c->Esp);
+		if (readable(stack, 64)) {
+			char line[256];
+			int at = 0;
+			for (int i = 0; i < 16; i++) at += snprintf(line + at, sizeof line - at, " %08lx", (unsigned long)stack[i]);
+			logf_("  stack:%s", line);
+		}
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
 static void install(HMODULE self)
 {
 	char ini[MAX_PATH];
@@ -3457,6 +3529,7 @@ static void install(HMODULE self)
 	g_autoUpscale = GetPrivateProfileIntA("Display", "HDAutoUpscale", 1, ini);
 	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
+	if (GetPrivateProfileIntA("Debug", "LogCrashes", 1, ini)) AddVectoredExceptionHandler(1, log_crash);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.
 	SetProcessDPIAware();
