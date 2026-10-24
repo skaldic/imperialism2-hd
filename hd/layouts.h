@@ -129,6 +129,18 @@ static const ScreenLayout g_screenLayouts[] = {
 		},
 		4100,
 	},
+	{
+		// Loading and saving: a chest of scrolls (the save slots) in a room. The room is widened
+		// either side of the chest: the red curtain on the left, the green wallpaper and the wood
+		// panelling on the right. The chest's gilded base runs the full width, so it is lengthened
+		// either side of its middle, in its ornament's repeat.
+		"load and save", "TLoadSavePicture", LID('m', 'a', 'i', 'n'), LID('s', 'l', 't', '0'), 800, 600, {
+			{ 0, 190, { { 25, 128, 0, 25, 'S' }, { 790, 128, 758, 32, 'M' } } },
+			{ 190, 500, { { 25, 128, 0, 25, 'S' }, { 790, 128, 775, 15, 'S' } } },
+			{ 500, 575, { { 200, 128, 100, 101, 'T' }, { 600, 128, 600, 101, 'T' } } },
+			{ 575, 600, { { 200, 128, 190, 10, 'S' }, { 600, 128, 600, 10, 'S' } } },
+		},
+	},
 	// (No layout for the technology screen: both its panels are filled edge to edge by controls
 	// and its frame is too thin to take the width, so it stays centred.)
 	{
