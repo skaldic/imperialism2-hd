@@ -1958,6 +1958,39 @@ static int WINAPI h_FrameRect(HDC dc, const RECT *r, HBRUSH brush)
 	return o_FrameRect(dc, r, brush);
 }
 
+// Diagnostic: where the game draws text (target bitmap size), counted.
+static BOOL (WINAPI *o_ExtTextOutA)(HDC, int, int, UINT, const RECT *, LPCSTR, UINT, const INT *);
+static BOOL (WINAPI *o_TextOutA)(HDC, int, int, LPCSTR, int);
+static int (WINAPI *o_DrawTextA)(HDC, LPCSTR, int, LPRECT, UINT);
+static void note_text(HDC dc, const char *fn, LPCSTR s, int n)
+{
+	static int logged;
+	if (logged > 400) return;
+	BITMAP bm = { 0 };
+	HGDIOBJ obj = GetCurrentObject(dc, OBJ_BITMAP);
+	if (obj) GetObjectA(obj, sizeof bm, &bm);
+	LOGFONTA lf = { 0 };
+	HGDIOBJ f = GetCurrentObject(dc, OBJ_FONT);
+	if (f) GetObjectA(f, sizeof lf, &lf);
+	char text[40] = "";
+	if (s) { int k = n < 0 ? (int)strlen(s) : n; if (k > 38) k = 38; memcpy(text, s, k); text[k] = 0; }
+	logged++;
+	logf_("text %s into %ldx%ld %dbpp window %p: font '%s' %ld, mode %d align %u \"%s\"", fn, bm.bmWidth, bm.bmHeight, bm.bmBitsPixel,
+		(void *)WindowFromDC(dc), lf.lfFaceName, lf.lfHeight, GetMapMode(dc), GetTextAlign(dc), text);
+}
+static BOOL WINAPI h_ExtTextOutA(HDC dc, int x, int y, UINT o, const RECT *r, LPCSTR s, UINT n, const INT *dx)
+{ if (g_dumpViews) note_text(dc, "ExtTextOutA", s, (int)n); return o_ExtTextOutA(dc, x, y, o, r, s, n, dx); }
+static BOOL WINAPI h_TextOutA(HDC dc, int x, int y, LPCSTR s, int n)
+{ if (g_dumpViews) note_text(dc, "TextOutA", s, n); return o_TextOutA(dc, x, y, s, n); }
+static int text_hd_draw(HDC dc, LPCSTR s, int n, LPRECT r, UINT f, BOOL *handled);
+static int WINAPI h_DrawTextA(HDC dc, LPCSTR s, int n, LPRECT r, UINT f)
+{
+	static int flagLogs;
+	if (g_dumpViews && flagLogs++ < 400) { note_text(dc, "DrawTextA", s, n); if (r) logf_("   flags %04x rect %ld,%ld-%ld,%ld bk %d color %06lx", f, r->left, r->top, r->right, r->bottom, GetBkMode(dc), (unsigned long)GetTextColor(dc)); }
+	BOOL handled = FALSE;
+	int result = text_hd_draw(dc, s, n, r, f, &handled);
+	return handled ? result : o_DrawTextA(dc, s, n, r, f);
+}
 static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
 	if (drawing_on_view(dst)) {
@@ -3655,7 +3688,198 @@ static BOOL quad_present(HDC dst, HDC src, int x0, int y0, int x1, int y1, int w
 	SetStretchBltMode(dst, mode);
 	return ok;
 }
-// The game sometimes copies a piece of the map buffer straight to the window (the hover outline,
+
+// ---------------------------------------------------------------------------------------------
+// Text at 2x
+//
+// The game draws all its text with DrawTextA into the 1x frame, in scalable fonts. Each call is
+// also drawn into the 2x frame with the font at twice the size, so text is drawn sharp instead of
+// enlarged. The 2x text is kept only on the 1x pixels the 1x text changed, which are then marked
+// as HD art: when the game draws over them again they change and are redrawn as usual.
+
+static BOOL g_sharpText = TRUE;
+static HDC g_textDC;
+static DWORD *g_textBits;
+
+typedef struct { LOGFONTA from; HFONT font; } TextFont;
+static TextFont g_textFonts[32];
+static int g_textFontCount;
+
+static HFONT text_font_2x(HDC dc)
+{
+	LOGFONTA lf;
+	HGDIOBJ f = GetCurrentObject(dc, OBJ_FONT);
+	if (!f || !GetObjectA(f, sizeof lf, &lf)) return NULL;
+	for (int i = 0; i < g_textFontCount; i++)
+		if (!memcmp(&g_textFonts[i].from, &lf, sizeof lf)) return g_textFonts[i].font;
+	LOGFONTA big = lf;
+	big.lfHeight *= 2;
+	big.lfWidth *= 2;
+	big.lfQuality = ANTIALIASED_QUALITY;
+	HFONT font = CreateFontIndirectA(&big);
+	if (font && g_textFontCount < (int)(sizeof g_textFonts / sizeof g_textFonts[0])) {
+		g_textFonts[g_textFontCount].from = lf;
+		g_textFonts[g_textFontCount].font = font;
+		g_textFontCount++;
+	}
+	return font;
+}
+
+// Draws text into g_textDC at 2x with every character at twice its 1x position: the 2x font's
+// own spacing drifts from the 1x one along a line, and the 2x text is only kept where the 1x text
+// landed. Lines are broken the way DrawText breaks them (at spaces, and at line feeds), measured
+// in the 1x font; (L, T) is where DrawText puts the block.
+static void text_layout_2x(HDC dc, LPCSTR s, int n, const RECT *r, UINT f, int L, int T)
+{
+	if (n < 0) n = (int)strlen(s);
+	TEXTMETRICA tm;
+	GetTextMetricsA(dc, &tm);
+	int lineH = tm.tmHeight + (f & DT_EXTERNALLEADING ? tm.tmExternalLeading : 0);
+	int width = r->right - r->left;
+	BOOL wrap = (f & DT_WORDBREAK) && !(f & DT_SINGLELINE);
+	SetTextAlign(g_textDC, TA_LEFT | TA_TOP | TA_NOUPDATECP);
+	static INT ext[1024], dx[1024];
+	int y = T, i = 0, lines = 0;
+	while (i <= n && lines < 64) {
+		// One line: up to a line feed, or as many words as fit.
+		int start = i, end = i, best = -1;
+		while (end < n && s[end] != '\n' && s[end] != '\r') {
+			if (wrap && end > start) {
+				SIZE sz;
+				GetTextExtentPoint32A(dc, s + start, end + 1 - start, &sz);
+				if (sz.cx > width && best > start) break;
+			}
+			if (s[end] == ' ') best = end;
+			end++;
+		}
+		int stop = end;
+		if (end < n && s[end] != '\n' && s[end] != '\r' && best > start) stop = best; // wrapped at a space
+		int len = stop - start;
+		// (Trailing spaces are kept: DrawText counts them when it aligns a line.)
+		if (len > 0 && len < 1024) {
+			SIZE sz;
+			int fit = 0;
+			GetTextExtentExPointA(dc, s + start, len, 0x7fffffff, &fit, ext, &sz);
+			int x = f & DT_CENTER ? (r->left + r->right - sz.cx) / 2 : f & DT_RIGHT ? r->right - sz.cx : r->left;
+			if (!wrap && (f & DT_SINGLELINE)) x = L;
+			for (int k = 0; k < len; k++) dx[k] = 2 * (ext[k] - (k ? ext[k - 1] : 0));
+			ExtTextOutA(g_textDC, x * 2, y * 2, 0, NULL, s + start, (UINT)len, dx);
+		}
+		y += lineH;
+		lines++;
+		// Past the line feed (CR LF counts once), or past the space the line was broken at.
+		i = stop;
+		if (i < n && s[i] == '\r') i++;
+		if (i < n && s[i] == '\n') i++;
+		else if (i < n && s[i] == ' ') i++;
+		if (i >= n) break;
+		if (f & DT_SINGLELINE) break;
+	}
+}
+static int text_hd_draw(HDC dc, LPCSTR s, int n, LPRECT r, UINT f, BOOL *handled)
+{
+	*handled = FALSE;
+	if (!g_sharpText || !s || !r || (f & DT_CALCRECT) || !(g_hd || g_twoStage) || !hd_ready()) return 0;
+	int w, h, stride;
+	BOOL bottomUp;
+	WORD *frame = (WORD *)dc_pixels(dc, &w, &h, &stride, &bottomUp);
+	if (!frame || w != g_main.w || h != g_main.h) return 0;
+	if (GetMapMode(dc) != MM_TEXT) return 0;
+
+	// Where the text can land: its measured block placed as DrawText places it, plus a margin.
+	RECT c = *r;
+	o_DrawTextA(dc, s, n, &c, f | DT_CALCRECT);
+	int cw = c.right - c.left, ch = c.bottom - c.top;
+	int L = f & DT_CENTER ? (r->left + r->right - cw) / 2 : f & DT_RIGHT ? r->right - cw : r->left;
+	int T = (f & DT_SINGLELINE) && (f & DT_VCENTER) ? (r->top + r->bottom - ch) / 2 :
+		(f & DT_SINGLELINE) && (f & DT_BOTTOM) ? r->bottom - ch : r->top;
+	RECT box = { min(L, r->left) - 4, min(T, r->top) - 4, max(L + cw, r->right) + 4, max(T + ch, r->bottom) + 4 };
+	if (!(f & DT_NOCLIP)) { box.left = max(box.left, r->left - 1); box.top = max(box.top, r->top - 1);
+		box.right = min(box.right, r->right + 1); box.bottom = min(box.bottom, r->bottom + 1); }
+	RECT clip;
+	if (GetClipBox(dc, &clip) != ERROR) IntersectRect(&box, &box, &clip);
+	box.left = max(box.left, 0); box.top = max(box.top, 0); box.right = min(box.right, w); box.bottom = min(box.bottom, h);
+	int bw = box.right - box.left, bh = box.bottom - box.top;
+	if (bw <= 0 || bh <= 0 || bw * bh > 400000) return 0;
+
+	// The 2x frame up to date under the text, and the 1x pixels before it.
+	hd_compose(dc, box.left, box.top, box.right, box.bottom);
+	static WORD *before;
+	static int beforeSize;
+	if (bw * bh > beforeSize) { free(before); beforeSize = bw * bh; before = malloc(sizeof(WORD) * beforeSize); }
+	if (!before) return 0;
+#define TEXT_ROW(yy) (frame + (size_t)(bottomUp ? h - 1 - (yy) : (yy)) * stride)
+	for (int y = 0; y < bh; y++) memcpy(before + (size_t)y * bw, TEXT_ROW(box.top + y) + box.left, sizeof(WORD) * bw);
+
+	*handled = TRUE;
+	int result = o_DrawTextA(dc, s, n, r, f);
+	GdiFlush();
+
+	// The same text at 2x, over a copy of the 2x frame.
+	if (!g_textDC) g_textDC = dib_dc(g_main.w * 2, g_main.h * 2, &g_textBits);
+	HFONT font = g_textDC ? text_font_2x(dc) : NULL;
+	if (!font) return result;
+	int W2 = g_main.w * 2;
+	for (int y = box.top * 2; y < box.bottom * 2; y++)
+		memcpy(g_textBits + (size_t)y * W2 + box.left * 2, g_main.frame + (size_t)y * W2 + box.left * 2, sizeof(DWORD) * bw * 2);
+	int saved = SaveDC(g_textDC);
+	SelectObject(g_textDC, font);
+	SetTextColor(g_textDC, GetTextColor(dc));
+	SetBkColor(g_textDC, GetBkColor(dc));
+	SetBkMode(g_textDC, GetBkMode(dc));
+	SetTextAlign(g_textDC, GetTextAlign(dc));
+	SetTextCharacterExtra(g_textDC, GetTextCharacterExtra(dc) * 2);
+	IntersectClipRect(g_textDC, box.left * 2, box.top * 2, box.right * 2, box.bottom * 2);
+	text_layout_2x(dc, s, n, r, f, L, T);
+	GdiFlush();
+	RestoreDC(g_textDC, saved);
+
+	// Checked before it is used: the 2x text must land where the 1x text did. Each 1x pixel the
+	// text changed should hold 2x ink (the 2x block differs from what was there), and 2x ink should
+	// not fall on many pixels the 1x text left alone. A font that does not scale evenly (a bitmap
+	// font, or one whose 2x glyphs are shaped differently) fails, and keeps its 1x text.
+	{
+		int changed = 0, inked = 0, stray = 0;
+		for (int y = 0; y < bh; y++) {
+			const WORD *row = TEXT_ROW(box.top + y) + box.left;
+			const WORD *was = before + (size_t)y * bw;
+			for (int x = 0; x < bw; x++) {
+				size_t o = (size_t)(box.top + y) * 2 * W2 + (box.left + x) * 2;
+				BOOL ink = g_textBits[o] != g_main.frame[o] || g_textBits[o + 1] != g_main.frame[o + 1] ||
+					g_textBits[o + W2] != g_main.frame[o + W2] || g_textBits[o + W2 + 1] != g_main.frame[o + W2 + 1];
+				if (row[x] != was[x]) { changed++; inked += ink; }
+				else if (ink) stray++;
+			}
+		}
+		if (changed == 0 || inked * 100 < changed * 70 || stray * 100 > changed * 20) {
+			static int rejectLogs;
+			if (g_dumpViews && rejectLogs++ < 300) logf_("   2x text not used: %d changed, %d with 2x ink, %d stray", changed, inked, stray);
+			return result;
+		}
+	}
+	// Kept where the 1x text changed a pixel.
+	int changedCount = 0;	for (int y = 0; y < bh; y++) {
+		const WORD *row = TEXT_ROW(box.top + y) + box.left;
+		const WORD *was = before + (size_t)y * bw;
+		size_t at = (size_t)(box.top + y) * g_main.w + box.left;
+		for (int x = 0; x < bw; x++) {
+			if (row[x] == was[x]) continue;
+			int fx = (box.left + x) * 2, fy = (box.top + y) * 2;
+			for (int half = 0; half < 2; half++) {
+				size_t o = (size_t)(fy + half) * W2 + fx;
+				g_main.frame[o] = g_textBits[o];
+				g_main.frame[o + 1] = g_textBits[o + 1];
+			}
+			g_main.shadow[at + x] = row[x];
+			g_main.state[at + x] = 1;
+			changedCount++;
+		}
+	}
+	static int textLogs;
+	if (g_dumpViews && textLogs++ < 300) logf_("   2x text: box %ld,%ld-%ld,%ld, %d pixels changed, at %d,%d", box.left, box.top, box.right, box.bottom, changedCount, L, T);
+#undef TEXT_ROW
+	return result;
+}// The game sometimes copies a piece of the map buffer straight to the window (the hover outline,
 // the blinking unit). Show it from the map's 2x frame so those tiles do not drop out of HD.
 static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
@@ -3912,6 +4136,7 @@ static void install(HMODULE self)
 	g_autoUpscale = GetPrivateProfileIntA("Display", "HDAutoUpscale", 1, ini);
 	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
 	g_hdNative = GetPrivateProfileIntA("Display", "HDNative", 1, ini);
+	g_sharpText = GetPrivateProfileIntA("Display", "SharpText", 1, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 	if (GetPrivateProfileIntA("Debug", "LogCrashes", 1, ini)) AddVectoredExceptionHandler(1, log_crash);
 
@@ -3940,6 +4165,9 @@ static void install(HMODULE self)
 	HOOK("USER32.dll", FillRect);
 	HOOK("USER32.dll", FrameRect);
 	if (g_dumpViews) HOOK("GDI32.dll", SetROP2);
+	HOOK("GDI32.dll", ExtTextOutA);
+	HOOK("GDI32.dll", TextOutA);
+	HOOK("USER32.dll", DrawTextA);
 	BOOL native = skip_mode_switch();
 	lstrcpynA(g_gameDir, ini, sizeof g_gameDir);
 	char *lastSlash = strrchr(g_gameDir, '\\');

@@ -63,6 +63,7 @@ HD=1
 | `HDAssets` | `decomp\assets\x2` in the game folder | Where the upscaled artwork is |
 | `HDCaptureTiles` | 1 | Save new map tiles for upscaling as they are met |
 | `HDAutoUpscale` | 1 | Upscale newly captured tiles when the game closes |
+| `SharpText` | 1 | Draw the game's text again at 2x in a doubled font, so it is sharp instead of enlarged (fonts that do not scale evenly keep their 1x text) |
 | `HDNative` | 1 | Show painted-out full-screen pictures (the main menu) at the display's own resolution from their 4x art; 0 uses the 2x art like other screens |
 
 `imp2hd.log` is rewritten in the game folder on each launch and records what the patch did.
