@@ -14,6 +14,8 @@
 //       exact repeat would show)
 //   'G' takes the columns from a generated picture of the whole widened screen instead (see
 //       generated), falling back to 'M' of src and srcW when there is none
+//   'Q' mirror-tiles a patch of plain texture in both directions: columns src..src+srcW, rows
+//       srcY..srcY+srcH (for paper with nothing plain beside the insertion in the same rows)
 //   'S' stretches it: the stretch, which must start or end at `at`, is drawn `width` columns wider
 //       (for fabric and shading, where any repeat of a fold would show)
 // Every band of a screen inserts the same total, LAYOUT_EXTRA. Views are shifted by the insertions
@@ -28,7 +30,7 @@
 #define LAYOUT_MAX_BANDS 8
 #define LAYOUT_MAX_W 1056
 
-typedef struct { short at, width, src, srcW; char mode; } LayoutInsert;
+typedef struct { short at, width, src, srcW; char mode; short srcY, srcH; } LayoutInsert;
 typedef struct { short top, bottom; LayoutInsert ins[LAYOUT_MAX_INSERTS]; } LayoutBand;
 typedef struct {
 	const char *name;           // for logs and the preview tool
@@ -123,6 +125,9 @@ static const ScreenLayout g_screenLayouts[] = {
 		DIPLOMACY_BANDS, 0, 1 },
 	{ "final vote", "TDiplomacyFinalView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
 		DIPLOMACY_BANDS, 0, 1 },
+	// And on the battle report, which is built on the diplomacy screen (with the red cloth).
+	{ "battle report", "TBattleReportView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
+		DIPLOMACY_BANDS, 0, 1 },
 	{
 		// The same screen on its other background, a red cloth (the same places, other fill).
 		"diplomacy (cloth)", "TDiplomacyMapView", LID('m', 'a', 'i', 'n'), 0, 800, 600, {
@@ -164,21 +169,36 @@ static const ScreenLayout g_screenLayouts[] = {
 	// (No layout for the technology screen: both its panels are filled edge to edge by controls
 	// and its frame is too thin to take the width, so it stays centred.)
 	{
-		// The industry screen's page (workers, production or shipyard): its margins, outside the
-		// rows, which draw their bars at a fixed place.
+		// The industry screen's page: graph paper with ruled rows, one picture per tab. Each is
+		// lengthened inside its rows, just after their left ornaments and just before their right
+		// ones, by mirroring a plain stretch of the same rows, so the ruling and the grid carry on.
+		// Production (and the default for any other artwork of the page).
 		"industry page", "TBackgroundPicture", LID('p', 'a', 'g', 'e'), 0, 595, 361, {
-			{ 0, 361, { { 14, 128, 14, 4, 'S' }, { 582, 128, 578, 4, 'S' } } },
+			{ 0, 361, { { 33, 128, 33, 32, 'M' }, { 558, 128, 526, 32, 'M' } } },
 		},
 	},
 	{
-		// The shipyard page has panels with a double frame where the others have plain margin:
-		// the left panel's inside and the margin beyond the right panels are stretched instead.
+		// Workers: the same above its lower boxes; beside those, paper from between the top boxes.
+		"industry page (workers)", "TBackgroundPicture", LID('p', 'a', 'g', 'e'), 0, 595, 361, {
+			{ 0, 255, { { 33, 128, 33, 32, 'M' }, { 560, 128, 556, 4, 'M' } } },
+			{ 255, 361, { { 33, 128, 40, 64, 'Q', 96, 28 }, { 560, 128, 40, 64, 'Q', 96, 28 } } },
+		},
+		9198,
+	},
+	{
+		// Shipyard: panels instead of rows. Inside the left panel, left of its oval, and inside
+		// the right panels after their last pictures.
 		"industry page (shipyard)", "TBackgroundPicture", LID('p', 'a', 'g', 'e'), 0, 595, 361, {
-			{ 0, 361, { { 19, 128, 19, 8, 'S' }, { 590, 128, 586, 4, 'S' } } },
+			// Grid paper from inside the left panel where nothing plain runs along the rows; the
+			// left panel's top and bottom frames are carried on with it.
+			{ 0, 34, { { 22, 128, 60, 128, 'Q', 150, 190 }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
+			{ 34, 46, { { 22, 128, 22, 8, 'M' }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
+			{ 46, 140, { { 22, 128, 60, 128, 'Q', 150, 190 }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
+			{ 140, 350, { { 22, 128, 60, 128, 'Q', 150, 190 }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
+			{ 350, 361, { { 22, 128, 22, 8, 'M' }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
 		},
 		9200,
-	},
-};
+	},};
 
 // Columns a layout adds (the same in every band).
 static int layout_extra(const ScreenLayout *s)
@@ -199,6 +219,7 @@ static int layout_valid(const ScreenLayout *s)
 			const LayoutInsert *in = &band->ins[i];
 			if (in->at <= last || in->at > s->width || in->srcW <= 0 || in->src < 0 || in->src + in->srcW > s->width) return 0;
 			if (in->mode == 'S' && in->src != in->at && in->src + in->srcW != in->at) return 0;
+			if (in->mode == 'Q' && (in->srcH <= 0 || in->srcY < 0 || in->srcY + in->srcH > s->height)) return 0;
 			last = in->at;
 			total += in->width;
 		}
@@ -266,6 +287,15 @@ static void layout_place(const ScreenLayout *s, int x, int y, int w, int h, int 
 	*nw = w + right - left;
 }
 
+// Mirror tiling: 0, 1, .. n-1, n-1, .. 0, 0, 1, ..
+static int layout_mirror(int v, int n)
+{
+	int p = 2 * n;
+	v %= p;
+	if (v < 0) v += p;
+	return v < n ? v : p - 1 - v;
+}
+
 // The source column of every column of one band of the widened picture.
 static void layout_band_map(const ScreenLayout *s, const LayoutBand *band, short *map)
 {
@@ -286,6 +316,8 @@ static void layout_band_map(const ScreenLayout *s, const LayoutBand *band, short
 			int first = in->mode == 'T' ? in->at : in->at - in->width;
 			int phase = ((first - in->src) % in->srcW + in->srcW) % in->srcW;
 			for (int k = 0; k < in->width; k++) map[out++] = (short)(in->src + (phase + k) % in->srcW);
+		} else if (in->mode == 'Q') {
+			for (int k = 0; k < in->width; k++) map[out++] = -3; // drawn by the patch fill
 		} else if (in->mode == 'G' && s->generated) {
 			for (int k = 0; k < in->width; k++) map[out++] = -1; // a generated column (drawn by the patch)
 		} else if (in->mode == 'M' || in->mode == 'G') {

@@ -81,16 +81,20 @@ static int g_viewW = BASE_W, g_viewH = GAME_H; // current size of the view windo
 static BOOL g_smooth = TRUE, g_integerScale = FALSE;
 static char g_logPath[MAX_PATH];
 
+// The log stays open: opening and closing it for each line cost 1-2 ms a time (the file is
+// scanned on every close), which added up while the game ran. Each line is flushed, so the log
+// is complete if the game crashes.
 static void logf_(const char *fmt, ...)
 {
-	FILE *f = fopen(g_logPath, "a");
+	static FILE *f;
+	if (!f) f = fopen(g_logPath, "a");
 	if (!f) return;
 	va_list ap;
 	va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
 	va_end(ap);
 	fputc('\n', f);
-	fclose(f);
+	fflush(f);
 }
 
 static BOOL scaled(void) { return g_view && (g_viewW != GAME_W || g_viewH != GAME_H); }
@@ -352,7 +356,7 @@ static int g_wideSteps = 7;
 static BOOL g_timing;
 static LONGLONG g_presentTicks;
 static int g_presentPixels;
-static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks;
+static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks, g_findTicks;
 static int g_copyCalls;
 static int g_traceBudget; // diagnostic: number of paint calls still to be logged
 static int g_drawTrace; // diagnostic: direct-to-window drawing calls still to be logged
@@ -743,6 +747,8 @@ static void layout_stretch_fill(BYTE *src, BYTE *dst, int sx, int sw, int top, i
 	int dw, int clipLeft, int clipRight);
 static DWORD *hd_load_png(const char *path, int w2, int h2);
 static BOOL hd_ready(void);
+static void layout_patch_fill(BYTE *src, BYTE *dst, const LayoutInsert *in, int bandTop, int top, int bottom, int dx, int dy,
+	int clipLeft, int clipRight);
 
 #define GENERATED_BLEND 48 // columns of crossfade into the original; must match tools\outpaint.ps1
 // Painted-out screens (layouts.h, 'G'): the 1x picture, and its 2x upscale when there is one.
@@ -822,9 +828,9 @@ static void __attribute__((thiscall)) layout_background_draw(BYTE *self, const i
 		for (int x = left; x < right;) {
 			int run = 1;
 			if (map[x] < 0) {
-				// Generated columns, from the painted-out picture.
-				while (x + run < right && map[x + run] < 0) run++;
-				generated_fill(s->generated, dst, x, run, top, bottom, originX, originY);
+				// Generated columns, from the painted-out picture; patches are drawn below.
+				while (x + run < right && map[x + run] == map[x]) run++;
+				if (map[x] == -1) generated_fill(s->generated, dst, x, run, top, bottom, originX, originY);
 				x += run;
 				continue;
 			}
@@ -855,6 +861,11 @@ static void __attribute__((thiscall)) layout_background_draw(BYTE *self, const i
 		int before = 0;
 		for (int i = 0; i < LAYOUT_MAX_INSERTS && s->bands[b].ins[i].width; i++) {
 			const LayoutInsert *in = &s->bands[b].ins[i];
+			if (in->mode == 'Q') {
+				int start = in->at + before;
+				layout_patch_fill(src, dst, in, s->bands[b].top, top, bottom, originX + start, originY,
+					originX + max(left, start), originX + min(right, start + in->width));
+			}
 			if (in->mode == 'S') {
 				int from = in->src + before, total = in->srcW + in->width;
 				layout_stretch_fill(src, dst, in->src, in->srcW, top, bottom, originX + from, originY,
@@ -895,7 +906,7 @@ static const ScreenLayout *find_layout(BYTE *picture)
 	for (int i = 0; i < (int)(sizeof g_screenLayouts / sizeof g_screenLayouts[0]); i++) {
 		const ScreenLayout *s = &g_screenLayouts[i];
 		if (s->picture) continue; // fill for one artwork only (see choose_look)
-		if (!strncmp(s->cls, "TDiplomacy", 10) && !g_diplomacyMapMoved) continue; // its map would not follow
+		if ((!strncmp(s->cls, "TDiplomacy", 10) || !strcmp(s->cls, "TBattleReportView")) && !g_diplomacyMapMoved) continue; // its map would not follow
 		if (strcmp(view_class(picture), s->cls) || (DWORD)VIEW_INT(picture, V_ID) != s->id) continue;
 		if (VIEW_INT(picture, V_W) != s->width || VIEW_INT(picture, V_H) != s->height) continue;
 		if (s->child && !child_view(picture, s->child)) continue;
@@ -1010,8 +1021,11 @@ static int sync_layout(BYTE *screen, BYTE *view, const LayoutContext *ctx, int p
 			}
 		}
 		if (wide && wide->layout.id) {
-			// The views inside a picture with its own layout follow that layout.
-			inner.layout = &wide->layout;
+			// The views inside a picture with its own layout follow that layout, or its variant for
+			// the artwork the picture shows now (the industry page has one per tab).
+			short artwork = *(short *)(child + 0x88);
+			if (artwork != wide->lookPicture) choose_look(wide, artwork);
+			inner.layout = &wide->look;
 			inner.origLeft = origX;
 			inner.newLeft = ctx->newLeft + nx;
 			inner.top = VIEW_INT(child, 0x30);
@@ -1149,7 +1163,21 @@ static void keep_battlefield_in_picture(BYTE *screen)
 
 // Called before each paint and from a timer. The map screen is widened when it is built; every
 // other screen was designed for 800 and is presented centred instead (see g_offsetX).
+static void watch_screens_now(void);
+
+// Diagnostic wrapper: how long the screen bookkeeping takes.
 static void watch_screens(void)
+{
+	LARGE_INTEGER a, b, f;
+	if (g_timing) QueryPerformanceCounter(&a);
+	watch_screens_now();
+	if (!g_timing) return;
+	QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
+	double ms = (b.QuadPart - a.QuadPart) * 1000.0 / f.QuadPart;
+	if (ms > 0.5) logf_("watch_screens %.2f ms", ms);
+}
+
+static void watch_screens_now(void)
 {
 	static BYTE *handled[32];
 	static int handledCount;
@@ -1229,13 +1257,13 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		LARGE_INTEGER a, b, freq;
 		QueryPerformanceFrequency(&freq);
 		QueryPerformanceCounter(&a);
-		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = 0; g_copyCalls = 0;
+		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = g_findTicks = 0; g_copyCalls = 0;
 		LRESULT r = CallWindowProcA(g_viewProc, hwnd, msg, wp, lp);
 		QueryPerformanceCounter(&b);
 		double ms = (b.QuadPart - a.QuadPart) * 1000.0 / freq.QuadPart;
 		double k = 1000.0 / freq.QuadPart;
-		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f; %d game pixels", ms,
-			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_presentPixels);
+		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f); %d game pixels", ms,
+			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_findTicks * k, g_presentPixels);
 		return r;
 	}
 	switch (msg) {
@@ -2349,7 +2377,9 @@ static void __attribute__((thiscall)) diplomacy_geometries(BYTE *self)
 {
 	typedef void (__attribute__((thiscall)) *Fn)(void *);
 	BYTE *here = child_view(self, ID4('h', 'e', 'r', 'e'));
-	BOOL moved = g_diplomacyMapMoved && here && VIEW_INT(self, V_W) == BASE_W && VIEW_INT(here, V_X) == 120;
+	// (Every screen built on this map is widened with it moved: the country shapes are built
+	// further right for all of them.)
+	BOOL moved = g_diplomacyMapMoved && here && VIEW_INT(self, V_W) == BASE_W;
 	if (moved) VIEW_INT(here, V_X) += DIPLOMACY_MAP_SHIFT;
 	((Fn)g_geometriesRest)(self);
 	if (moved) VIEW_INT(here, V_X) -= DIPLOMACY_MAP_SHIFT; // the layout moves it for good
@@ -2522,7 +2552,6 @@ static int g_hdIndexCount;
 static HdImage g_hdImages[512];
 static int g_hdMissLog = 40; // diagnostic: unmatched pictures still to be reported
 static int g_hdImageCount;
-static size_t g_hdBytes;
 
 
 // GDI+ flat API, used only to read PNG files.
@@ -2639,6 +2668,46 @@ static void hd_index_archive(const char *path, const char *name)
 	CloseHandle(f);
 }
 
+// The index by hash, for whole-picture lookups, and by size, for sprite-cell matching: scanning
+// the whole index on every miss cost about 2 ms per sprite drawn.
+static int *g_hdByHash, *g_hdBySize;
+
+static int cmp_by_hash(const void *a, const void *b)
+{
+	DWORD x = g_hdIndex[*(const int *)a].hash, y = g_hdIndex[*(const int *)b].hash;
+	return x < y ? -1 : x > y;
+}
+
+static int cmp_by_size(const void *a, const void *b)
+{
+	const HdIndexEntry *x = &g_hdIndex[*(const int *)a], *y = &g_hdIndex[*(const int *)b];
+	int kx = x->w * 65536 + x->h, ky = y->w * 65536 + y->h;
+	return kx < ky ? -1 : kx > ky;
+}
+
+static void hd_sort_index(void)
+{
+	g_hdByHash = malloc(sizeof(int) * (g_hdIndexCount + 1));
+	g_hdBySize = malloc(sizeof(int) * (g_hdIndexCount + 1));
+	if (!g_hdByHash || !g_hdBySize) return;
+	for (int i = 0; i < g_hdIndexCount; i++) g_hdByHash[i] = g_hdBySize[i] = i;
+	qsort(g_hdByHash, g_hdIndexCount, sizeof(int), cmp_by_hash);
+	qsort(g_hdBySize, g_hdIndexCount, sizeof(int), cmp_by_size);
+}
+
+// First position in g_hdByHash with that hash, or in g_hdBySize with that size.
+static int index_lower_bound(const int *order, BOOL bySize, DWORD key)
+{
+	int lo = 0, hi = g_hdIndexCount;
+	while (lo < hi) {
+		int mid = (lo + hi) / 2;
+		const HdIndexEntry *e = &g_hdIndex[order[mid]];
+		DWORD k = bySize ? (DWORD)(e->w * 65536 + e->h) : e->hash;
+		if (k < key) lo = mid + 1; else hi = mid;
+	}
+	return lo;
+}
+static void hd_sort_index(void);
 static void hd_build_index(void)
 {
 	char pattern[MAX_PATH];
@@ -2656,6 +2725,7 @@ static void hd_build_index(void)
 		if (g_hdIndexCount < 4096) hd_index_archive(path, name);
 	} while (FindNextFileA(find, &fd));
 	FindClose(find);
+	hd_sort_index();
 	logf_("HD: indexed %d pictures", g_hdIndexCount);
 }
 
@@ -2687,6 +2757,49 @@ static DWORD *hd_load_png(const char *path, int w2, int h2)
 	return pixels;
 }
 
+// Decoded HD pictures by file, so a picture matched again (a sprite seen over different terrain,
+// for one) is not decoded again. The cache owns the pixels; HdImage entries borrow them.
+typedef struct { DWORD key; DWORD *pixels; size_t bytes; } PngCacheEntry;
+static PngCacheEntry g_pngCache[1024];
+static int g_pngCacheCount;
+static size_t g_pngCacheBytes;
+
+static DWORD *hd_load_cached(const char *path, int w2, int h2)
+{
+	DWORD key = fnv(fnv(2166136261u, (const BYTE *)path, strlen(path)), (const BYTE *)&w2, sizeof w2);
+	for (int i = 0; i < g_pngCacheCount; i++) if (g_pngCache[i].key == key) return g_pngCache[i].pixels;
+	if (g_pngCacheCount >= (int)(sizeof g_pngCache / sizeof g_pngCache[0]) || g_pngCacheBytes > 600u * 1024 * 1024) {
+		// Full: everything that refers to cached pictures is forgotten with them.
+		g_hdImageCount = 0;
+		hd_forget_art();
+		for (int i = 0; i < g_pngCacheCount; i++) free(g_pngCache[i].pixels);
+		g_pngCacheCount = 0;
+		g_pngCacheBytes = 0;
+	}
+	DWORD *pixels = hd_load_png(path, w2, h2);
+	if (pixels) {
+		g_pngCache[g_pngCacheCount].key = key;
+		g_pngCache[g_pngCacheCount].pixels = pixels;
+		g_pngCache[g_pngCacheCount].bytes = (size_t)w2 * h2 * 4;
+		g_pngCacheBytes += (size_t)w2 * h2 * 4;
+		g_pngCacheCount++;
+	}
+	return pixels;
+}
+
+// Makes room in the table of matched pictures: sprite cells (cheap to match again) go first.
+static void hd_make_room(void)
+{
+	int kept = 0;
+	for (int i = 0; i < g_hdImageCount; i++) if (g_hdImages[i].bpp != -8) g_hdImages[kept++] = g_hdImages[i];
+	if (kept < g_hdImageCount * 3 / 4) {
+		g_hdImageCount = kept;
+		return;
+	}
+	g_hdImageCount = 0;
+	hd_forget_art(); // blocks referring to forgotten art are simply redrawn
+}
+
 // The upscaled picture for a picture in memory, or NULL.
 static const HdImage *hd_find(const BYTE *bits, int w, int h, int bpp)
 {
@@ -2698,22 +2811,18 @@ static const HdImage *hd_find(const BYTE *bits, int w, int h, int bpp)
 			return g_hdImages[i].pixels ? &g_hdImages[i] : NULL;
 		}
 	}
-	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0]) || g_hdBytes > 400u * 1024 * 1024) {
-		for (int i = 0; i < g_hdImageCount; i++) free(g_hdImages[i].pixels);
-		g_hdImageCount = 0;
-		g_hdBytes = 0;
-		hd_forget_art(); // blocks referring to freed art are simply redrawn
-	}
+	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0])) hd_make_room();
+
 	HdImage *img = &g_hdImages[g_hdImageCount++];
 	img->hash = hash; img->w = w; img->h = h; img->bpp = bpp; img->pixels = NULL;
 	BOOL indexed = FALSE;
-	for (int i = 0; i < g_hdIndexCount; i++) {
-		if (g_hdIndex[i].hash != hash || g_hdIndex[i].w != w || g_hdIndex[i].h != h || g_hdIndex[i].bpp != bpp) continue;
+	for (int at = g_hdByHash ? index_lower_bound(g_hdByHash, FALSE, hash) : 0; g_hdByHash && at < g_hdIndexCount && g_hdIndex[g_hdByHash[at]].hash == hash; at++) {
+		int i = g_hdByHash[at];
+		if (g_hdIndex[i].w != w || g_hdIndex[i].h != h || g_hdIndex[i].bpp != bpp) continue;
 		indexed = TRUE;
 		char path[MAX_PATH];
 		snprintf(path, sizeof path, "%s\\%s\\%d.png", g_hdAssets, g_hdIndex[i].archive, g_hdIndex[i].id);
-		img->pixels = hd_load_png(path, w * 2, h * 2);
-		if (img->pixels) g_hdBytes += (size_t)w * h * 16;
+		img->pixels = hd_load_cached(path, w * 2, h * 2);
 		logf_("HD: %s\\%d %dx%d %dbpp %s", g_hdIndex[i].archive, g_hdIndex[i].id, w, h, bpp, img->pixels ? "loaded" : "NOT FOUND on disk");
 		break;
 	}
@@ -2731,7 +2840,8 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 	// The game remaps some palette indices when it loads 8-bit pictures, so the bytes in memory
 	// are close to the archive's but not identical. The region is matched by similarity: among
 	// archive pictures of the same size, the one agreeing on the most sampled pixels wins.
-	int rowStep = max(1, h / 48), stride = (pictureW + 3) & ~3;
+	// (Every other row of a small cell is plenty to tell pictures apart, at half the cost.)
+	int rowStep = max(2, h / 32), stride = (pictureW + 3) & ~3;
 	DWORD hash = fnv(2166136261u, (const BYTE *)&w, sizeof w);
 	for (int row = 0; row < h; row += rowStep) {
 		hash = fnv(hash, bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x, (size_t)w);
@@ -2741,12 +2851,26 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 			return g_hdImages[i].pixels ? &g_hdImages[i] : NULL;
 		}
 	}
-	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0])) return NULL;
+	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0])) hd_make_room();
 	HdImage *img = &g_hdImages[g_hdImageCount++];
 	img->hash = hash; img->w = w; img->h = h; img->bpp = -8; img->pixels = NULL; // -8: matched as a cell
 	int best = -1, bestSame = 0, secondSame = 0, sampled = 0;
-	for (int i = 0; i < g_hdIndexCount; i++) {
-		if (g_hdIndex[i].bpp != 8 || g_hdIndex[i].w != w || g_hdIndex[i].h != h || !g_hdIndex[i].data8) continue;
+	// Four rows first: most archive pictures differ on those already, and only the rest are
+	// compared in full (the full comparison of every candidate took about 4 ms per sprite drawn).
+	int quickRows[4] = { h / 8, h * 3 / 8, h * 5 / 8, h * 7 / 8 };
+	DWORD sizeKey = (DWORD)(w * 65536 + h);
+	for (int at = g_hdBySize ? index_lower_bound(g_hdBySize, TRUE, sizeKey) : g_hdIndexCount; at < g_hdIndexCount &&
+		(DWORD)(g_hdIndex[g_hdBySize[at]].w * 65536 + g_hdIndex[g_hdBySize[at]].h) == sizeKey; at++) {
+		int i = g_hdBySize[at];
+		if (g_hdIndex[i].bpp != 8 || !g_hdIndex[i].data8) continue;
+		int quick = 0;
+		for (int q = 0; q < 4; q++) {
+			int row = quickRows[q];
+			const BYTE *mem = bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x;
+			const BYTE *file = g_hdIndex[i].data8 + (size_t)row * w;
+			for (int col = 0; col < w; col++) quick += mem[col] == file[col];
+		}
+		if (quick * 100 < 4 * w * 60) continue; // far from the 80% needed
 		int same = 0;
 		sampled = 0;
 		for (int row = 0; row < h; row += rowStep) {
@@ -2769,10 +2893,12 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 		}
 		char path[MAX_PATH];
 		snprintf(path, sizeof path, "%s\\%s\\%d.png", g_hdAssets, g_hdIndex[i].archive, g_hdIndex[i].id);
-		img->pixels = hd_load_png(path, w * 2, h * 2);
-		if (img->pixels) g_hdBytes += (size_t)w * h * 16;
-		logf_("HD: %s\\%d %dx%d 8-bit (%d%% match) %s", g_hdIndex[i].archive, g_hdIndex[i].id, w, h,
-			bestSame * 100 / max(sampled, 1), img->pixels ? "loaded" : "NOT FOUND on disk");
+		img->pixels = hd_load_cached(path, w * 2, h * 2);
+		if (g_hdMissLog > 0 || !img->pixels) {
+			g_hdMissLog--;
+			logf_("HD: %s\\%d %dx%d 8-bit (%d%% match) %s", g_hdIndex[i].archive, g_hdIndex[i].id, w, h,
+				bestSame * 100 / max(sampled, 1), img->pixels ? "loaded" : "NOT FOUND on disk");
+		}
 		break;
 	}
 	return img->pixels ? img : NULL;
@@ -3018,6 +3144,7 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 
 	// Plain copies of 8- and 16-bit pictures, and 8-bit copies that skip one palette index, can
 	// have HD art: a map tile, the whole picture upscaled, or (8-bit only) the cell being copied.
+	LARGE_INTEGER q0, q1; QueryPerformanceCounter(&q0);
 	BOOL keyed = transparent != 0xffffffff, eight = sh->biBitCount == 8;
 	const DWORD *pixels = NULL;
 	int ax = sx, ay = sy, aw = pw;
@@ -3035,6 +3162,8 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 		}
 		if (art) pixels = art->pixels;
 	}
+	QueryPerformanceCounter(&q1);
+	g_findTicks += q1.QuadPart - q0.QuadPart;
 	if (pixels) surface_track(s, frame);
 	else if (frame != s->bits) return;
 
@@ -3222,6 +3351,54 @@ static void layout_stretch_fill(BYTE *src, BYTE *dst, int sx, int sw, int top, i
 	}
 }
 
+// Draws a 'Q' insertion: a patch of the picture, mirror-tiled in both directions, into the band
+// rows [top, bottom) at frame columns from dx, within [clipLeft, clipRight). The tiling starts at
+// the band's top and the insertion's left edge. The HD frame gets the same from the HD art.
+static void layout_patch_fill(BYTE *src, BYTE *dst, const LayoutInsert *in, int bandTop, int top, int bottom, int dx, int dy,
+	int clipLeft, int clipRight)
+{
+	if (!readable(src, 0x14) || !readable(dst, 0x14)) return;
+	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
+	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
+	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh) || dh->biBitCount != 16) return;
+	if (sh->biBitCount != 8 && sh->biBitCount != 16) return;
+	const BYTE *srcBits = *(const BYTE **)(src + 0x0c);
+	WORD *frame = *(WORD **)(dst + 0x0c);
+	int fw = dh->biWidth, fh = abs(dh->biHeight), stride = (fw + 1) & ~1, pw = sh->biWidth;
+	if (!srcBits || !frame || in->src < 0 || in->src + in->srcW > pw || in->srcY + in->srcH > abs(sh->biHeight)) return;
+	clipLeft = max(clipLeft, max(dx, 0));
+	clipRight = min(clipRight, min(dx + in->width, fw));
+	HdSurface *hd = NULL;
+	const DWORD *art = NULL;
+	if (hd_ready() && fw == g_main.w && fh == g_main.h && g_main.bits == frame) {
+		const HdImage *image = hd_find(srcBits, pw, abs(sh->biHeight), sh->biBitCount);
+		if (image && image->pixels) { hd = &g_main; art = image->pixels; }
+	}
+	for (int y = top; y < bottom; y++) {
+		int fy = dy + y;
+		if (fy < 0 || fy >= fh) continue;
+		WORD *row = frame + (size_t)(dh->biHeight > 0 ? fh - 1 - fy : fy) * stride;
+		int sy = in->srcY + layout_mirror(y - bandTop, in->srcH);
+		for (int x = clipLeft; x < clipRight; x++) {
+			int k = x - dx;
+			WORD v = picture_pixel(sh, srcBits, in->src + layout_mirror(k, in->srcW), sy);
+			row[x] = v;
+			size_t at = (size_t)fy * g_main.w + x;
+			if (!hd) {
+				if (g_main.state && g_main.bits == frame) g_main.state[at] = 0;
+				continue;
+			}
+			for (int half = 0; half < 2; half++) {
+				int sy2 = in->srcY * 2 + layout_mirror((y - bandTop) * 2 + half, in->srcH * 2);
+				for (int kk = 0; kk < 2; kk++)
+					hd->frame[(size_t)(fy * 2 + half) * hd->w * 2 + x * 2 + kk] =
+						art[(size_t)sy2 * pw * 2 + in->src * 2 + layout_mirror(k * 2 + kk, in->srcW * 2)];
+			}
+			hd->shadow[at] = v;
+			hd->state[at] = 1;
+		}
+	}
+}
 // The 16-bit pixel buffer selected into a device context, with its layout; NULL if there is none.
 static const WORD *dc_pixels(HDC dc, int *w, int *h, int *stride, BOOL *bottomUp)
 {

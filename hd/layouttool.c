@@ -88,7 +88,21 @@ static int preview(const char *name, const char *in, const char *out, const char
 		const LayoutBand *band = &s->bands[b];
 		layout_band_map(s, band, map);
 		for (int y = band->top; y < band->bottom; y++)
-			for (int x = 0; x < dst.w; x++) dst.px[y * dst.w + x] = src.px[y * src.w + map[x]];
+			for (int x = 0; x < dst.w; x++) dst.px[y * dst.w + x] = map[x] >= 0 ? src.px[y * src.w + map[x]] : 0xff00ff;
+		// Patches, mirror-tiled in both directions.
+		{
+			int before = 0;
+			for (int i = 0; i < LAYOUT_MAX_INSERTS && band->ins[i].width; i++) {
+				const LayoutInsert *in = &band->ins[i];
+				if (in->mode == 'Q') {
+					int start = in->at + before;
+					for (int y = band->top; y < band->bottom; y++)
+						for (int k = 0; k < in->width; k++)
+							dst.px[y * dst.w + start + k] = src.px[(in->srcY + layout_mirror(y - band->top, in->srcH)) * src.w + in->src + layout_mirror(k, in->srcW)];
+				}
+				before += in->width;
+			}
+		}
 		// Stretched columns blended between neighbours, as the patch draws them.
 		int before = 0;
 		for (int i = 0; i < LAYOUT_MAX_INSERTS && band->ins[i].width; i++) {
