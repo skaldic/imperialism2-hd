@@ -64,7 +64,7 @@ typedef struct {
 		{ 96, 216, { { 135, 128, 135, 64, 'M' }, { 667, 128, 603, 64, 'M' } } }, \
 		/* the frame's lower edge and the gold rope under it */ \
 		{ 216, 245, { { 135, 128, 160, 8, 'T' }, { 667, 128, 600, 8, 'T' } } }, \
-		{ 245, 600, { { 100, 125, 80, 20, 'S' }, { 705, 131, 705, 20, 'S' } } }, \
+		{ 245, 600, { { 100, 125, 80, 20, 'G' }, { 705, 131, 705, 20, 'G' } } }, \
 	}
 static const ScreenLayout g_screenLayouts[] = {
 	{
@@ -117,17 +117,18 @@ static const ScreenLayout g_screenLayouts[] = {
 		"diplomacy", "TDiplomacyMapView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
 		DIPLOMACY_BANDS,
 		// The Information panel is a picture filled to its edges (its colour key). The map of
-		// nations is drawn at fixed positions, moved by the patch (DIPLOMACY_MAP_SHIFT).
-		0, 1,
+		// nations is drawn at fixed positions, moved by the patch (DIPLOMACY_MAP_SHIFT). The sea chart
+		// either side of it is painted out (tools\\inpaint_strips.ps1).
+		0, 1, 4140,
 	},
 	// The same map of nations on the screens for offers made to you and for the final vote.
 	{ "diplomatic offers", "TDiplomacyOfferView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
-		DIPLOMACY_BANDS, 0, 1 },
+		DIPLOMACY_BANDS, 0, 1, 4140 },
 	{ "final vote", "TDiplomacyFinalView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
-		DIPLOMACY_BANDS, 0, 1 },
+		DIPLOMACY_BANDS, 0, 1, 4140 },
 	// And on the battle report, which is built on the diplomacy screen (with the red cloth).
 	{ "battle report", "TBattleReportView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
-		DIPLOMACY_BANDS, 0, 1 },
+		DIPLOMACY_BANDS, 0, 1, 4140 },
 	{
 		// The same screen on its other background, a red cloth (the same places, other fill).
 		"diplomacy (cloth)", "TDiplomacyMapView", LID('m', 'a', 'i', 'n'), 0, 800, 600, {
@@ -135,9 +136,9 @@ static const ScreenLayout g_screenLayouts[] = {
 			{ 55, 96, { { 135, 128, 135, 20, 'S' }, { 667, 128, 647, 20, 'S' } } },
 			{ 96, 216, { { 135, 128, 135, 20, 'S' }, { 667, 128, 647, 20, 'S' } } },
 			{ 216, 245, { { 135, 128, 160, 11, 'T' }, { 667, 128, 600, 11, 'T' } } },
-			{ 245, 600, { { 100, 125, 80, 20, 'S' }, { 705, 131, 705, 20, 'S' } } },
+			{ 245, 600, { { 100, 125, 80, 20, 'G' }, { 705, 131, 705, 20, 'G' } } },
 		},
-		4100,
+		4100, 1, 4100,
 	},
 	{
 		// Loading and saving: a chest of scrolls (the save slots) in a room. The room is widened
