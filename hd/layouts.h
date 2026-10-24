@@ -121,9 +121,9 @@ static const ScreenLayout g_screenLayouts[] = {
 		// either side of it is painted out (tools\\inpaint_strips.ps1).
 		0, 1, 4140,
 	},
-	// The same map of nations on the screens for offers made to you and for the final vote.
-	{ "diplomatic offers", "TDiplomacyOfferView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
-		DIPLOMACY_BANDS, 0, 1, 4140 },
+	// The same map of nations on the final vote screen.
+	// (Not the screen for offers made to you: its panel, with the Accept and Reject seals, is laid
+	// out differently and came out broken. It stays centred until it has a layout of its own.)
 	{ "final vote", "TDiplomacyFinalView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
 		DIPLOMACY_BANDS, 0, 1, 4140 },
 	// And on the battle report, which is built on the diplomacy screen (with the red cloth).
