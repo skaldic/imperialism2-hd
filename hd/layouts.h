@@ -175,8 +175,16 @@ static const ScreenLayout g_screenLayouts[] = {
 		},
 		0, 0, 8800,
 	},
-	// (No layout for the technology screen: both its panels are filled edge to edge by controls
-	// and its frame is too thin to take the width, so it stays centred.)
+	// Screens painted out either side by the image model (tools\outpaint.ps1): the whole 800-wide
+	// picture keeps its place in the middle and every view moves with it.
+	{ "technology", "TTechScreenPicture", LID('m', 'a', 'i', 'n'), LID('g', 'g', 'r', 'p'), 800, 600,
+		{ { 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } } }, 0, 0, 2300 },
+	{ "preferences", "TGamePreferencesPicture", LID('m', 'a', 'i', 'n'), 0, 800, 600,
+		{ { 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } } }, 0, 0, 4149 },
+	{ "custom difficulty", "TDifficultyPicture", LID('m', 'a', 'i', 'n'), 0, 800, 600,
+		{ { 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } } }, 0, 0, 4149 },
+	{ "new game", "TSetupRandomMapPicture", LID('m', 'a', 'i', 'n'), 0, 800, 600,
+		{ { 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } } }, 0, 0, 4540 },
 	{
 		// The industry screen's page: graph paper with ruled rows, one picture per tab. Each is
 		// lengthened inside its rows, just after their left ornaments and just before their right
@@ -198,16 +206,12 @@ static const ScreenLayout g_screenLayouts[] = {
 		// Shipyard: panels instead of rows. Inside the left panel, left of its oval, and inside
 		// the right panels after their last pictures.
 		"industry page (shipyard)", "TBackgroundPicture", LID('p', 'a', 'g', 'e'), 0, 595, 361, {
-			// Grid paper from inside the left panel where nothing plain runs along the rows; the
-			// left panel's top and bottom frames are carried on with it.
-			{ 0, 34, { { 22, 128, 60, 128, 'Q', 150, 190 }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
-			{ 34, 46, { { 22, 128, 22, 8, 'M' }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
-			{ 46, 140, { { 22, 128, 60, 128, 'Q', 150, 190 }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
-			{ 140, 350, { { 22, 128, 60, 128, 'Q', 150, 190 }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
-			{ 350, 361, { { 22, 128, 22, 8, 'M' }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
+			// Plain paper in the page margins, outside the panels, which keep their own frames.
+			{ 0, 361, { { 14, 128, 60, 128, 'Q', 150, 190 }, { 582, 128, 60, 128, 'Q', 150, 190 } } },
 		},
 		9200,
-	},};
+	},
+};
 
 // Columns a layout adds (the same in every band).
 static int layout_extra(const ScreenLayout *s)
