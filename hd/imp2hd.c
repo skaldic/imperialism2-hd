@@ -62,7 +62,8 @@ static BOOL g_hd;
 static int g_marginArt = 3; // beside centred screens: 0 black, 1 blurred edge, 2 tiled texture, 3 extended background
 static BOOL g_screenOnTop, g_mapOnTop;
 static BYTE *g_topScreen; // the screen on top, as last seen by watch_screens
-static BOOL g_hdNative = TRUE; // full-screen paintings shown at the display's resolution (HDNative)
+static BOOL g_hdNative = TRUE;
+static BOOL g_mapSprites; // experimental: HD art for map units (HDMapSprites), off by default // full-screen paintings shown at the display's resolution (HDNative)
 static char g_gameDir[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
@@ -2915,7 +2916,7 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 	{
 		int most = 0, all = 0;
 		for (int v = 0; v < 256; v++) { all += counts[v]; if (counts[v] > most) { most = counts[v]; bg = v; } }
-		if (most * 100 < all * 30) bg = -1;
+		if (most * 100 < all * 30 || !g_mapSprites) bg = -1; // (only with the experimental map sprites)
 	}
 	// Four rows first: most archive pictures differ on those already, and only the rest are
 	// compared in full (the full comparison of every candidate took about 4 ms per sprite drawn).
@@ -2974,7 +2975,7 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 		// Two archive pictures that both fit (animation frames, colour variants) cannot be told
 		// apart reliably unless the winner is near-exact or clearly ahead of the runner-up.
 		// (The same picture stored in two archives is not a real tie.)
-		BOOL twin = second >= 0 && g_hdIndex[second].data8 && !memcmp(g_hdIndex[second].data8, g_hdIndex[i].data8, (size_t)w * h);
+		BOOL twin = g_mapSprites && second >= 0 && g_hdIndex[second].data8 && !memcmp(g_hdIndex[second].data8, g_hdIndex[i].data8, (size_t)w * h);
 		if (!twin && bestSame * 100 < sampled * 97 && (bestSame - secondSame) * 100 < sampled * 5) {
 			logf_("HD: %dx%d 8-bit picture is ambiguous (%d%% vs %d%%): left as is", w, h,
 				bestSame * 100 / max(sampled, 1), secondSame * 100 / max(sampled, 1));
@@ -3302,7 +3303,7 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
 	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh)) return;
 	if (dh->biBitCount == 8 && sh->biBitCount == 8) {
-		cache_note_copy(src, dst, sh, dh, sx, sy, w, h, dx, dy, transparent);
+		if (g_mapSprites) cache_note_copy(src, dst, sh, dh, sx, sy, w, h, dx, dy, transparent);
 		return;
 	}
 	if (dh->biBitCount != 16) return;
@@ -4273,7 +4274,7 @@ static void hd_on_exit(void)
 static BOOL hook_draw_transparent(void);
 static void hd_install(void)
 {
-	logf_("HD: sprites drawn onto the window: %s", hook_draw_transparent() ? "hooked" : "NOT hooked");
+	if (g_mapSprites) logf_("HD: sprites drawn onto the window: %s", hook_draw_transparent() ? "hooked" : "NOT hooked");
 	const DWORD thunk = 0x00403125, target = 0x00487790;
 	DWORD *rel = (DWORD *)(thunk + 1), old;
 	if (*(BYTE *)thunk != 0xe9 || thunk + 5 + *rel != target) {
@@ -4381,6 +4382,7 @@ static void install(HMODULE self)
 	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
 	g_hdNative = GetPrivateProfileIntA("Display", "HDNative", 1, ini);
 	g_sharpText = GetPrivateProfileIntA("Display", "SharpText", 1, ini);
+	g_mapSprites = GetPrivateProfileIntA("Display", "HDMapSprites", 0, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 	if (GetPrivateProfileIntA("Debug", "LogCrashes", 1, ini)) AddVectoredExceptionHandler(1, log_crash);
 
