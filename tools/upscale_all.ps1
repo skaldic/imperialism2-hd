@@ -16,6 +16,8 @@ param(
     [double]$Grain = 0.75,              # share of a plain enlargement used away from outlines (0 = none)
     [double]$EdgeLow = 8,               # blurred-brightness step below which nothing counts as an outline
     [double]$EdgeHigh = 20,            # ... and at which it fully does
+    [string]$Model = 'realesrgan-x4plus', # or realesrgan-x4plus-anime: sharper on small drawn figures
+    [switch]$SpritesOnly,               # only pictures with transparency (units, buildings, icons)
     [switch]$NewOnly                    # skip pictures whose upscaled version is already up to date
 )
 
@@ -291,12 +293,13 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
         }
         $w = 0; $h = 0
         $mask = [KeyedUpscale]::Prepare($file.FullName, "$tempIn\$($file.Name)", [ref]$w, [ref]$h)
+        if ($SpritesOnly -and $null -eq $mask) { Remove-Item -LiteralPath "$tempIn\$($file.Name)"; continue }
         $tile = $null -eq $mask -and $Terrain -contains $dir.Name -and $w -eq 64 -and $h -eq 64
         if ($tile) { [KeyedUpscale]::PrepareTile($file.FullName, "$tempIn\$($file.Name)") }
         $info[$file.Name] = @{ Mask = $mask; W = $w; H = $h; Tile = $tile; Source = $file.FullName }
     }
     if ($info.Count -eq 0) { continue }
-    & $Upscaler -i $tempIn -o $tempOut -n realesrgan-x4plus -s 4 -f png 2>$null
+    & $Upscaler -i $tempIn -o $tempOut -n $Model -s 4 -f png 2>$null
 
     $done = 0
     foreach ($name in $info.Keys) {
