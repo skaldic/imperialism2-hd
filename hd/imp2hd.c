@@ -62,6 +62,7 @@ static BOOL g_hd;
 static int g_marginArt = 3; // beside centred screens: 0 black, 1 blurred edge, 2 tiled texture, 3 extended background
 static BOOL g_screenOnTop, g_mapOnTop;
 static BYTE *g_topScreen; // the screen on top, as last seen by watch_screens
+static BOOL g_hdNative = TRUE; // full-screen paintings shown at the display's resolution (HDNative)
 static char g_gameDir[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
@@ -765,7 +766,7 @@ static const GeneratedArt *generated_art(short id)
 	snprintf(path, sizeof path, "%sdecomp\\assets\\x2\\_wide\\%d.png", g_gameDir, id);
 	if (slot->px1) slot->px2 = hd_load_png(path, g_gameW * 2, GAME_H * 2);
 	snprintf(path, sizeof path, "%sdecomp\\assets\\x4\\_wide\\%d.png", g_gameDir, id);
-	if (slot->px1 && g_hd) slot->px4 = hd_load_png(path, g_gameW * 4, GAME_H * 4);
+	if (slot->px1 && g_hd && g_hdNative) slot->px4 = hd_load_png(path, g_gameW * 4, GAME_H * 4);
 	logf_("painted-out picture %d: %s, 2x %s, 4x %s", id, slot->px1 ? "loaded" : "missing",
 		slot->px2 ? "loaded" : "missing", slot->px4 ? "loaded" : "missing");
 	return slot->px1 ? slot : NULL;
@@ -3438,7 +3439,7 @@ static BOOL prepare_view_art(const GeneratedArt *art, short id)
 
 static BOOL quad_present(HDC dst, HDC src, int x0, int y0, int x1, int y1, int width, DWORD rop)
 {
-	if (!g_hd || g_offsetX || !g_topScreen || !g_main.frame || rop != SRCCOPY || width != g_gameW) return FALSE;
+	if (!g_hd || !g_hdNative || g_offsetX || !g_topScreen || !g_main.frame || rop != SRCCOPY || width != g_gameW) return FALSE;
 	WidePicture *wide = wide_picture(g_topScreen);
 	if (!wide || wide->picture != g_topScreen || !wide->look.generated || VIEW_INT(g_topScreen, 0x2c) != 0) return FALSE;
 	const GeneratedArt *art = generated_art(wide->look.generated);
@@ -3733,6 +3734,7 @@ static void install(HMODULE self)
 	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 1, ini);
 	g_autoUpscale = GetPrivateProfileIntA("Display", "HDAutoUpscale", 1, ini);
 	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
+	g_hdNative = GetPrivateProfileIntA("Display", "HDNative", 1, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 	if (GetPrivateProfileIntA("Debug", "LogCrashes", 1, ini)) AddVectoredExceptionHandler(1, log_crash);
 

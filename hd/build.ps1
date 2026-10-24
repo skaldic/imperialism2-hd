@@ -9,6 +9,6 @@ if ($LASTEXITCODE -ne 0) { throw "build failed" }
 "built $out ($((Get-Item $out).Length) bytes)"
 
 if ($Install) {
-    Copy-Item $out "$PSScriptRoot\..\..\ddraw.dll" -Force
+    Copy-Item $out "$PSScriptRoot\..\..\ddraw.dll" -Force -ErrorAction Stop
     "installed to game folder"
 }
