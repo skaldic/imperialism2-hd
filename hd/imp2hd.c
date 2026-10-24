@@ -3881,6 +3881,19 @@ static int text_hd_draw(HDC dc, LPCSTR s, int n, LPRECT r, UINT f, BOOL *handled
 	return result;
 }// The game sometimes copies a piece of the map buffer straight to the window (the hover outline,
 // the blinking unit). Show it from the map's 2x frame so those tiles do not drop out of HD.
+// Two 5-5-5 colours that differ by at most four steps in each channel. The blink picture is drawn
+// with a slightly different palette from the map (more saturated), so only the highlight outline,
+// which is far from anything on the map, fails to match.
+static BOOL near555(WORD a, WORD b)
+{
+	for (int shift = 0; shift <= 10; shift += 5)
+		if (abs((int)((a >> shift) & 31) - (int)((b >> shift) & 31)) > 4) return FALSE;
+	return TRUE;
+}
+
+static int g_mapToBufferX, g_mapToBufferY;
+static BOOL g_mapToBufferKnown;
+
 static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
 {
 	int mw, mh, stride;
@@ -3891,6 +3904,10 @@ static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int s
 	POINT m = { sx, sy };
 	LPtoDP(src, &m, 1);
 	surface_compose(&g_map, mapBits, stride, bottomUp, m.x, m.y, m.x + w, m.y + h);
+	// Where the window's pixels are in the map buffer, for the selection blink.
+	g_mapToBufferX = m.x - x;
+	g_mapToBufferY = m.y - y;
+	g_mapToBufferKnown = TRUE;
 	int mode = g_twoStage ? SetStretchBltMode(dst, COLORONCOLOR) : 0;
 	BOOL ok = StretchBlt(dst, x, y, w, h, g_map.dc, m.x * 2, m.y * 2, w * 2, h * 2, SRCCOPY);
 	if (mode) SetStretchBltMode(dst, mode);
@@ -3950,7 +3967,9 @@ static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int
 		const WORD *pixels = (const WORD *)bits;
 		int stride = ds.dsBm.bmWidthBytes / 2;
 		// Where this rectangle lies in the map buffer, which has a 64-pixel margin.
-		int mx0 = x - MAP_VIEW_X + 64, my0 = y - MAP_VIEW_Y + 64;
+		// (The map buffer scrolls: its offset is the one last used to show it.)
+		int mx0 = g_mapToBufferKnown ? x + g_mapToBufferX : x - MAP_VIEW_X + 64;
+		int my0 = g_mapToBufferKnown ? y + g_mapToBufferY : y - MAP_VIEW_Y + 64;
 		// The row order reported for these bitmaps is not reliable: ask GDI for a few pixels and
 		// see which order agrees with them.
 		int agree[2] = { 0, 0 };
@@ -3972,7 +3991,7 @@ static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int
 				DWORD *out = scratch + (size_t)row * 2 * SMALL_MAX * 2 + col * 2;
 				if (mx >= 0 && my >= 0 && mx < g_map.w && my < g_map.h) {
 					size_t at = (size_t)my * g_map.w + mx;
-					if (g_map.state[at] == 1 && g_map.shadow[at] == p) {
+					if (g_map.state[at] == 1 && near555(g_map.shadow[at], p)) {
 						const DWORD *from = g_map.frame + (size_t)my * 2 * g_map.w * 2 + mx * 2;
 						out[0] = from[0]; out[1] = from[1];
 						out[SMALL_MAX * 2] = from[g_map.w * 2]; out[SMALL_MAX * 2 + 1] = from[g_map.w * 2 + 1];
