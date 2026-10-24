@@ -258,4 +258,37 @@ public static class ImageOps
                 px[y * w + x0 + x] = FromLab(T[0][i] + (L - T[0][i]) * t, T[1][i] + (A - T[1][i]) * t, T[2][i] + (B - T[2][i]) * t);
             }
     }
+
+    // Unsharp mask on the sprite's own pixels: each colour channel moved away from a small blur by
+    // `amount`. Pixels of the key colour (magenta, transparent) are left alone and do not count in
+    // the blur, so the sprite's edge does not pick up a pink fringe.
+    public static void SharpenSprite(int[] px, int w, int h, double amount, int key)
+    {
+        var src = (int[])px.Clone();
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int i = y * w + x, p = src[i];
+                if ((p & 0xffffff) == key) continue;
+                double r = 0, g = 0, b = 0, n = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int xx = x + dx, yy = y + dy;
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        int q = src[yy * w + xx];
+                        if ((q & 0xffffff) == key) continue;
+                        double wt = dx == 0 && dy == 0 ? 4 : dx == 0 || dy == 0 ? 2 : 1;
+                        r += ((q >> 16) & 255) * wt; g += ((q >> 8) & 255) * wt; b += (q & 255) * wt; n += wt;
+                    }
+                r /= n; g /= n; b /= n;
+                int nr = Clamp((int)Math.Round(((p >> 16) & 255) + amount * (((p >> 16) & 255) - r)));
+                int ng = Clamp((int)Math.Round(((p >> 8) & 255) + amount * (((p >> 8) & 255) - g)));
+                int nb = Clamp((int)Math.Round((p & 255) + amount * ((p & 255) - b)));
+                if ((nr << 16 | ng << 8 | nb) == key) nb--; // never turn a pixel into the key
+                px[i] = (int)(0xff000000u | (uint)(nr << 16 | ng << 8 | nb));
+            }
+    }
+
+    static int Clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 }
