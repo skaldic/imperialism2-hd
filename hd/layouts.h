@@ -167,6 +167,14 @@ static const ScreenLayout g_screenLayouts[] = {
 		},
 		0, 0, 4502,
 	},
+	{
+		// The deals report: two scrolls on a dark etched wall. The scrolls and the views on them
+		// stay where they are and the wall is painted out either side (tools\outpaint.ps1).
+		"deals", "TDealBookPicture", LID('m', 'a', 'i', 'n'), LID('s', 'o', 'l', 'd'), 800, 600, {
+			{ 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } },
+		},
+		0, 0, 8800,
+	},
 	// (No layout for the technology screen: both its panels are filled edge to edge by controls
 	// and its frame is too thin to take the width, so it stays centred.)
 	{

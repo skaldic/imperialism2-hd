@@ -16,7 +16,8 @@ param(
     [int]$Seed = 1,
     [int]$Steps = 32,
     [double]$Cfg = 6.5,
-    [int]$Feather = 6,
+    [int]$Feather = 12,
+    [int]$Overlap = 10,                           # columns of the picture repainted beside each strip
     [string]$Sd = "D:\Tools\sdcpp\bin\sd-cli.exe",
     [string]$Model = "D:\Tools\sdcpp\models\sdxl_inpaint.safetensors",
     [string]$Vae = "D:\Tools\sdcpp\models\sdxl_vae_fp16_fix.safetensors",
@@ -47,8 +48,8 @@ foreach ($strip in $Strips) {
     $init = Resize $crop ($cw * 2) ($ch * 2); $crop.Dispose()
     $initPath = Join-Path $work "$Id-strip-init.png"; $init.Save($initPath, [Drawing.Imaging.ImageFormat]::Png); $init.Dispose()
     $mask = New-Object Drawing.Bitmap ($cw * 2), ($ch * 2); $mg = [Drawing.Graphics]::FromImage($mask); $mg.Clear([Drawing.Color]::Black)
-    $mx = ($sx - $cx - 4) * 2; $my = ($top - $cy - 2) * 2
-    $mg.FillRectangle([Drawing.Brushes]::White, $mx, $my, ($sw + 8) * 2, $ch * 2 - $my); $mg.Dispose()
+    $mx = ($sx - $cx - $Overlap) * 2; $my = ($top - $cy - 2) * 2
+    $mg.FillRectangle([Drawing.Brushes]::White, $mx, $my, ($sw + 2 * $Overlap) * 2, $ch * 2 - $my); $mg.Dispose()
     $maskPath = Join-Path $work "$Id-strip-mask.png"; $mask.Save($maskPath, [Drawing.Imaging.ImageFormat]::Png); $mask.Dispose()
     $out = Join-Path $work "$Id-strip-$sx-seed$Seed.png"
     $ErrorActionPreference = "Continue"
@@ -59,8 +60,8 @@ foreach ($strip in $Strips) {
     $gb = [Drawing.Bitmap]::FromFile($out); $gen = Resize $gb $cw $ch; $gb.Dispose()
     # Paste the strip (and 4 columns either side) back, feathered at its edges.
     for ($y = $top - 2; $y -lt $H; $y++) {
-        for ($x = $sx - 4; $x -lt $sx + $sw + 4; $x++) {
-            $d = [Math]::Min([Math]::Min($x - ($sx - 4), ($sx + $sw + 3) - $x), $y - ($top - 2))
+        for ($x = $sx - $Overlap; $x -lt $sx + $sw + $Overlap; $x++) {
+            $d = [Math]::Min([Math]::Min($x - ($sx - $Overlap), ($sx + $sw + $Overlap - 1) - $x), $y - ($top - 2))
             $t = [Math]::Min(1.0, ($d + 0.5) / $Feather)
             $a = $pic.GetPixel($x, $y); $c = $gen.GetPixel($x - $cx, $y - $cy)
             $pic.SetPixel($x, $y, [Drawing.Color]::FromArgb([int]($a.R + ($c.R - $a.R) * $t), [int]($a.G + ($c.G - $a.G) * $t), [int]($a.B + ($c.B - $a.B) * $t)))
