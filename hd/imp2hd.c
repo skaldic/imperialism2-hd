@@ -3891,6 +3891,17 @@ static BOOL near555(WORD a, WORD b)
 	return TRUE;
 }
 
+// Whether a pixel of the blink picture is the selection outline: white or black where the map has
+// something else. Every other pixel is the map's own, drawn with a slightly different palette.
+static BOOL blink_outline(WORD blink, WORD map)
+{
+	int r = blink >> 10 & 31, g = blink >> 5 & 31, b = blink & 31;
+	int mr = map >> 10 & 31, mg = map >> 5 & 31, mb = map & 31;
+	BOOL white = r >= 26 && g >= 26 && b >= 26, black = r <= 3 && g <= 3 && b <= 3;
+	BOOL mapWhite = mr >= 22 && mg >= 22 && mb >= 22, mapBlack = mr <= 7 && mg <= 7 && mb <= 7;
+	return (white && !mapWhite) || (black && !mapBlack);
+}
+
 static int g_mapToBufferX, g_mapToBufferY;
 static BOOL g_mapToBufferKnown;
 
@@ -3991,7 +4002,7 @@ static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int
 				DWORD *out = scratch + (size_t)row * 2 * SMALL_MAX * 2 + col * 2;
 				if (mx >= 0 && my >= 0 && mx < g_map.w && my < g_map.h) {
 					size_t at = (size_t)my * g_map.w + mx;
-					if (g_map.state[at] == 1 && near555(g_map.shadow[at], p)) {
+					if (g_map.state[at] == 1 && !blink_outline(p, g_map.shadow[at])) {
 						const DWORD *from = g_map.frame + (size_t)my * 2 * g_map.w * 2 + mx * 2;
 						out[0] = from[0]; out[1] = from[1];
 						out[SMALL_MAX * 2] = from[g_map.w * 2]; out[SMALL_MAX * 2 + 1] = from[g_map.w * 2 + 1];
