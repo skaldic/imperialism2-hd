@@ -3881,13 +3881,13 @@ static int text_hd_draw(HDC dc, LPCSTR s, int n, LPRECT r, UINT f, BOOL *handled
 	return result;
 }// The game sometimes copies a piece of the map buffer straight to the window (the hover outline,
 // the blinking unit). Show it from the map's 2x frame so those tiles do not drop out of HD.
-// Two 5-5-5 colours that differ by at most four steps in each channel. The blink picture is drawn
+// Two 5-5-5 colours that differ by at most nine steps in each channel. The blink picture is drawn
 // with a slightly different palette from the map (more saturated), so only the highlight outline,
 // which is far from anything on the map, fails to match.
 static BOOL near555(WORD a, WORD b)
 {
 	for (int shift = 0; shift <= 10; shift += 5)
-		if (abs((int)((a >> shift) & 31) - (int)((b >> shift) & 31)) > 4) return FALSE;
+		if (abs((int)((a >> shift) & 31) - (int)((b >> shift) & 31)) > 9) return FALSE;
 	return TRUE;
 }
 
