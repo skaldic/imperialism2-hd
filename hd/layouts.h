@@ -135,8 +135,14 @@ static const ScreenLayout g_screenLayouts[] = {
 		// panelling on the right. The chest's gilded base runs the full width, so it is lengthened
 		// either side of its middle, in its ornament's repeat.
 		"load and save", "TLoadSavePicture", LID('m', 'a', 'i', 'n'), LID('s', 'l', 't', '0'), 800, 600, {
-			{ 0, 190, { { 25, 128, 0, 25, 'S' }, { 790, 128, 758, 32, 'M' } } },
-			{ 190, 500, { { 25, 128, 0, 25, 'S' }, { 790, 128, 775, 15, 'S' } } },
+			{ 0, 180, { { 25, 128, 0, 25, 'S' }, { 790, 128, 758, 32, 'M' } } },
+			// On the right, everything is added at the picture's edge, from the strip beside
+			// it: the panelling mirrored (its grooves run level), the carpet mirrored too, from the strip
+			// from right of the chest's slanting side, which comes close to the edge lower down.
+			{ 180, 400, { { 25, 128, 0, 25, 'S' }, { 800, 128, 770, 30, 'M' } } },
+			{ 400, 460, { { 25, 128, 0, 25, 'S' }, { 800, 128, 776, 24, 'M' } } },
+			{ 460, 485, { { 25, 128, 0, 25, 'S' }, { 800, 128, 791, 9, 'M' } } },
+			{ 485, 500, { { 25, 128, 0, 25, 'S' }, { 800, 128, 797, 3, 'S' } } },
 			{ 500, 575, { { 200, 128, 100, 101, 'T' }, { 600, 128, 600, 101, 'T' } } },
 			{ 575, 600, { { 200, 128, 190, 10, 'S' }, { 600, 128, 600, 10, 'S' } } },
 		},
