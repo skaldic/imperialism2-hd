@@ -2418,24 +2418,38 @@ static void __attribute__((thiscall)) diplomacy_geometries(BYTE *self)
 	if (moved) VIEW_INT(here, V_X) -= DIPLOMACY_MAP_SHIFT; // the layout moves it for good
 }
 
+// A copy of a function's first `len` bytes (whole instructions that do not depend on where they
+// are) followed by a jump back past them: the original function, callable after redirect().
+static BYTE *make_trampoline(BYTE *site, int len)
+{
+	BYTE *t = VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!t) return NULL;
+	memcpy(t, site, len);
+	t[len] = 0xe9;
+	*(int *)(t + len + 1) = (int)((site + len) - (t + len + 5));
+	return t;
+}
+
+// Replaces a function's first `len` bytes (at least 5) with a jump to `to`.
+static BOOL redirect(BYTE *site, int len, void *to)
+{
+	DWORD old;
+	if (!VirtualProtect(site, len, PAGE_EXECUTE_READWRITE, &old)) return FALSE;
+	site[0] = 0xe9;
+	*(int *)(site + 1) = (int)((BYTE *)to - (site + 5));
+	for (int i = 5; i < len; i++) site[i] = 0x90;
+	VirtualProtect(site, len, old, &old);
+	FlushInstructionCache(GetCurrentProcess(), site, len);
+	return TRUE;
+}
+
 static BOOL hook_diplomacy_geometries(void)
 {
 	BYTE *site = (BYTE *)0x00527c20;
 	static const BYTE expected[] = { 0x6a, 0xff, 0x68 }; // push -1; push <handler>
 	if (memcmp(site, expected, sizeof expected)) return FALSE;
-	g_geometriesRest = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-	if (!g_geometriesRest) return FALSE;
-	memcpy(g_geometriesRest, site, 7);
-	g_geometriesRest[7] = 0xe9;
-	*(int *)(g_geometriesRest + 8) = (int)((site + 7) - (g_geometriesRest + 12));
-	DWORD old;
-	VirtualProtect(site, 7, PAGE_EXECUTE_READWRITE, &old);
-	site[0] = 0xe9;
-	*(int *)(site + 1) = (int)((BYTE *)diplomacy_geometries - (site + 5));
-	site[5] = site[6] = 0x90;
-	VirtualProtect(site, 7, old, &old);
-	FlushInstructionCache(GetCurrentProcess(), site, 7);
-	return TRUE;
+	g_geometriesRest = make_trampoline(site, 7);
+	return g_geometriesRest && redirect(site, 7, (void *)diplomacy_geometries);
 }
 
 static void widen_layout_constants(void)
@@ -2793,6 +2807,7 @@ static DWORD *hd_load_png(const char *path, int w2, int h2)
 // Decoded HD pictures by file, so a picture matched again (a sprite seen over different terrain,
 // for one) is not decoded again. The cache owns the pixels; HdImage entries borrow them.
 typedef struct { DWORD key; DWORD *pixels; size_t bytes; } PngCacheEntry;
+static int g_artGeneration; // bumped when the decoded pictures are freed
 static PngCacheEntry g_pngCache[1024];
 static int g_pngCacheCount;
 static size_t g_pngCacheBytes;
@@ -2804,6 +2819,7 @@ static DWORD *hd_load_cached(const char *path, int w2, int h2)
 	if (g_pngCacheCount >= (int)(sizeof g_pngCache / sizeof g_pngCache[0]) || g_pngCacheBytes > 600u * 1024 * 1024) {
 		// Full: everything that refers to cached pictures is forgotten with them.
 		g_hdImageCount = 0;
+		g_artGeneration++;
 		hd_forget_art();
 		for (int i = 0; i < g_pngCacheCount; i++) free(g_pngCache[i].pixels);
 		g_pngCacheCount = 0;
@@ -2887,7 +2903,20 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0])) hd_make_room();
 	HdImage *img = &g_hdImages[g_hdImageCount++];
 	img->hash = hash; img->w = w; img->h = h; img->bpp = -8; img->pixels = NULL; // -8: matched as a cell
-	int best = -1, bestSame = 0, secondSame = 0, sampled = 0;
+	int best = -1, second = -1, bestSame = 0, secondSame = 0, sampled = 0;
+	// A sprite's cell is mostly its transparent background; counted, it makes any mostly plain
+	// archive picture look like a match. The commonest value of the cell, when it covers much of
+	// it, is taken to be that background and left out of the comparison.
+	int counts[256] = { 0 }, bg = -1;
+	for (int row = 0; row < h; row += rowStep) {
+		const BYTE *mem = bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x;
+		for (int col = 0; col < w; col++) counts[mem[col]]++;
+	}
+	{
+		int most = 0, all = 0;
+		for (int v = 0; v < 256; v++) { all += counts[v]; if (counts[v] > most) { most = counts[v]; bg = v; } }
+		if (most * 100 < all * 30) bg = -1;
+	}
 	// Four rows first: most archive pictures differ on those already, and only the rest are
 	// compared in full (the full comparison of every candidate took about 4 ms per sprite drawn).
 	int quickRows[4] = { h / 8, h * 3 / 8, h * 5 / 8, h * 7 / 8 };
@@ -2896,30 +2925,57 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 		(DWORD)(g_hdIndex[g_hdBySize[at]].w * 65536 + g_hdIndex[g_hdBySize[at]].h) == sizeKey; at++) {
 		int i = g_hdBySize[at];
 		if (g_hdIndex[i].bpp != 8 || !g_hdIndex[i].data8) continue;
-		int quick = 0;
+		int quick = 0, quickCounted = 0;
 		for (int q = 0; q < 4; q++) {
 			int row = quickRows[q];
 			const BYTE *mem = bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x;
 			const BYTE *file = g_hdIndex[i].data8 + (size_t)row * w;
-			for (int col = 0; col < w; col++) quick += mem[col] == file[col];
+			for (int col = 0; col < w; col++) {
+				if (mem[col] == bg) continue;
+				quickCounted++;
+				quick += mem[col] == file[col];
+			}
 		}
-		if (quick * 100 < 4 * w * 60) continue; // far from the 80% needed
+		if (quickCounted > 8 && quick * 100 < quickCounted * 60) continue; // far from the 80% needed
+		// The archive picture's own background, so that figure it has where the cell has background
+		// (a highlighted variant's outline, say) counts against it.
+		int fileCounts[256] = { 0 }, fileBg = -1, fileMost = 0;
+		for (int row = 0; row < h; row += rowStep) {
+			const BYTE *file = g_hdIndex[i].data8 + (size_t)row * w;
+			for (int col = 0; col < w; col++) fileCounts[file[col]]++;
+		}
+		for (int v = 0; v < 256; v++) if (fileCounts[v] > fileMost) { fileMost = fileCounts[v]; fileBg = v; }
 		int same = 0;
 		sampled = 0;
 		for (int row = 0; row < h; row += rowStep) {
 			const BYTE *mem = bits + (size_t)(bottomUp ? pictureH - 1 - (y + row) : y + row) * stride + x;
 			const BYTE *file = g_hdIndex[i].data8 + (size_t)row * w;
-			for (int col = 0; col < w; col++) same += mem[col] == file[col];
-			sampled += w;
+			for (int col = 0; col < w; col++) {
+				BOOL memBg = mem[col] == bg, fBg = bg >= 0 && file[col] == fileBg;
+				if (memBg && fBg) continue;
+				same += !memBg && !fBg && mem[col] == file[col];
+				sampled++;
+			}
 		}
-		if (same > bestSame) { secondSame = bestSame; bestSame = same; best = i; }
-		else if (same > secondSame) secondSame = same;
+		if (sampled < 16) continue; // next to nothing to compare
+		same = (int)((long long)same * 1000 / sampled); // as parts per thousand, comparable between candidates
+		sampled = 1000;
+		if (same > bestSame) { secondSame = bestSame; second = best; bestSame = same; best = i; }
+		else if (same > secondSame) { secondSame = same; second = i; }
+	}
+	if (g_dumpViews) {
+		static int cellLogs;
+		if (cellLogs++ < 200) logf_("cell %dx%d at %d,%d of %dx%d: best %s\\%d %d%%, second %d %d%%", w, h, x, y, pictureW, pictureH,
+			best >= 0 ? g_hdIndex[best].archive : "-", best >= 0 ? g_hdIndex[best].id : 0, bestSame * 100 / max(sampled, 1),
+			second >= 0 ? g_hdIndex[second].id : 0, secondSame * 100 / max(sampled, 1));
 	}
 	for (int i = best; i >= 0 && i == best; i++) {
 		if (bestSame * 100 < sampled * 80) break; // under 80% agreement: not the same picture
 		// Two archive pictures that both fit (animation frames, colour variants) cannot be told
 		// apart reliably unless the winner is near-exact or clearly ahead of the runner-up.
-		if (bestSame * 100 < sampled * 97 && (bestSame - secondSame) * 100 < sampled * 5) {
+		// (The same picture stored in two archives is not a real tie.)
+		BOOL twin = second >= 0 && g_hdIndex[second].data8 && !memcmp(g_hdIndex[second].data8, g_hdIndex[i].data8, (size_t)w * h);
+		if (!twin && bestSame * 100 < sampled * 97 && (bestSame - secondSame) * 100 < sampled * 5) {
 			logf_("HD: %dx%d 8-bit picture is ambiguous (%d%% vs %d%%): left as is", w, h,
 				bestSame * 100 / max(sampled, 1), secondSame * 100 / max(sampled, 1));
 			break;
@@ -3128,6 +3184,101 @@ static BOOL hd_ready(void)
 	return TRUE;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Units in cached map tiles
+//
+// The game paints units (and other sprites) into its 8-bit cache of finished map tiles and then
+// copies whole tiles to the map, so a unit reaches the map as part of a tile, whose HD version is
+// a generic upscale of the whole tile. Each sprite painted into a cache cell is recorded with its
+// own HD art, and drawn over the tile's HD version when the cell is copied to the map.
+
+#define CACHE_OVERLAYS 2048
+typedef struct {
+	const BYTE *cache;     // the cache bitmap's pixels
+	int cellX, cellY;      // the cell's top-left in it
+	const DWORD *art;      // 2x sprite art
+	int aw, ax, ay;        // its width, and where the drawn rectangle starts in it (1x units)
+	int ox, oy, w, h;      // where the rectangle lies in the cell
+	BYTE mask[64 * 64];    // which pixels of the rectangle the game drew
+	int generation;        // of the HD art cache, so freed art is never used
+} CacheOverlay;
+static CacheOverlay *g_overlays;
+static int g_overlayCount;
+
+static void cache_forget_cell(const BYTE *cache, int cellX, int cellY)
+{
+	for (int i = 0; i < g_overlayCount;) {
+		if (g_overlays[i].cache == cache && g_overlays[i].cellX == cellX && g_overlays[i].cellY == cellY)
+			g_overlays[i] = g_overlays[--g_overlayCount];
+		else i++;
+	}
+}
+
+static void cache_note_copy(BYTE *src, BYTE *dst, const BITMAPINFOHEADER *sh, const BITMAPINFOHEADER *dh,
+	int sx, int sy, int w, int h, int dx, int dy, DWORD transparent)
+{
+	if (!g_hd || (dh->biHeight != 64 && dh->biHeight != -64)) return; // only the tile cache sheets
+	const BYTE *cache = *(const BYTE **)(dst + 0x0c), *srcBits = *(const BYTE **)(src + 0x0c);
+	if (!cache || !srcBits || w <= 0 || h <= 0 || w > 64 || h > 64) return;
+	int cellX = dx >= 0 ? dx / 64 * 64 : -1, cellY = 0;
+	if (cellX < 0 || dx + w > cellX + 64 || dy < 0 || dy + h > 64) return;
+	if (transparent == 0xffffffff) {
+		// The tile's own pictures are laid down first: whatever was recorded there is gone.
+		if (w == 64 && h == 64) cache_forget_cell(cache, cellX, cellY);
+		return;
+	}
+	if (!g_overlays) g_overlays = calloc(CACHE_OVERLAYS, sizeof *g_overlays);
+	if (!g_overlays) return;
+	int pw = sh->biWidth, ph = abs(sh->biHeight);
+	BOOL bottomUp8 = sh->biHeight > 0;
+	if (sx < 0 || sy < 0 || sx + w > pw || sy + h > ph) return;
+	const HdImage *art = hd_find(srcBits, pw, ph, 8);
+	int ax = sx, ay = sy, aw = pw;
+	if (!art) { art = hd_find_cell(srcBits, pw, ph, bottomUp8, sx, sy, w, h); ax = 0; ay = 0; aw = w; }
+	if (!art || !art->pixels) return;
+	if (g_overlayCount >= CACHE_OVERLAYS) g_overlayCount = 0; // full: start over (cells are rebuilt often)
+	CacheOverlay *o = &g_overlays[g_overlayCount++];
+	o->cache = cache; o->cellX = cellX; o->cellY = cellY;
+	o->art = art->pixels; o->aw = aw; o->ax = ax; o->ay = ay;
+	o->ox = dx - cellX; o->oy = dy - cellY; o->w = w; o->h = h;
+	o->generation = g_artGeneration;
+	BYTE key = (BYTE)transparent;
+	int sstride = (pw + 3) & ~3;
+	for (int y = 0; y < h; y++) {
+		const BYTE *row = srcBits + (size_t)(bottomUp8 ? ph - 1 - (sy + y) : sy + y) * sstride + sx;
+		for (int x = 0; x < w; x++) o->mask[y * 64 + x] = row[x] != key;
+	}
+}
+
+// Draws the sprites recorded for a cache cell into a 2x picture (w by h 1x pixels, rows of
+// `stride` 2x pixels) where the cell's top-left lands at (mx, my).
+static void cache_draw_overlays_into(const BYTE *cache, int cellX, int cellY, DWORD *frame2x, int stride, int w, int h, int mx, int my)
+{
+	for (int i = 0; i < g_overlayCount; i++) {
+		const CacheOverlay *o = &g_overlays[i];
+		if (o->cache != cache || o->cellX != cellX || o->cellY != cellY || o->generation != g_artGeneration) continue;
+		for (int y = 0; y < o->h; y++) {
+			int fy = my + o->oy + y;
+			if (fy < 0 || fy >= h) continue;
+			for (int x = 0; x < o->w; x++) {
+				if (!o->mask[y * 64 + x]) continue;
+				int fx = mx + o->ox + x;
+				if (fx < 0 || fx >= w) continue;
+				for (int half = 0; half < 2; half++) {
+					const DWORD *from = o->art + (size_t)((o->ay + y) * 2 + half) * o->aw * 2 + (o->ax + x) * 2;
+					DWORD *to = frame2x + (size_t)(fy * 2 + half) * stride + fx * 2;
+					for (int k = 0; k < 2; k++) if ((from[k] & 0xffffff) != HD_KEY) to[k] = from[k];
+				}
+			}
+		}
+	}
+}
+
+// After a cache cell has been copied to the map buffer at (mx, my) with its tile's HD art.
+static void cache_draw_overlays(const BYTE *cache, int cellX, int cellY, HdSurface *s, int mx, int my)
+{
+	cache_draw_overlays_into(cache, cellX, cellY, s->frame, s->w * 2, s->w, s->h, mx, my);
+}
 static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, int h, int dx, int dy, DWORD transparent);
 
 static void __attribute__((thiscall)) hd_copy_pixels(BYTE *src, BYTE *dst, int sx, int sy, int w, int h,
@@ -3149,8 +3300,12 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	if (!readable(src, 0x14) || !readable(dst, 0x14) || !hd_ready()) return;
 	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
 	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
-	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh) || dh->biBitCount != 16) return;
-
+	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh)) return;
+	if (dh->biBitCount == 8 && sh->biBitCount == 8) {
+		cache_note_copy(src, dst, sh, dh, sx, sy, w, h, dx, dy, transparent);
+		return;
+	}
+	if (dh->biBitCount != 16) return;
 	// Only copies into the frame or the map buffer are of interest.
 	HdSurface *s = NULL;
 	if (dh->biWidth == g_main.w && abs(dh->biHeight) == g_main.h) s = &g_main;
@@ -3181,7 +3336,9 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	BOOL keyed = transparent != 0xffffffff, eight = sh->biBitCount == 8;
 	const DWORD *pixels = NULL;
 	int ax = sx, ay = sy, aw = pw;
+	BOOL tileCell = FALSE;
 	if (s == &g_map && eight && !keyed && w == 64 && h == 64) {
+		tileCell = TRUE;
 		pixels = tile_art(srcBits, pw, ph, bottomUp8, sx, sy, frame, stride, bottomUp, s->h, dx, dy);
 		ax = 0; ay = 0; aw = 64;
 	} else if (sh->biBitCount == 16 && !keyed) {
@@ -3217,6 +3374,9 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 			for (int half = 0; half < 2; half++) {
 				memcpy(s->frame + (size_t)((dy + y) * 2 + half) * s->w * 2 + dx * 2,
 					pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + ax * 2, (size_t)w * 8);
+			}
+			if (tileCell && y == h - 1) {
+				cache_draw_overlays(srcBits, sx, sy, s, dx, dy);
 			}
 			continue;
 		}
@@ -3964,6 +4124,8 @@ static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int
 		if (!art) art = tile_art(bits, bw, bh, !bottomUp, sx, sy, NULL, 0, FALSE, 0, 0, 0);
 		if (!art) return FALSE;
 		for (int row = 0; row < 128; row++) memcpy(scratch + (size_t)row * SMALL_MAX * 2, art + row * 128, 128 * 4);
+		// With the units painted into this cell drawn from their own HD art (see cache_note_copy).
+		cache_draw_overlays_into(bits, sx, sy, scratch, SMALL_MAX * 2, 64, 64, 0, 0);
 	} else if (ds.dsBm.bmBitsPixel == 16) {
 		const WORD *pixels = (const WORD *)bits;
 		int stride = ds.dsBm.bmWidthBytes / 2;
@@ -4022,6 +4184,66 @@ static BOOL hd_small_to_window(HDC dst, int x, int y, int w, int h, HDC src, int
 	return ok;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Sprites drawn straight onto the window
+//
+// Units on the map (and other animated sprites) are drawn by CDib::DrawTransparent: it reads the
+// spot back from the window, paints the sprite into it at 1x with magenta as the transparent
+// colour, and puts it back. Shown that way a unit is the 1x sprite enlarged. When the sprite has
+// HD art it is drawn instead from that, at 2x, with the same transparent colour.
+
+static BYTE *g_drawTransparentRest;
+
+typedef int (__attribute__((thiscall)) *DrawTransparentFn)(void *dib, void *cdc, DWORD key, int dx, int dy, int dw, int dh,
+	int sx, int sy, int sw, int sh);
+
+static BOOL hd_transparent_to_window(BYTE *dib, HDC dc, int dx, int dy, int dw, int dh, int sx, int sy, int sw, int sh)
+{
+	static HDC spriteDC;
+	static DWORD *spriteBits;
+	if (!g_hd || !scaled() || !is_game_window(WindowFromDC(dc)) || dw != sw || dh != sh) return FALSE;
+	if (dw <= 0 || dh <= 0 || dw > SMALL_MAX || dh > SMALL_MAX || !hd_ready()) return FALSE;
+	if (!readable(dib, 0x14)) return FALSE;
+	const BITMAPINFOHEADER *bh = *(const BITMAPINFOHEADER **)(dib + 0x10);
+	const BYTE *bits = *(const BYTE **)(dib + 0x0c);
+	if (!readable(bh, sizeof *bh) || !bits || (bh->biBitCount != 8 && bh->biBitCount != 16)) return FALSE;
+	int pw = bh->biWidth, ph = abs(bh->biHeight);
+	if (sx < 0 || sy < 0 || sx + sw > pw || sy + sh > ph) return FALSE;
+	const HdImage *art = hd_find(bits, pw, ph, bh->biBitCount);
+	int ax = sx, ay = sy, aw = pw;
+	if (!art && bh->biBitCount == 8) { art = hd_find_cell(bits, pw, ph, bh->biHeight > 0, sx, sy, sw, sh); ax = 0; ay = 0; aw = sw; }
+	if (!art || !art->pixels) return FALSE;
+	if (!spriteDC) spriteDC = dib_dc(SMALL_MAX * 2, SMALL_MAX * 2, &spriteBits);
+	if (!spriteDC) return FALSE;
+	for (int y = 0; y < dh * 2; y++)
+		memcpy(spriteBits + (size_t)y * SMALL_MAX * 2, art->pixels + (size_t)(ay * 2 + y) * aw * 2 + ax * 2, sizeof(DWORD) * dw * 2);
+	GdiFlush();
+	ensure_mapped(dc);
+	int mode = SetStretchBltMode(dc, COLORONCOLOR);
+	BOOL ok = TransparentBlt(dc, dx, dy, dw, dh, spriteDC, 0, 0, dw * 2, dh * 2, RGB(255, 0, 255));
+	SetStretchBltMode(dc, mode);
+	return ok;
+}
+
+static int __attribute__((thiscall)) draw_transparent(BYTE *dib, BYTE *cdc, DWORD key, int dx, int dy, int dw, int dh,
+	int sx, int sy, int sw, int sh)
+{
+	HDC dc = readable(cdc, 8) ? *(HDC *)(cdc + 4) : NULL;
+	BOOL done = dc && key == 0xff00ff && hd_transparent_to_window(dib, dc, dx, dy, dw, dh, sx, sy, sw, sh);
+	if (done) return 1;
+	return ((DrawTransparentFn)g_drawTransparentRest)(dib, cdc, key, dx, dy, dw, dh, sx, sy, sw, sh);
+}
+
+// The function starts "push -1; push <handler>" (7 bytes), copied out and replaced by a jump.
+static BOOL hook_draw_transparent(void)
+{
+	BYTE *site = (BYTE *)0x004861c0;
+	static const BYTE expected[] = { 0x6a, 0xff, 0x68 };
+	if (memcmp(site, expected, sizeof expected)) return FALSE;
+	g_drawTransparentRest = make_trampoline(site, 7);
+	return g_drawTransparentRest && redirect(site, 7, (void *)draw_transparent);
+}
+
 // When the game closes after meeting new map tiles, upscale them in the background so they are
 // HD on the next run. Runs tools\upscale_all.ps1 from the folder the assets live in.
 static BOOL g_autoUpscale = TRUE;
@@ -4048,8 +4270,10 @@ static void hd_on_exit(void)
 	}
 }
 
+static BOOL hook_draw_transparent(void);
 static void hd_install(void)
 {
+	logf_("HD: sprites drawn onto the window: %s", hook_draw_transparent() ? "hooked" : "NOT hooked");
 	const DWORD thunk = 0x00403125, target = 0x00487790;
 	DWORD *rel = (DWORD *)(thunk + 1), old;
 	if (*(BYTE *)thunk != 0xe9 || thunk + 5 + *rel != target) {
