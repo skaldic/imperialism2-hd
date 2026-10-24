@@ -738,6 +738,35 @@ static WidePicture *wide_picture(const BYTE *picture)
 
 static void layout_stretch_fill(BYTE *src, BYTE *dst, int sx, int sw, int top, int bottom, int dx, int dy,
 	int dw, int clipLeft, int clipRight);
+static DWORD *hd_load_png(const char *path, int w2, int h2);
+static BOOL hd_ready(void);
+
+#define GENERATED_BLEND 48 // columns of crossfade into the original; must match tools\outpaint.ps1
+// Painted-out screens (layouts.h, 'G'): the 1x picture, and its 2x upscale when there is one.
+typedef struct { short id; BOOL tried; DWORD *px1, *px2; } GeneratedArt;
+static GeneratedArt g_generated[8];
+static char g_gameDir[MAX_PATH];
+
+static const GeneratedArt *generated_art(short id)
+{
+	if (!id) return NULL;
+	GeneratedArt *slot = NULL;
+	for (int i = 0; i < 8; i++) {
+		if (g_generated[i].id == id) return g_generated[i].px1 ? &g_generated[i] : NULL;
+		if (!slot && !g_generated[i].id) slot = &g_generated[i];
+	}
+	if (!slot) return NULL;
+	slot->id = id;
+	char path[MAX_PATH];
+	snprintf(path, sizeof path, "%sdecomp\\assets\\wide\\%d.png", g_gameDir, id);
+	slot->px1 = hd_load_png(path, g_gameW, GAME_H);
+	snprintf(path, sizeof path, "%sdecomp\\assets\\x2\\_wide\\%d.png", g_gameDir, id);
+	if (slot->px1) slot->px2 = hd_load_png(path, g_gameW * 2, GAME_H * 2);
+	logf_("painted-out picture %d: %s, 2x %s", id, slot->px1 ? "loaded" : "missing", slot->px2 ? "loaded" : "missing");
+	return slot->px1 ? slot : NULL;
+}
+
+static void generated_fill(short id, BYTE *dst, int x, int w, int top, int bottom, int ox, int oy);
 
 // Picks the fill for the artwork a picture shows now: a variant entry for that artwork if there
 // is one, or else the picture's own layout.
@@ -752,6 +781,7 @@ static void choose_look(WidePicture *wide, short artwork)
 			layout_valid(v)) look = v;
 	}
 	wide->look = *look;
+	if (wide->look.generated && !generated_art(wide->look.generated)) wide->look.generated = 0; // fall back
 	wide->lookPicture = artwork;
 	for (int b = 0; b < LAYOUT_MAX_BANDS && look->bands[b].bottom; b++)
 		layout_band_map(&wide->look, &wide->look.bands[b], wide->map[b]);
@@ -785,9 +815,34 @@ static void __attribute__((thiscall)) layout_background_draw(BYTE *self, const i
 		int left = max(area[0], 0), right = min(area[2], width);
 		for (int x = left; x < right;) {
 			int run = 1;
+			if (map[x] < 0) {
+				// Generated columns, from the painted-out picture.
+				while (x + run < right && map[x + run] < 0) run++;
+				generated_fill(s->generated, dst, x, run, top, bottom, originX, originY);
+				x += run;
+				continue;
+			}
 			while (x + run < right && map[x + run] == map[x] + run) run++;
 			copy(src, dst, map[x], top, run, bottom - top, originX + x, originY + top, 0xffffffff);
 			x += run;
+		}
+		// Beside each painted-out stretch, the painted-out picture also covers a band of the
+		// original: there it holds a crossfade from the original into the generated part
+		// (tools\outpaint.ps1), which hides the join.
+		if (s->generated) {
+			int before = 0;
+			for (int i = 0; i < LAYOUT_MAX_INSERTS && s->bands[b].ins[i].width; i++) {
+				const LayoutInsert *in = &s->bands[b].ins[i];
+				if (in->mode == 'G') {
+					int start = in->at + before, end = start + in->width;
+					int bands[2][2] = { { start - GENERATED_BLEND, start }, { end, end + GENERATED_BLEND } };
+					for (int k = 0; k < 2; k++) {
+						int l = max(max(bands[k][0], left), 0), r = min(bands[k][1], right);
+						if (r > l) generated_fill(s->generated, dst, l, r - l, top, bottom, originX, originY);
+					}
+				}
+				before += in->width;
+			}
 		}
 		// Stretched columns were copied as repeats of the nearest source column; they are redrawn
 		// blended between neighbours.
@@ -852,6 +907,7 @@ static WidePicture *register_wide_picture(BYTE *picture, BYTE *screen, const Scr
 	slot->screen = screen;
 	slot->layout = *layout;
 	slot->look = *layout;
+	if (slot->look.generated && !generated_art(slot->look.generated)) slot->look.generated = 0; // fall back
 	slot->lookPicture = -1;
 	for (int b = 0; b < LAYOUT_MAX_BANDS && layout->bands[b].bottom; b++)
 		layout_band_map(&slot->look, &slot->look.bands[b], slot->map[b]);
@@ -2451,7 +2507,7 @@ static void trace_picture_copies(void)
 typedef struct { DWORD hash, tight; int w, h, bpp, id; char archive[24]; BYTE *data8; } HdIndexEntry;
 typedef struct { DWORD hash; int w, h, bpp; DWORD *pixels; } HdImage; // pixels NULL: known to be missing
 
-static char g_hdAssets[MAX_PATH], g_gameDir[MAX_PATH];
+static char g_hdAssets[MAX_PATH];
 static HdIndexEntry *g_hdIndex;
 static int g_hdIndexCount;
 static HdImage g_hdImages[512];
@@ -3019,6 +3075,41 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 			}
 			s->shadow[at + x] = row[x];
 			s->state[at + x] = 1;
+		}
+	}
+}
+
+// Columns [x, x+w) of rows [top, bottom) of a widened picture drawn from its painted-out version,
+// into the frame at origin (ox, oy), and into the HD frame at 2x when there is an upscale.
+static void generated_fill(short id, BYTE *dst, int x, int w, int top, int bottom, int ox, int oy)
+{
+	const GeneratedArt *art = generated_art(id);
+	if (!art || !readable(dst, 0x14)) return;
+	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
+	WORD *frame = *(WORD **)(dst + 0x0c);
+	if (!readable(dh, sizeof *dh) || dh->biBitCount != 16 || !frame) return;
+	int fw = dh->biWidth, fh = abs(dh->biHeight), stride = (fw + 1) & ~1;
+	HdSurface *hd = art->px2 && hd_ready() && fw == g_main.w && fh == g_main.h && g_main.bits == frame ? &g_main : NULL;
+	BOOL tracked = fw == g_main.w && fh == g_main.h && g_main.bits == frame && g_main.state;
+	for (int y = top; y < bottom; y++) {
+		int fy = oy + y;
+		if (fy < 0 || fy >= fh || y >= GAME_H) continue;
+		WORD *row = frame + (size_t)(dh->biHeight > 0 ? fh - 1 - fy : fy) * stride;
+		for (int c = x; c < x + w; c++) {
+			int fx = ox + c;
+			if (fx < 0 || fx >= fw || c >= g_gameW) continue;
+			DWORD p = art->px1[(size_t)y * g_gameW + c];
+			WORD v = (WORD)(((p >> 19) & 31) << 10 | ((p >> 11) & 31) << 5 | ((p >> 3) & 31));
+			row[fx] = v;
+			if (hd) {
+				for (int half = 0; half < 2; half++)
+					memcpy(hd->frame + (size_t)(fy * 2 + half) * hd->w * 2 + fx * 2,
+						art->px2 + (size_t)(y * 2 + half) * g_gameW * 2 + c * 2, 8);
+				hd->shadow[(size_t)fy * hd->w + fx] = v;
+				hd->state[(size_t)fy * hd->w + fx] = 1;
+			} else if (tracked) {
+				g_main.state[(size_t)fy * g_main.w + fx] = 0;
+			}
 		}
 	}
 }

@@ -145,6 +145,14 @@ map's country shapes and drawing code are generated once at a fixed screen posit
 generator is shown the map view where the layout puts it. `hd/layouttool.c` previews a layout
 offline from the extracted artwork and a view dump (`tools/views_from_log.ps1`).
 
+**Painted-out screens.** Screens that are one painting with nothing plain to lengthen (the main
+menu) are kept whole and centred, and the room is painted out either side by an image model:
+`tools/outpaint.ps1` runs an SDXL inpainting model through
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (Vulkan, so it runs on AMD
+cards too) and joins the result to the original along a seam where the two agree best. The pictures
+are made from your own copy of the game and live in `assets/wide` and `assets/x2/_wide`, like the
+other HD art. Without them those screens fall back to mirrored edges.
+
 **HD artwork.** The game keeps drawing at 1x. Its picture-copy routine is intercepted; when it
 copies a picture for which an upscaled version exists, the same rectangle is also copied at 2x
 into the 2x frame, and the 1x pixels written are remembered. When the frame is shown, pixels that

@@ -12,6 +12,8 @@
 //       would not meet in a plain repeat)
 //   'R' takes short runs of it in a scrambled order (for paper, wood and other texture, where an
 //       exact repeat would show)
+//   'G' takes the columns from a generated picture of the whole widened screen instead (see
+//       generated), falling back to 'M' of src and srcW when there is none
 //   'S' stretches it: the stretch, which must start or end at `at`, is drawn `width` columns wider
 //       (for fabric and shading, where any repeat of a fold would show)
 // Every band of a screen inserts the same total, LAYOUT_EXTRA. Views are shifted by the insertions
@@ -42,6 +44,9 @@ typedef struct {
 	// Pictures over the background keep their size and move with their middle, instead of being
 	// lengthened like the background under them (for panels with no plain stretch of their own).
 	char fixedPictures;
+	// The widened screen painted out by an image model, at 1x: assets/wide/<generated>.png at the
+	// widened size, and its upscale assets/x2/_wide/<generated>.png, for 'G' insertions.
+	short generated;
 
 } ScreenLayout;
 
@@ -146,6 +151,15 @@ static const ScreenLayout g_screenLayouts[] = {
 			{ 500, 575, { { 200, 128, 100, 101, 'T' }, { 600, 128, 600, 101, 'T' } } },
 			{ 575, 600, { { 200, 128, 190, 10, 'S' }, { 600, 128, 600, 10, 'S' } } },
 		},
+	},
+	{
+		// The main menu: one painting of a room, with no plain stretch to lengthen. It is kept
+		// whole and centred, and the room is painted out either side by an image model
+		// (tools\outpaint.ps1).
+		"main menu", "TGameSetupPicture", LID('m', 'a', 'i', 'n'), LID('l', 'o', 'a', 'd'), 800, 600, {
+			{ 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } },
+		},
+		0, 0, 4502,
 	},
 	// (No layout for the technology screen: both its panels are filled edge to edge by controls
 	// and its frame is too thin to take the width, so it stays centred.)
@@ -272,7 +286,9 @@ static void layout_band_map(const ScreenLayout *s, const LayoutBand *band, short
 			int first = in->mode == 'T' ? in->at : in->at - in->width;
 			int phase = ((first - in->src) % in->srcW + in->srcW) % in->srcW;
 			for (int k = 0; k < in->width; k++) map[out++] = (short)(in->src + (phase + k) % in->srcW);
-		} else if (in->mode == 'M') {
+		} else if (in->mode == 'G' && s->generated) {
+			for (int k = 0; k < in->width; k++) map[out++] = -1; // a generated column (drawn by the patch)
+		} else if (in->mode == 'M' || in->mode == 'G') {
 			// A stretch ending at the insertion runs back from it first, one starting there runs
 			// forward first; either way the seams meet their own mirror image. With a width of
 			// twice the stretch both ends join the original artwork unbroken.
