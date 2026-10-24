@@ -20,6 +20,7 @@ param(
     [string]$Model = "D:\Tools\sdcpp\models\sdxl_inpaint.safetensors",
     [string]$Vae = "D:\Tools\sdcpp\models\sdxl_vae_fp16_fix.safetensors",
     [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe",
+    [switch]$Make4x,                             # only (re)make the 4x picture from the 1x and 2x ones
     [int]$Pick = 0                                # with a seed: make that candidate the one used
 )
 $ErrorActionPreference = "Stop"
@@ -40,6 +41,29 @@ function Resize($bmp, $w, $h) {
     $g.InterpolationMode = 'HighQualityBicubic'; $g.PixelOffsetMode = 'HighQuality'
     $g.DrawImage($bmp, 0, 0, $w, $h); $g.Dispose(); $out
 }
+
+function Make-4x {
+    $final1 = Join-Path $assets "wide\$id.png"; $t4 = Join-Path $work "$id-x4.png"
+    # And at 4x, for screens shown at the display's own resolution: the original from the upscaler's
+    # own 4x result, the painted sides from their 2x picture upscaled and halved.
+    New-Item -ItemType Directory -Force (Join-Path $assets "x4\_wide") | Out-Null
+    $ErrorActionPreference = "Continue"
+    & $Upscaler -i $final1 -o $t4 -n realesrgan-x4plus -s 4 -f png 2>&1 | Out-Null
+    $x2path = Join-Path $assets "x2\_wide\$id.png"; $tmp8 = Join-Path $work "$id-x8.png"
+    & $Upscaler -i $x2path -o $tmp8 -n realesrgan-x4plus -s 4 -f png 2>&1 | Out-Null
+    $ErrorActionPreference = "Stop"
+    $x4 = New-Object Drawing.Bitmap ($W * 4), ($H * 4), ([Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $g4 = [Drawing.Graphics]::FromImage($x4)
+    $a = [Drawing.Bitmap]::FromFile($t4); $g4.DrawImage($a, 0, 0, $W * 4, $H * 4); $a.Dispose()
+    $b8 = [Drawing.Bitmap]::FromFile($tmp8); $sides = Resize $b8 ($W * 4) ($H * 4); $b8.Dispose()
+    $g4.DrawImage($sides, (New-Object Drawing.Rectangle 0, 0, ($M * 4), ($H * 4)), (New-Object Drawing.Rectangle 0, 0, ($M * 4), ($H * 4)), 'Pixel')
+    $g4.DrawImage($sides, (New-Object Drawing.Rectangle (($W - $M) * 4), 0, ($M * 4), ($H * 4)), (New-Object Drawing.Rectangle (($W - $M) * 4), 0, ($M * 4), ($H * 4)), 'Pixel')
+    $g4.Dispose(); $sides.Dispose()
+    Save-Png $x4 (Join-Path $assets "x4\_wide\$id.png"); $x4.Dispose()
+    Remove-Item $t4, $tmp8
+    }
+
+if ($Make4x) { Make-4x; "made the 4x picture"; return }
 
 $orig = [Drawing.Bitmap]::FromFile((Resolve-Path (Join-Path $assets "orig\$Picture.png")))
 if ($orig.Width -ne 800 -or $orig.Height -ne $H) { throw "expected an 800x600 picture" }
@@ -160,4 +184,5 @@ $x4 = [Drawing.Bitmap]::FromFile($tmp4)
 $x2 = Resize $x4 ($W * 2) ($H * 2); $x4.Dispose()
 Save-Png $x2 (Join-Path $assets "x2\_wide\$id.png"); $x2.Dispose()
 Remove-Item $tmp4
-"installed $final and its 2x"
+Make-4x
+"installed $final and its 2x and 4x"

@@ -61,10 +61,12 @@ static HWND g_frame, g_view;
 static BOOL g_hd;
 static int g_marginArt = 3; // beside centred screens: 0 black, 1 blurred edge, 2 tiled texture, 3 extended background
 static BOOL g_screenOnTop, g_mapOnTop;
+static BYTE *g_topScreen; // the screen on top, as last seen by watch_screens
 static char g_gameDir[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
+static BOOL quad_present(HDC dst, HDC src, int x0, int y0, int x1, int y1, int width, DWORD rop);
 static void hd_note_gdi_draw(HDC dst, int x, int y, int w, int h);
 static BOOL hd_transfer_map(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
 static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop);
@@ -743,7 +745,7 @@ static BOOL hd_ready(void);
 
 #define GENERATED_BLEND 48 // columns of crossfade into the original; must match tools\outpaint.ps1
 // Painted-out screens (layouts.h, 'G'): the 1x picture, and its 2x upscale when there is one.
-typedef struct { short id; BOOL tried; DWORD *px1, *px2; } GeneratedArt;
+typedef struct { short id; BOOL tried; DWORD *px1, *px2, *px4; } GeneratedArt;
 static GeneratedArt g_generated[8];
 static char g_gameDir[MAX_PATH];
 
@@ -762,7 +764,10 @@ static const GeneratedArt *generated_art(short id)
 	slot->px1 = hd_load_png(path, g_gameW, GAME_H);
 	snprintf(path, sizeof path, "%sdecomp\\assets\\x2\\_wide\\%d.png", g_gameDir, id);
 	if (slot->px1) slot->px2 = hd_load_png(path, g_gameW * 2, GAME_H * 2);
-	logf_("painted-out picture %d: %s, 2x %s", id, slot->px1 ? "loaded" : "missing", slot->px2 ? "loaded" : "missing");
+	snprintf(path, sizeof path, "%sdecomp\\assets\\x4\\_wide\\%d.png", g_gameDir, id);
+	if (slot->px1 && g_hd) slot->px4 = hd_load_png(path, g_gameW * 4, GAME_H * 4);
+	logf_("painted-out picture %d: %s, 2x %s, 4x %s", id, slot->px1 ? "loaded" : "missing",
+		slot->px2 ? "loaded" : "missing", slot->px4 ? "loaded" : "missing");
 	return slot->px1 ? slot : NULL;
 }
 
@@ -1203,6 +1208,7 @@ static void watch_screens(void)
 	// with no screen at all (the intro movies) the 800-wide layout is centred too.
 	int offset = g_gameW > BASE_W && !(top && is_wide_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
 	if (top && is_battle_screen(top)) keep_battlefield_in_picture(top);
+	g_topScreen = top;
 	g_screenOnTop = top != NULL;
 	g_mapOnTop = top && is_map_screen(top);
 	if (offset != g_offsetX) {
@@ -1992,7 +1998,9 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 		// way without filtering. GDI's own smooth mode costs 60-90 ms for a full frame here.
 		BOOL composed = (g_hd || g_twoStage) && rop == SRCCOPY && hd_compose(src, x - 2, y - 2, x + w + 2, y + h + 2);
 		if (g_timing) { LARGE_INTEGER tc; QueryPerformanceCounter(&tc); g_composeTicks += tc.QuadPart - t0.QuadPart; }
-		if (composed) {
+		if (composed && quad_present(dst, src, x - 2, y - 2, x + w + 2, y + h + 2, width, rop)) {
+			ok = TRUE;
+		} else if (composed) {
 			int mode = g_twoStage ? SetStretchBltMode(dst, COLORONCOLOR) : 0;
 			ok = StretchBlt(dst, 0, 0, width, GAME_H, g_hdDC, 0, 0, width * 2, GAME_H * 2, rop);
 			if (mode) SetStretchBltMode(dst, mode);
@@ -3363,6 +3371,112 @@ static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1)
 	return TRUE;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Full-screen paintings at the display's own resolution
+//
+// A screen that is a single painted-out picture (layouts.h, 'G', with assets\x4\_wide art) is not
+// shown through the 2x frame. Its 4x art is scaled once to the size of the game's window, and each
+// update is composed at that size: wherever the game's frame still shows the painting's own pixel,
+// the window gets the painting; anywhere the game has drawn something else (text, highlights),
+// it gets the usual 2x frame.
+
+static HDC g_viewArtDC, g_viewComposeDC;
+static DWORD *g_viewArt, *g_viewCompose;
+static int g_viewArtW, g_viewArtH;
+static short g_viewArtId;
+
+static HDC dib_dc(int w, int h, DWORD **bits)
+{
+	BITMAPINFO bi = { 0 };
+	bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+	bi.bmiHeader.biWidth = w;
+	bi.bmiHeader.biHeight = -h;
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	HBITMAP bmp = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, (void **)bits, NULL, 0);
+	if (!bmp) return NULL;
+	HDC dc = CreateCompatibleDC(NULL);
+	SelectObject(dc, bmp);
+	return dc;
+}
+
+static void free_dib_dc(HDC *dc)
+{
+	if (!*dc) return;
+	HGDIOBJ bmp = GetCurrentObject(*dc, OBJ_BITMAP);
+	DeleteDC(*dc);
+	DeleteObject(bmp);
+	*dc = NULL;
+}
+
+// The painting at the window's size, made when the screen or the window size changes.
+static BOOL prepare_view_art(const GeneratedArt *art, short id)
+{
+	if (g_viewArtDC && g_viewArtId == id && g_viewArtW == g_viewW && g_viewArtH == g_viewH) return TRUE;
+	free_dib_dc(&g_viewArtDC);
+	free_dib_dc(&g_viewComposeDC);
+	DWORD *bits4;
+	HDC four = dib_dc(g_gameW * 4, GAME_H * 4, &bits4);
+	if (!four) return FALSE;
+	memcpy(bits4, art->px4, (size_t)g_gameW * 4 * GAME_H * 4 * 4);
+	g_viewArtDC = dib_dc(g_viewW, g_viewH, &g_viewArt);
+	g_viewComposeDC = dib_dc(g_viewW, g_viewH, &g_viewCompose);
+	if (g_viewArtDC) {
+		SetStretchBltMode(g_viewArtDC, HALFTONE);
+		SetBrushOrgEx(g_viewArtDC, 0, 0, NULL);
+		StretchBlt(g_viewArtDC, 0, 0, g_viewW, g_viewH, four, 0, 0, g_gameW * 4, GAME_H * 4, SRCCOPY);
+		GdiFlush();
+	}
+	free_dib_dc(&four);
+	if (!g_viewArtDC || !g_viewComposeDC) return FALSE;
+	g_viewArtId = id;
+	g_viewArtW = g_viewW;
+	g_viewArtH = g_viewH;
+	logf_("painting %d prepared at the window's size, %dx%d", id, g_viewW, g_viewH);
+	return TRUE;
+}
+
+static BOOL quad_present(HDC dst, HDC src, int x0, int y0, int x1, int y1, int width, DWORD rop)
+{
+	if (!g_hd || g_offsetX || !g_topScreen || !g_main.frame || rop != SRCCOPY || width != g_gameW) return FALSE;
+	WidePicture *wide = wide_picture(g_topScreen);
+	if (!wide || wide->picture != g_topScreen || !wide->look.generated || VIEW_INT(g_topScreen, 0x2c) != 0) return FALSE;
+	const GeneratedArt *art = generated_art(wide->look.generated);
+	if (!art || !art->px4 || !prepare_view_art(art, wide->look.generated)) return FALSE;
+	int fw, fh, stride;
+	BOOL bottomUp;
+	const WORD *frame = dc_pixels(src, &fw, &fh, &stride, &bottomUp);
+	if (!frame || fw != g_gameW || fh != GAME_H) return FALSE;
+
+	int W = g_gameW, H = GAME_H;
+	x0 = max(x0, 0); y0 = max(y0, 0); x1 = min(x1, W); y1 = min(y1, H);
+	if (x1 <= x0 || y1 <= y0) return TRUE;
+	// The window pixels covering the game pixels being updated.
+	int vx0 = (int)((long long)x0 * g_viewW / W), vx1 = (int)(((long long)x1 * g_viewW + W - 1) / W);
+	int vy0 = (int)((long long)y0 * g_viewH / H), vy1 = (int)(((long long)y1 * g_viewH + H - 1) / H);
+	vx1 = min(vx1, g_viewW); vy1 = min(vy1, g_viewH);
+	for (int vy = vy0; vy < vy1; vy++) {
+		int gy = (int)((long long)vy * H / g_viewH);
+		const WORD *row = frame + (size_t)(bottomUp ? H - 1 - gy : gy) * stride;
+		const DWORD *expected = art->px1 + (size_t)gy * W;
+		const DWORD *from2 = g_main.frame + (size_t)((long long)vy * H * 2 / g_viewH) * W * 2;
+		DWORD *out = g_viewCompose + (size_t)vy * g_viewW;
+		const DWORD *painted = g_viewArt + (size_t)vy * g_viewW;
+		for (int vx = vx0; vx < vx1; vx++) {
+			int gx = (int)((long long)vx * W / g_viewW);
+			DWORD p = expected[gx];
+			WORD e = (WORD)(((p >> 19) & 31) << 10 | ((p >> 11) & 31) << 5 | ((p >> 3) & 31));
+			out[vx] = row[gx] == e ? painted[vx] : from2[(long long)vx * W * 2 / g_viewW];
+		}
+	}
+	GdiFlush();
+	// One window pixel per composed pixel: the window's device context maps game coordinates to
+	// it, so the copy is given in game units with the composed picture's own size as the source.
+	int mode = SetStretchBltMode(dst, COLORONCOLOR);
+	BOOL ok = StretchBlt(dst, 0, 0, W, H, g_viewComposeDC, 0, 0, g_viewW, g_viewH, rop);
+	SetStretchBltMode(dst, mode);
+	return ok;
+}
 // The game sometimes copies a piece of the map buffer straight to the window (the hover outline,
 // the blinking unit). Show it from the map's 2x frame so those tiles do not drop out of HD.
 static BOOL hd_map_to_window(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop)
