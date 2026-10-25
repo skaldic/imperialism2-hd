@@ -63,7 +63,7 @@ static int g_marginArt = 3; // beside centred screens: 0 black, 1 blurred edge, 
 static BOOL g_screenOnTop, g_mapOnTop;
 static BYTE *g_topScreen; // the screen on top, as last seen by watch_screens
 static BOOL g_hdNative = TRUE;
-static BOOL g_mapSprites; // experimental: HD art for map units (HDMapSprites), off by default // full-screen paintings shown at the display's resolution (HDNative)
+static BOOL g_mapSprites; // HD art for map units, drawn from the picture known by number (HDMapSprites) // full-screen paintings shown at the display's resolution (HDNative)
 static char g_gameDir[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
@@ -359,6 +359,8 @@ static LONGLONG g_presentTicks;
 static int g_presentPixels;
 static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks, g_findTicks;
 static int g_tileCalls, g_tileHits;
+static int g_spriteById, g_spriteUnknown; // sprites drawn from the picture known by number / left at 1x
+static LONGLONG g_knownTicks, g_noteTicks, g_tileTicks;  // time finding sprites by number, and recording cache sprites
 static int g_copyCalls;
 static int g_traceBudget; // diagnostic: number of paint calls still to be logged
 static int g_drawTrace; // diagnostic: direct-to-window drawing calls still to be logged
@@ -1260,12 +1262,14 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		QueryPerformanceFrequency(&freq);
 		QueryPerformanceCounter(&a);
 		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = g_findTicks = 0; g_tileCalls = g_tileHits = 0; g_copyCalls = 0;
+		g_spriteById = g_spriteUnknown = 0; g_knownTicks = g_noteTicks = 0; g_tileTicks = 0;
 		LRESULT r = CallWindowProcA(g_viewProc, hwnd, msg, wp, lp);
 		QueryPerformanceCounter(&b);
 		double ms = (b.QuadPart - a.QuadPart) * 1000.0 / freq.QuadPart;
 		double k = 1000.0 / freq.QuadPart;
-		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f), tiles %d/%d HD; %d game pixels", ms,
-			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_findTicks * k, g_tileHits, g_tileCalls, g_presentPixels);
+		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f), tiles %d/%d HD; %d game pixels; sprites %d by number (%.1f), %d unknown; cache sprites %.1f; tiles %.1f", ms,
+			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_findTicks * k, g_tileHits, g_tileCalls, g_presentPixels,
+			g_spriteById, g_knownTicks * k, g_spriteUnknown, g_noteTicks * k, g_tileTicks * k);
 		return r;
 	}
 	switch (msg) {
@@ -2997,6 +3001,188 @@ static const HdImage *hd_find_cell(const BYTE *bits, int pictureW, int pictureH,
 	return img->pixels ? img : NULL;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Pictures known by number (with HDMapSprites)
+//
+// The game loads every picture by its number (CResourceMgr::GetDib), and paints sprites into
+// scratch buffers (CDib::DrawThyself) before copying them out with a transparent colour. Both
+// are noted, so a sprite copied from a buffer is drawn from the HD art of the very picture
+// painted there, instead of being recognised from its pixels (hd_find_cell), which was slow
+// and sometimes picked the wrong picture.
+
+// Buffers are reused, and not always through the functions watched here, so each note keeps a
+// fingerprint of the pixels it was made for and counts only while they are still there.
+typedef struct { const BYTE *bits; short id; int w, h, bpp; DWORD hash; } DibId;
+typedef struct { const BYTE *bits; int x, y, w, h; short id; int stride, rows, bpp; BOOL bottomUp; DWORD hash; } PaintedPicture;
+
+static DWORD region_hash(const BYTE *bits, int stride, int rows, BOOL bottomUp, int bpp, int x, int y, int w, int h)
+{
+	int bytes = bpp / 8;
+	if (x < 0 || y < 0 || w <= 0 || h <= 0 || y + h > rows || (x + w) * bytes > stride) return 0;
+	if (!readable(bits, (size_t)stride * rows)) return 0;
+	DWORD hash = 2166136261u;
+	for (int r = 0; r < h; r++)
+		hash = fnv(hash, bits + (size_t)(bottomUp ? rows - 1 - (y + r) : y + r) * stride + (size_t)x * bytes, (size_t)w * bytes);
+	return hash;
+}
+static DibId g_dibIds[4096];             // a loaded picture's pixels -> its number (open addressing)
+static PaintedPicture g_painted[256];    // pictures painted into buffers, newest last
+static int g_paintedCount;
+
+static DibId *dib_id_slot(const BYTE *bits)
+{
+	unsigned n = sizeof g_dibIds / sizeof g_dibIds[0], i = (unsigned)(((UINT_PTR)bits >> 4) * 2654435761u) % n;
+	for (unsigned k = 0; k < n; k++, i = (i + 1) % n)
+		if (g_dibIds[i].bits == bits || !g_dibIds[i].bits) return &g_dibIds[i];
+	return NULL;
+}
+
+// The number of the picture loaded at `bits`, if it is still the one there, or -1.
+static int dib_id(const BYTE *bits, int w, int h, int bpp)
+{
+	DibId *s = bits ? dib_id_slot(bits) : NULL;
+	if (!s || !s->bits || s->w != w || s->h != h || s->bpp != bpp) return -1;
+	size_t size = pixel_bytes(w, h, bpp);
+	if (!readable(bits, size) || picture_hash(bits, size, w, h) != s->hash) return -1;
+	return s->id;
+}
+
+static void note_dib_id(const BYTE *bits, short id, int w, int h, int bpp)
+{
+	if (!bits) return;
+	size_t size = pixel_bytes(w, h, bpp);
+	if (!readable(bits, size)) return;
+	DibId *s = dib_id_slot(bits);
+	if (!s) { memset(g_dibIds, 0, sizeof g_dibIds); s = dib_id_slot(bits); } // full: start over
+	s->bits = bits; s->id = id; s->w = w; s->h = h; s->bpp = bpp;
+	s->hash = picture_hash(bits, size, w, h);
+}
+
+// Whatever was painted under a rectangle of a buffer is covered.
+static void forget_painted(const BYTE *bits, int x, int y, int w, int h)
+{
+	for (int i = 0; i < g_paintedCount;) {
+		const PaintedPicture *p = &g_painted[i];
+		if (p->bits == bits && p->x < x + w && x < p->x + p->w && p->y < y + h && y < p->y + p->h) {
+			memmove(&g_painted[i], &g_painted[i + 1], (g_paintedCount - i - 1) * sizeof *g_painted);
+			g_paintedCount--;
+		} else i++;
+	}
+}
+
+static void note_painted(HDC dc, const BYTE *srcBits, int srcBpp, int x, int y, int w, int h)
+{
+	DIBSECTION ds;
+	HGDIOBJ bmp = dc ? GetCurrentObject(dc, OBJ_BITMAP) : NULL;
+	if (!bmp || GetObjectA(bmp, sizeof ds, &ds) != sizeof ds || !ds.dsBm.bmBits) return;
+	const BYTE *dst = ds.dsBm.bmBits;
+	forget_painted(dst, x, y, w, h);
+	int id = dib_id(srcBits, w, h, srcBpp);
+	if (id < 0) return;
+	PaintedPicture p = { dst, x, y, w, h, (short)id, ds.dsBm.bmWidthBytes, ds.dsBm.bmHeight, ds.dsBm.bmBitsPixel, ds.dsBmih.biHeight > 0, 0 };
+	GdiFlush();
+	p.hash = region_hash(dst, p.stride, p.rows, p.bottomUp, p.bpp, x, y, w, h);
+	if (!p.hash) return;
+	if (g_paintedCount >= (int)(sizeof g_painted / sizeof g_painted[0])) {
+		memmove(g_painted, g_painted + 1, (g_paintedCount - 1) * sizeof *g_painted);
+		g_paintedCount--;
+	}
+	g_painted[g_paintedCount++] = p;
+}
+
+// The HD art of picture `id` (w by h at 1x), or NULL.
+static const HdImage *hd_by_id(int id, int w, int h)
+{
+	DWORD key = 0x80000000u | (DWORD)id;
+	for (int i = 0; i < g_hdImageCount; i++)
+		if (g_hdImages[i].bpp == -9 && g_hdImages[i].hash == key && g_hdImages[i].w == w && g_hdImages[i].h == h)
+			return g_hdImages[i].pixels ? &g_hdImages[i] : NULL;
+	if (g_hdImageCount >= (int)(sizeof g_hdImages / sizeof g_hdImages[0])) hd_make_room();
+	HdImage *img = &g_hdImages[g_hdImageCount++];
+	img->hash = key; img->w = w; img->h = h; img->bpp = -9; img->pixels = NULL; // -9: found by number
+	for (int i = 0; i < g_hdIndexCount; i++) {
+		if (g_hdIndex[i].id != id || g_hdIndex[i].w != w || g_hdIndex[i].h != h) continue;
+		char path[MAX_PATH];
+		snprintf(path, sizeof path, "%s\\%s\\%d.png", g_hdAssets, g_hdIndex[i].archive, g_hdIndex[i].id);
+		img->pixels = hd_load_cached(path, w * 2, h * 2);
+		if (img->pixels) break;
+	}
+	return img->pixels ? img : NULL;
+}
+
+// The HD art for a rectangle of a picture in memory, when the picture is one the game loaded by
+// number or the rectangle lies within one painted into a buffer; (ax, ay) is the rectangle's
+// place in the art and aw the art's 1x width. NULL when the picture is not known.
+static const HdImage *hd_known_(const BYTE *bits, int pw, int ph, int bpp, int x, int y, int w, int h, int *ax, int *ay, int *aw);
+static const HdImage *hd_known(const BYTE *bits, int pw, int ph, int bpp, int x, int y, int w, int h, int *ax, int *ay, int *aw)
+{
+	LARGE_INTEGER a, b;
+	QueryPerformanceCounter(&a);
+	const HdImage *art = hd_known_(bits, pw, ph, bpp, x, y, w, h, ax, ay, aw);
+	QueryPerformanceCounter(&b);
+	g_knownTicks += b.QuadPart - a.QuadPart;
+	return art;
+}
+static const HdImage *hd_known_(const BYTE *bits, int pw, int ph, int bpp, int x, int y, int w, int h, int *ax, int *ay, int *aw)
+{
+	int id = dib_id(bits, pw, ph, bpp);
+	if (id >= 0) {
+		*ax = x; *ay = y; *aw = pw;
+		return hd_by_id(id, pw, ph);
+	}
+	for (int i = g_paintedCount - 1; i >= 0; i--) {
+		const PaintedPicture *p = &g_painted[i];
+		if (p->bits != bits || x < p->x || y < p->y || x + w > p->x + p->w || y + h > p->y + p->h) continue;
+		if (region_hash(p->bits, p->stride, p->rows, p->bottomUp, p->bpp, p->x, p->y, p->w, p->h) != p->hash) {
+			forget_painted(p->bits, p->x, p->y, p->w, p->h); // painted over since: no longer known
+			return NULL;
+		}
+		*ax = x - p->x; *ay = y - p->y; *aw = p->w;
+		return hd_by_id(p->id, p->w, p->h);
+	}
+	return NULL;
+}
+
+typedef BYTE *(__attribute__((thiscall)) *GetDibFn)(void *mgr, short id);
+static BYTE *g_getDibRest;
+
+static BYTE *__attribute__((thiscall)) get_dib(void *mgr, short id)
+{
+	BYTE *dib = ((GetDibFn)g_getDibRest)(mgr, id);
+	if (dib && readable(dib, 0x14)) {
+		const BITMAPINFOHEADER *bh = *(const BITMAPINFOHEADER **)(dib + 0x10);
+		if (readable(bh, sizeof *bh)) note_dib_id(*(const BYTE **)(dib + 0x0c), id, bh->biWidth, abs(bh->biHeight), bh->biBitCount);
+	}
+	return dib;
+}
+
+static int WINAPI h_StretchDIBits(HDC dst, int x, int y, int w, int h, int sx, int sy, int sw, int sh,
+	const void *bits, const BITMAPINFO *info, UINT usage, DWORD rop);
+
+// CDib::DrawThyself, in full (it is one StretchDIBits call): its first instructions include a
+// short jump, so it cannot be moved into a trampoline.
+static int __attribute__((thiscall)) draw_thyself(BYTE *dib, BYTE *cdc, const POINT *at)
+{
+	const BITMAPINFO *bi = *(const BITMAPINFO **)(dib + 0x10);
+	if (!bi) return 0;
+	HDC dc = cdc ? *(HDC *)(cdc + 4) : NULL;
+	int w = bi->bmiHeader.biWidth, h = abs(bi->bmiHeader.biHeight);
+	const BYTE *bits = *(const BYTE **)(dib + 0x0c);
+	h_StretchDIBits(dc, at->x, at->y, w, h, 0, 0, w, h, bits, bi, 0, SRCCOPY);
+	note_painted(dc, bits, bi->bmiHeader.biBitCount, at->x, at->y, w, h);
+	return 1;
+}
+
+static BOOL hook_picture_numbers(void)
+{
+	BYTE *getDib = (BYTE *)0x004ae9f0, *drawThyself = (BYTE *)0x004860c0;
+	static const BYTE seh[] = { 0x6a, 0xff, 0x68 };                       // push -1; push <handler>
+	static const BYTE thyself[] = { 0x8b, 0x51, 0x10, 0x85, 0xd2, 0x75, 0x05 }; // mov edx,[ecx+10]; test; jnz
+	if (memcmp(getDib, seh, sizeof seh) || memcmp(drawThyself, thyself, sizeof thyself)) return FALSE;
+	g_getDibRest = make_trampoline(getDib, 7);
+	return g_getDibRest && redirect(getDib, 7, (void *)get_dib) && redirect(drawThyself, 5, (void *)draw_thyself);
+}
+
 // A surface pairs one of the game's 1x pixel buffers with a frame twice its size. "state" says
 // what each 2x block holds: 0 unknown, 1 HD art, 2 smoothed 1x pixel. "shadow" is the 1x value
 // the pixel had when its block was written, so later changes by the game can be detected.
@@ -3010,6 +3196,7 @@ typedef struct {
 	DWORD *frame;     // top-down, 2w by 2h
 	WORD *shadow;
 	BYTE *state, *dirty;
+	DWORD *shaded;   // per 1x pixel: the 2x value a sprite's shadow left there (so it is not darkened twice)
 } HdSurface;
 
 #define MAP_SURFACE_H 728
@@ -3204,6 +3391,9 @@ typedef struct {
 	int aw, ax, ay;        // its width, and where the drawn rectangle starts in it (1x units)
 	int ox, oy, w, h;      // where the rectangle lies in the cell
 	BYTE mask[64 * 64];    // which pixels of the rectangle the game drew
+	BYTE pix[64 * 64];     // ... and what it drew there: only pixels still holding that are drawn HD
+	int stride;            // the cache picture's row length (it is 64 rows high)
+	BOOL bottomUp;
 	int generation;        // of the HD art cache, so freed art is never used
 } CacheOverlay;
 static CacheOverlay *g_overlays;
@@ -3236,10 +3426,10 @@ static void cache_note_copy(BYTE *src, BYTE *dst, const BITMAPINFOHEADER *sh, co
 	int pw = sh->biWidth, ph = abs(sh->biHeight);
 	BOOL bottomUp8 = sh->biHeight > 0;
 	if (sx < 0 || sy < 0 || sx + w > pw || sy + h > ph) return;
-	const HdImage *art = hd_find(srcBits, pw, ph, 8);
 	int ax = sx, ay = sy, aw = pw;
-	if (!art) { art = hd_find_cell(srcBits, pw, ph, bottomUp8, sx, sy, w, h); ax = 0; ay = 0; aw = w; }
-	if (!art || !art->pixels) return;
+	const HdImage *art = hd_known(srcBits, pw, ph, 8, sx, sy, w, h, &ax, &ay, &aw);
+	if (!art) { g_spriteUnknown++; return; }
+	g_spriteById++;
 	if (g_overlayCount >= CACHE_OVERLAYS) g_overlayCount = 0; // full: start over (cells are rebuilt often)
 	CacheOverlay *o = &g_overlays[g_overlayCount++];
 	o->cache = cache; o->cellX = cellX; o->cellY = cellY;
@@ -3248,10 +3438,22 @@ static void cache_note_copy(BYTE *src, BYTE *dst, const BITMAPINFOHEADER *sh, co
 	o->generation = g_artGeneration;
 	BYTE key = (BYTE)transparent;
 	int sstride = (pw + 3) & ~3;
+	o->stride = (dh->biWidth + 3) & ~3; o->bottomUp = dh->biHeight > 0;
 	for (int y = 0; y < h; y++) {
 		const BYTE *row = srcBits + (size_t)(bottomUp8 ? ph - 1 - (sy + y) : sy + y) * sstride + sx;
-		for (int x = 0; x < w; x++) o->mask[y * 64 + x] = row[x] != key;
+		for (int x = 0; x < w; x++) { o->mask[y * 64 + x] = row[x] != key; o->pix[y * 64 + x] = row[x]; }
 	}
+}
+
+static BOOL hd_dark(DWORD p)
+{
+	return (p & 0xffffff) != HD_KEY && ((p >> 16) & 255) < 56 && ((p >> 8) & 255) < 56 && (p & 255) < 56;
+}
+
+// A ground pixel under a sprite's shadow: darkened by half.
+static DWORD hd_shade(DWORD p)
+{
+	return (p & 0xff000000) | ((p >> 1) & 0x7f7f7f);
 }
 
 // Draws the sprites recorded for a cache cell into a 2x picture (w by h 1x pixels, rows of
@@ -3261,13 +3463,52 @@ static void cache_draw_overlays_into(const BYTE *cache, int cellX, int cellY, DW
 	for (int i = 0; i < g_overlayCount; i++) {
 		const CacheOverlay *o = &g_overlays[i];
 		if (o->cache != cache || o->cellX != cellX || o->cellY != cellY || o->generation != g_artGeneration) continue;
+		// The cache cell may have been refilled since (not always through a watched copy), and
+		// later sprites may cover this one: only pixels still holding what it drew are its.
+		BYTE still[64 * 64];
+		int drawn = 0, kept = 0;
+		for (int y = 0; y < o->h; y++) {
+			const BYTE *row = cache + (size_t)(o->bottomUp ? 63 - (o->oy + y) : o->oy + y) * o->stride + cellX + o->ox;
+			for (int x = 0; x < o->w; x++) {
+				BOOL mine = o->mask[y * 64 + x] && row[x] == o->pix[y * 64 + x];
+				still[y * 64 + x] = (BYTE)mine;
+				drawn += o->mask[y * 64 + x]; kept += mine;
+			}
+		}
+		if (kept * 2 < drawn) { g_overlays[i--] = g_overlays[--g_overlayCount]; continue; } // mostly gone: gone
+		// Shadows are drawn as a chequer of dark dots (every other pixel left transparent), which
+		// enlarged reads as a chessboard. Dots and the gaps between them darken the ground instead.
+		BYTE shade[64 * 64] = { 0 };
+		#define OV_DOT(xx, yy) ((xx) >= 0 && (yy) >= 0 && (xx) < o->w && (yy) < o->h && still[(yy) * 64 + (xx)] && \
+			hd_dark(o->art[(size_t)((o->ay + (yy)) * 2) * o->aw * 2 + (o->ax + (xx)) * 2]))
+		#define OV_OPEN(xx, yy) ((xx) < 0 || (yy) < 0 || (xx) >= o->w || (yy) >= o->h || !o->mask[(yy) * 64 + (xx)])
+		for (int y = 0; y < o->h; y++)
+			for (int x = 0; x < o->w; x++) {
+				if (OV_DOT(x, y) && OV_OPEN(x - 1, y) + OV_OPEN(x + 1, y) + OV_OPEN(x, y - 1) + OV_OPEN(x, y + 1) >= 3) shade[y * 64 + x] = 1;
+			}
+		for (int y = 0; y < o->h; y++)
+			for (int x = 0; x < o->w; x++) {
+				if (o->mask[y * 64 + x]) continue;
+				int around = (x > 0 && shade[y * 64 + x - 1] == 1) + (x + 1 < o->w && shade[y * 64 + x + 1] == 1) +
+					(y > 0 && shade[(y - 1) * 64 + x] == 1) + (y + 1 < o->h && shade[(y + 1) * 64 + x] == 1);
+				if (around >= 2) shade[y * 64 + x] = 2;
+			}
+		#undef OV_DOT
+		#undef OV_OPEN
 		for (int y = 0; y < o->h; y++) {
 			int fy = my + o->oy + y;
 			if (fy < 0 || fy >= h) continue;
 			for (int x = 0; x < o->w; x++) {
-				if (!o->mask[y * 64 + x]) continue;
 				int fx = mx + o->ox + x;
 				if (fx < 0 || fx >= w) continue;
+				if (shade[y * 64 + x]) {
+					for (int half = 0; half < 2; half++) {
+						DWORD *to = frame2x + (size_t)(fy * 2 + half) * stride + fx * 2;
+						for (int k = 0; k < 2; k++) to[k] = hd_shade(to[k]);
+					}
+					continue;
+				}
+				if (!still[y * 64 + x]) continue;
 				for (int half = 0; half < 2; half++) {
 					const DWORD *from = o->art + (size_t)((o->ay + y) * 2 + half) * o->aw * 2 + (o->ax + x) * 2;
 					DWORD *to = frame2x + (size_t)(fy * 2 + half) * stride + fx * 2;
@@ -3305,8 +3546,15 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	const BITMAPINFOHEADER *sh = *(const BITMAPINFOHEADER **)(src + 0x10);
 	const BITMAPINFOHEADER *dh = *(const BITMAPINFOHEADER **)(dst + 0x10);
 	if (!readable(sh, sizeof *sh) || !readable(dh, sizeof *dh)) return;
+	if (g_mapSprites && g_paintedCount) forget_painted(*(const BYTE **)(dst + 0x0c), dx, dy, w, h);
 	if (dh->biBitCount == 8 && sh->biBitCount == 8) {
-		if (g_mapSprites) cache_note_copy(src, dst, sh, dh, sx, sy, w, h, dx, dy, transparent);
+		if (g_mapSprites) {
+			LARGE_INTEGER a, b;
+			QueryPerformanceCounter(&a);
+			cache_note_copy(src, dst, sh, dh, sx, sy, w, h, dx, dy, transparent);
+			QueryPerformanceCounter(&b);
+			g_noteTicks += b.QuadPart - a.QuadPart;
+		}
 		return;
 	}
 	if (dh->biBitCount != 16) return;
@@ -3370,7 +3618,9 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	if (s == &g_map && eight && !keyed && w == 64 && h == 64) {
 		tileCell = TRUE;
 		g_tileCalls++;
+		LARGE_INTEGER t0, t1; QueryPerformanceCounter(&t0);
 		pixels = tile_art(srcBits, pw, ph, bottomUp8, sx, sy, frame, stride, bottomUp, s->h, dx, dy);
+		QueryPerformanceCounter(&t1); g_tileTicks += t1.QuadPart - t0.QuadPart;
 		ax = 0; ay = 0; aw = 64;
 		if (pixels) g_tileHits++;
 	} else if (sh->biBitCount == 16 && !keyed) {
@@ -3378,7 +3628,11 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 		if (art) pixels = art->pixels;
 	} else if (eight) {
 		const HdImage *art = hd_find(srcBits, pw, ph, 8);
-		if (!art) {
+		if (!art && keyed && g_mapSprites) {
+			// A sprite: drawn from the picture known to be there, or left at 1x (never guessed).
+			art = hd_known(srcBits, pw, ph, 8, sx, sy, w, h, &ax, &ay, &aw);
+			if (art) g_spriteById++; else g_spriteUnknown++;
+		} else if (!art) {
 			art = hd_find_cell(srcBits, pw, ph, bottomUp8, sx, sy, w, h);
 			ax = 0; ay = 0; aw = w;
 		}
@@ -3390,6 +3644,29 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 	else if (frame != s->bits) return;
 
 	BYTE key = (BYTE)transparent;
+	// A sprite's shadow is a chequer of dark dots between transparent pixels; enlarged it reads as
+	// a chessboard. The dots and the gaps between them darken what is beneath instead (shade 1).
+	static BYTE shade[128 * 128];
+	BOOL shading = pixels && keyed && eight && w <= 128 && h <= 128;
+	if (shading) {
+		int sstride = (pw + 3) & ~3;
+		#define SRC(xx, yy) srcBits[(size_t)(bottomUp8 ? ph - 1 - (sy + (yy)) : sy + (yy)) * sstride + sx + (xx)]
+		#define OPEN(xx, yy) ((xx) < 0 || (yy) < 0 || (xx) >= w || (yy) >= h || SRC(xx, yy) == key)
+		#define DOT(xx, yy) (!OPEN(xx, yy) && hd_dark(pixels[(size_t)((ay + (yy)) * 2) * aw * 2 + (ax + (xx)) * 2]) && \
+			OPEN((xx) - 1, yy) + OPEN((xx) + 1, yy) + OPEN(xx, (yy) - 1) + OPEN(xx, (yy) + 1) >= 3)
+		for (int y = 0; y < h; y++)
+			for (int x = 0; x < w; x++) {
+				BOOL d = DOT(x, y);
+				if (!d && OPEN(x, y))
+					d = (x > 0 && DOT(x - 1, y)) + (x + 1 < w && DOT(x + 1, y)) + (y > 0 && DOT(x, y - 1)) + (y + 1 < h && DOT(x, y + 1)) >= 2;
+				shade[y * 128 + x] = (BYTE)d;
+			}
+		#undef DOT
+		#undef OPEN
+		#undef SRC
+		if (!s->shaded) s->shaded = calloc((size_t)s->w * s->h, sizeof *s->shaded);
+		if (!s->shaded) shading = FALSE;
+	}
 	for (int y = 0; y < h; y++) {
 		const WORD *row = frame + (size_t)(bottomUp ? s->h - 1 - (dy + y) : dy + y) * stride + dx;
 		const BYTE *srcRow = eight ? srcBits + (size_t)(bottomUp8 ? ph - 1 - (sy + y) : sy + y) * ((pw + 3) & ~3) + sx : NULL;
@@ -3416,6 +3693,17 @@ static void hd_copy_pixels_after(BYTE *src, BYTE *dst, int sx, int sy, int w, in
 		// The upscaled sprite's outline is rounded at 2x, so within a block some of the four
 		// pixels can be sprite and some background (marked with the key colour, magenta).
 		for (int x = 0; x < w; x++) {
+			if (shading && shade[y * 128 + x]) {
+				// Darkened once: a block still holding the darkened value is not darkened again
+				// (the game redraws sprites without always redrawing what is under them).
+				if (s->state[at + x] != 1) continue; // nothing known beneath
+				DWORD *b0 = s->frame + (size_t)((dy + y) * 2) * s->w * 2 + (dx + x) * 2, *b1 = b0 + s->w * 2;
+				if (s->shaded[at + x] == b0[0] && s->shaded[at + x]) { s->shadow[at + x] = row[x]; continue; }
+				b0[0] = hd_shade(b0[0]); b0[1] = hd_shade(b0[1]); b1[0] = hd_shade(b1[0]); b1[1] = hd_shade(b1[1]);
+				s->shaded[at + x] = b0[0];
+				s->shadow[at + x] = row[x];
+				continue;
+			}
 			const DWORD *from[2];
 			DWORD *to[2], solid = HD_KEY;
 			for (int half = 0; half < 2; half++) {
@@ -4241,20 +4529,46 @@ static BOOL hd_transparent_to_window(BYTE *dib, HDC dc, int dx, int dy, int dw, 
 	if (!readable(bh, sizeof *bh) || !bits || (bh->biBitCount != 8 && bh->biBitCount != 16)) return FALSE;
 	int pw = bh->biWidth, ph = abs(bh->biHeight);
 	if (sx < 0 || sy < 0 || sx + sw > pw || sy + sh > ph) return FALSE;
-	const HdImage *art = hd_find(bits, pw, ph, bh->biBitCount);
 	int ax = sx, ay = sy, aw = pw;
-	if (!art && bh->biBitCount == 8) { art = hd_find_cell(bits, pw, ph, bh->biHeight > 0, sx, sy, sw, sh); ax = 0; ay = 0; aw = sw; }
-	if (!art || !art->pixels) return FALSE;
+	const HdImage *art = hd_known(bits, pw, ph, bh->biBitCount, sx, sy, sw, sh, &ax, &ay, &aw);
+	if (!art) {
+		static int logged;
+		if (logged++ < 40) logf_("HD: sprite %dx%d at %d,%d of a %dx%d %dbpp picture not known (painted records %d)",
+			sw, sh, sx, sy, pw, ph, bh->biBitCount, g_paintedCount);
+		g_spriteUnknown++;
+		return FALSE;
+	}
+	g_spriteById++;
 	if (!spriteDC) spriteDC = dib_dc(SMALL_MAX * 2, SMALL_MAX * 2, &spriteBits);
 	if (!spriteDC) return FALSE;
-	for (int y = 0; y < dh * 2; y++)
-		memcpy(spriteBits + (size_t)y * SMALL_MAX * 2, art->pixels + (size_t)(ay * 2 + y) * aw * 2 + ax * 2, sizeof(DWORD) * dw * 2);
 	GdiFlush();
+	// Drawn with per-pixel alpha (premultiplied): the transparent colour clear, the sprite solid,
+	// and its shadow, a chequer of dark dots, as half-transparent black over its whole area.
+	const int row = SMALL_MAX * 2;
+	#define SP(xx, yy) art->pixels[(size_t)((ay + (yy)) * 2) * aw * 2 + (ax + (xx)) * 2]
+	#define SP_OPEN(xx, yy) ((xx) < 0 || (yy) < 0 || (xx) >= dw || (yy) >= dh || (SP(xx, yy) & 0xffffff) == HD_KEY)
+	#define SP_DOT(xx, yy) (!SP_OPEN(xx, yy) && hd_dark(SP(xx, yy)) && SP_OPEN((xx) - 1, yy) + SP_OPEN((xx) + 1, yy) + \
+		SP_OPEN(xx, (yy) - 1) + SP_OPEN(xx, (yy) + 1) >= 3)
+	for (int y = 0; y < dh; y++)
+		for (int x = 0; x < dw; x++) {
+			BOOL shade = SP_DOT(x, y);
+			if (!shade && SP_OPEN(x, y)) {
+				int around = (x > 0 && SP_DOT(x - 1, y)) + (x + 1 < dw && SP_DOT(x + 1, y)) + (y > 0 && SP_DOT(x, y - 1)) + (y + 1 < dh && SP_DOT(x, y + 1));
+				shade = around >= 2;
+			}
+			for (int half = 0; half < 2; half++) {
+				const DWORD *from = art->pixels + (size_t)((ay + y) * 2 + half) * aw * 2 + (ax + x) * 2;
+				DWORD *to = spriteBits + (size_t)(y * 2 + half) * row + x * 2;
+				for (int k = 0; k < 2; k++)
+					to[k] = shade ? 0x80000000u : (from[k] & 0xffffff) == HD_KEY ? 0 : 0xff000000u | from[k];
+			}
+		}
+	#undef SP_DOT
+	#undef SP_OPEN
+	#undef SP
 	ensure_mapped(dc);
-	int mode = SetStretchBltMode(dc, COLORONCOLOR);
-	BOOL ok = TransparentBlt(dc, dx, dy, dw, dh, spriteDC, 0, 0, dw * 2, dh * 2, RGB(255, 0, 255));
-	SetStretchBltMode(dc, mode);
-	return ok;
+	BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+	return AlphaBlend(dc, dx, dy, dw, dh, spriteDC, 0, 0, dw * 2, dh * 2, blend);
 }
 
 static int __attribute__((thiscall)) draw_transparent(BYTE *dib, BYTE *cdc, DWORD key, int dx, int dy, int dw, int dh,
@@ -4306,6 +4620,7 @@ static BOOL hook_draw_transparent(void);
 static void hd_install(void)
 {
 	if (g_mapSprites) logf_("HD: sprites drawn onto the window: %s", hook_draw_transparent() ? "hooked" : "NOT hooked");
+	if (g_mapSprites) logf_("HD: pictures known by number: %s", hook_picture_numbers() ? "hooked" : "NOT hooked");
 	const DWORD thunk = 0x00403125, target = 0x00487790;
 	DWORD *rel = (DWORD *)(thunk + 1), old;
 	if (*(BYTE *)thunk != 0xe9 || thunk + 5 + *rel != target) {
@@ -4413,7 +4728,7 @@ static void install(HMODULE self)
 	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
 	g_hdNative = GetPrivateProfileIntA("Display", "HDNative", 1, ini);
 	g_sharpText = GetPrivateProfileIntA("Display", "SharpText", 1, ini);
-	g_mapSprites = GetPrivateProfileIntA("Display", "HDMapSprites", 0, ini);
+	g_mapSprites = GetPrivateProfileIntA("Display", "HDMapSprites", 1, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 	if (GetPrivateProfileIntA("Debug", "LogCrashes", 1, ini)) AddVectoredExceptionHandler(1, log_crash);
 

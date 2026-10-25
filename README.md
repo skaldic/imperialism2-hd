@@ -65,6 +65,7 @@ HD=1
 | `HDAutoUpscale` | 1 | Upscale newly captured tiles when the game closes |
 | `SharpText` | 1 | Draw the game's text again at 2x in a doubled font, so it is sharp instead of enlarged (fonts that do not scale evenly keep their 1x text) |
 | `HDNative` | 1 | Show painted-out full-screen pictures (the main menu) at the display's own resolution from their 4x art; 0 uses the 2x art like other screens |
+| `HDMapSprites` | 1 | Draw units, towns and other map sprites from their HD art. The patch notes which picture the game loads by number and where it paints it, so each sprite is drawn from its own art (never guessed from pixels); sprite shadows become a soft darkening instead of an enlarged chequer |
 
 `imp2hd.log` is rewritten in the game folder on each launch and records what the patch did.
 `[Debug]` keys (`DumpViews`, `TraceCopies`, `Timing`, `WideSteps`) add diagnostics to it.

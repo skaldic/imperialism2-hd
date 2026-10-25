@@ -17,7 +17,17 @@ Add-Type -Namespace Native -Name Drive -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
 [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
 [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
+[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
 '@
+
+# Clicks and keys are real input: they go to whatever window is in front. They are sent only
+# while the game is in front, so another program (a launcher, say) is never clicked.
+function Test-GameInFront {
+    $pid2 = [uint32]0
+    [void][Native.Drive]::GetWindowThreadProcessId([Native.Drive]::GetForegroundWindow(), [ref]$pid2)
+    return $pid2 -eq $proc.Id
+}
 [void][Native.Drive]::SetProcessDPIAware()
 
 $outDir = "$PSScriptRoot\shots"
@@ -46,6 +56,7 @@ function Move-To([int]$gx, [int]$gy) {
 foreach ($step in $Steps) {
     if ($proc.HasExited) { "game exited (code $($proc.ExitCode)) before '$step'"; break }
     $verb, $arg = $step -split ':', 2
+    if ($verb -in 'click', 'key', 'move' -and -not (Test-GameInFront)) { "the game is not in front: stopped before '$step'"; break }
     switch ($verb) {
         'wait'  { Start-Sleep -Milliseconds ([int]([double]$arg * 1000)) }
         'move'  { $x, $y = $arg -split ','; Move-To $x $y }
