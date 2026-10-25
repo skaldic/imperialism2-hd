@@ -4429,7 +4429,11 @@ static int text_hd_draw(HDC dc, LPCSTR s, int n, LPRECT r, UINT f, BOOL *handled
 				else if (ink) stray++;
 			}
 		}
-		if (changed == 0 || inked * 100 < changed * 70 || stray * 100 > changed * 20) {
+		// (Text drawn over an earlier copy of itself, as the engraved numbers are, changes fewer
+		// pixels, so more of its 2x ink looks stray; it is let through when nearly all of what it
+		// did change got 2x ink.)
+		int strayLimit = inked * 100 >= changed * 80 ? 40 : 20;
+		if (changed == 0 || inked * 100 < changed * 70 || stray * 100 > changed * strayLimit) {
 			static int rejectLogs;
 			if (g_dumpViews && rejectLogs++ < 300) logf_("   2x text not used: %d changed, %d with 2x ink, %d stray", changed, inked, stray);
 			return result;
