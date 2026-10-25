@@ -14,7 +14,8 @@ param(
     [string[]]$Only = @(),              # archive names to process; empty means all
     [string[]]$Terrain = @('MapTiles'), # archives whose key-less 64x64 pictures are repeating terrain
     [double]$Grain = 0.75,              # share of a plain enlargement used away from outlines (0 = none)
-    [double]$EdgeLow = 8,               # blurred-brightness step below which nothing counts as an outline
+    [double]$TileGrain = 1.0,           # the original's speckle added back to terrain tiles (grain_tiles.ps1)
+    [double]$EdgeLow = 8,              # blurred-brightness step below which nothing counts as an outline
     [double]$EdgeHigh = 20,            # ... and at which it fully does
     [string]$Model = 'realesrgan-x4plus', # or realesrgan-x4plus-anime: sharper on small drawn figures
     [switch]$SpritesOnly,               # only pictures with transparency (units, buildings, icons)
@@ -305,7 +306,11 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
     foreach ($name in $info.Keys) {
         if (-not (Test-Path -LiteralPath "$tempOut\$name")) { continue }
         $dest = "$Assets\x2\$($dir.Name)\$name"
-        if ($info[$name].Tile) { [KeyedUpscale]::FinishTile("$tempOut\$name", $info[$name].Source, $dest, $Grain); $tiles++ }
+        if ($info[$name].Tile) {
+            [KeyedUpscale]::FinishTile("$tempOut\$name", $info[$name].Source, $dest, $Grain); $tiles++
+            # grain_tiles.ps1 starts from its saved copy, which this tile now replaces
+            Remove-Item -LiteralPath "$Assets\x2_before_grain\$($dir.Name)\$name" -ErrorAction SilentlyContinue
+        }
         else { [KeyedUpscale]::Finish("$tempOut\$name", "$tempIn\$name", $dest, $info[$name].Mask, $info[$name].W, $info[$name].H, $Grain) }
         $done++
         if ($null -ne $info[$name].Mask) { $keyed++ }
@@ -315,3 +320,4 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
 }
 Remove-Item -Recurse -Force $tempIn, $tempOut -ErrorAction SilentlyContinue
 "upscaled $total pictures ($keyed with transparency, $tiles terrain tiles) -> $Assets\x2"
+if ($tiles -gt 0) { & "$PSScriptRoot\grain_tiles.ps1" -Amount $TileGrain -Terrain $Terrain -Assets $Assets }

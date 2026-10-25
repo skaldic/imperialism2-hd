@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 // Pixel helpers for the tools scripts (PowerShell's GetPixel is far too slow at 4x).
 using System;
 using System.Drawing;
@@ -291,4 +292,219 @@ public static class ImageOps
     }
 
     static int Clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
+
+    // Puts a tile's own fine grain back into its 2x version: each 2x pixel gets `amount` times the
+    // difference between the 1x pixel under it and that pixel's 3x3 average (the tile wraps at its
+    // edges, as terrain does). Shading and colour stay the upscale's; only the speckle returns.
+    public static void AddGrain(int[] hd, int w2, int h2, int[] orig, int w, int h, double amount)
+    {
+        var detail = new double[w * h * 3];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                double r = 0, g = 0, b = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int q = orig[((y + dy + h) % h) * w + (x + dx + w) % w];
+                        r += (q >> 16) & 255; g += (q >> 8) & 255; b += q & 255;
+                    }
+                int p = orig[y * w + x], i = (y * w + x) * 3;
+                detail[i] = ((p >> 16) & 255) - r / 9; detail[i + 1] = ((p >> 8) & 255) - g / 9; detail[i + 2] = (p & 255) - b / 9;
+            }
+        for (int y = 0; y < h2; y++)
+            for (int x = 0; x < w2; x++)
+            {
+                int i = ((y * h / h2) * w + x * w / w2) * 3, p = hd[y * w2 + x];
+                int nr = Clamp((int)Math.Round(((p >> 16) & 255) + amount * detail[i]));
+                int ng = Clamp((int)Math.Round(((p >> 8) & 255) + amount * detail[i + 1]));
+                int nb = Clamp((int)Math.Round((p & 255) + amount * detail[i + 2]));
+                hd[y * w2 + x] = (int)(0xff000000u | (uint)(nr << 16 | ng << 8 | nb));
+            }
+    }
+
+    // Lays a generated subject onto the original tile: generated pixels that are not grass (not a
+    // clearly green hue) are the subject; the mask is grown by one pixel and softened, and the
+    // rest of the tile stays the original grass.
+    public static void PasteSubject(int[] orig, int[] gen, int w, int h, double cx, double cy, double radius)
+    {
+        var m = new double[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                double dx = x - cx, dy = y - cy;
+                if (dx * dx + dy * dy > radius * radius) continue;
+                int p = gen[y * w + x], r = (p >> 16) & 255, g = (p >> 8) & 255, b = p & 255;
+                bool grass = g > r + 12 && g > b + 12;
+                if (!grass) m[y * w + x] = 1;
+            }
+        var grown = new double[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                double v = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int xx = x + dx, yy = y + dy;
+                        if (xx >= 0 && yy >= 0 && xx < w && yy < h && m[yy * w + xx] > v) v = m[yy * w + xx];
+                    }
+                grown[y * w + x] = v;
+            }
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                double a = 0; int n = 0;
+                for (int dy = -1; dy <= 1; dy++)
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int xx = x + dx, yy = y + dy;
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        a += grown[yy * w + xx]; n++;
+                    }
+                a /= n;
+                int i = y * w + x, o = orig[i], g2 = gen[i], v = 0;
+                for (int sh = 0; sh < 24; sh += 8)
+                    v |= (int)(((o >> sh) & 255) * (1 - a) + ((g2 >> sh) & 255) * a) << sh;
+                orig[i] = (int)(0xff000000u | (uint)v);
+            }
+    }
+
+    // Uneven grass: smooth random patches, wrapping at the tile's edges so the tile still repeats
+    // seamlessly. Light patches turn slightly yellow (dry), dark ones deeper green (clumps).
+    // `amount` is the brightness change at the strongest patch (0.15 = 15%).
+    public static void Mottle(int[] px, int w, int h, double amount, int seed)
+    {
+        var field = new double[w * h];
+        var rnd = new Random(seed);
+        foreach (int cells in new[] { 3, 6, 12 })
+        {
+            var lat = new double[cells * cells];
+            for (int i = 0; i < lat.Length; i++) lat[i] = rnd.NextDouble() * 2 - 1;
+            double weight = cells == 3 ? 0.5 : cells == 6 ? 0.35 : 0.15;
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    double fx = (double)x * cells / w, fy = (double)y * cells / h;
+                    int x0 = (int)fx, y0 = (int)fy; double tx = fx - x0, ty = fy - y0;
+                    tx = tx * tx * (3 - 2 * tx); ty = ty * ty * (3 - 2 * ty);
+                    int x1 = (x0 + 1) % cells, y1 = (y0 + 1) % cells;
+                    double a = lat[y0 * cells + x0] * (1 - tx) + lat[y0 * cells + x1] * tx;
+                    double b = lat[y1 * cells + x0] * (1 - tx) + lat[y1 * cells + x1] * tx;
+                    field[y * w + x] += weight * (a * (1 - ty) + b * ty);
+                }
+        }
+        double max = 1e-9; foreach (double v in field) max = Math.Max(max, Math.Abs(v));
+        for (int i = 0; i < w * h; i++)
+        {
+            double f = field[i] / max, k = 1 + amount * f;
+            int p = px[i], r = (p >> 16) & 255, g = (p >> 8) & 255, b = p & 255;
+            double dry = Math.Max(0, f) * amount * 0.6; // light patches drift toward straw
+            int nr = Clamp((int)Math.Round(r * k + dry * 90));
+            int ng = Clamp((int)Math.Round(g * k + dry * 40));
+            int nb = Clamp((int)Math.Round(b * k));
+            px[i] = (int)(0xff000000u | (uint)(nr << 16 | ng << 8 | nb));
+        }
+    }
+
+    // The painting's own grass: the median colour of a ring just inside the tile's edge.
+    public static int GrassColour(int[] px, int w, int h)
+    {
+        var rs = new List<int>(); var gs = new List<int>(); var bs = new List<int>();
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int e = Math.Min(Math.Min(x, y), Math.Min(w - 1 - x, h - 1 - y));
+                if (e < w / 32 || e > w / 12) continue;
+                int p = px[y * w + x]; rs.Add((p >> 16) & 255); gs.Add((p >> 8) & 255); bs.Add(p & 255);
+            }
+        rs.Sort(); gs.Sort(); bs.Sort(); int m = rs.Count / 2;
+        return rs[m] << 16 | gs[m] << 8 | bs[m];
+    }
+
+    // True where a pixel is far enough from the grass colour to be part of the subject.
+    public static bool[] SubjectMask(int[] px, int w, int h, int grass, int tolerance)
+    {
+        int gr = (grass >> 16) & 255, gg = (grass >> 8) & 255, gb = grass & 255;
+        var m = new bool[w * h];
+        for (int i = 0; i < w * h; i++)
+        {
+            int p = px[i], dr = ((p >> 16) & 255) - gr, dg = ((p >> 8) & 255) - gg, db = (p & 255) - gb;
+            m[i] = Math.Sqrt(dr * dr + dg * dg + db * db) > tolerance;
+        }
+        return m;
+    }
+
+    // The square around the subject: rows and columns with at least `minRun` subject pixels
+    // (stray specks don't count), grown by `margin` of its size. Returns x, y, size.
+    public static int[] SubjectSquare(bool[] m, int w, int h, int minRun, double margin)
+    {
+        int x0 = w, x1 = -1, y0 = h, y1 = -1;
+        for (int y = 0; y < h; y++) { int n = 0; for (int x = 0; x < w; x++) if (m[y * w + x]) n++; if (n >= minRun) { y0 = Math.Min(y0, y); y1 = y; } }
+        for (int x = 0; x < w; x++) { int n = 0; for (int y = 0; y < h; y++) if (m[y * w + x]) n++; if (n >= minRun) { x0 = Math.Min(x0, x); x1 = x; } }
+        if (x1 < 0 || y1 < 0) return new[] { 0, 0, w };
+        int size = (int)(Math.Max(x1 - x0, y1 - y0) * (1 + 2 * margin));
+        size = Math.Min(Math.Max(size, w / 4), w);
+        int cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+        int sx = Math.Min(Math.Max(cx - size / 2, 0), w - size), sy = Math.Min(Math.Max(cy - size / 2, 0), h - size);
+        return new[] { sx, sy, size };
+    }
+
+    // Lays the subject (mask grown by one pixel, edge softened) onto the original tile.
+    public static void PasteMasked(int[] orig, int[] gen, bool[] m, int w, int h)
+    {
+        var a = new double[w * h];
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+            {
+                int n = 0, hit = 0;
+                for (int dy = -2; dy <= 2; dy++)
+                    for (int dx = -2; dx <= 2; dx++)
+                    {
+                        int xx = x + dx, yy = y + dy;
+                        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+                        n++;
+                        bool near = false;
+                        for (int ey = -1; ey <= 1 && !near; ey++)
+                            for (int ex = -1; ex <= 1 && !near; ex++)
+                            {
+                                int qx = xx + ex, qy = yy + ey;
+                                if (qx >= 0 && qy >= 0 && qx < w && qy < h && m[qy * w + qx]) near = true;
+                            }
+                        if (near) hit++;
+                    }
+                a[y * w + x] = (double)hit / n;
+            }
+        for (int i = 0; i < w * h; i++)
+        {
+            int o = orig[i], g = gen[i], v = 0;
+            for (int sh = 0; sh < 24; sh += 8)
+                v |= (int)(((o >> sh) & 255) * (1 - a[i]) + ((g >> sh) & 255) * a[i]) << sh;
+            orig[i] = (int)(0xff000000u | (uint)v);
+        }
+    }
+
+    // Drops thin parts of a mask (lines narrower than 2*r+1 pixels): erode, then grow back.
+    public static bool[] OpenMask(bool[] m, int w, int h, int r)
+    {
+        Func<bool[], bool, bool[]> pass = (src, all) =>
+        {
+            var o = new bool[w * h];
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    bool v = all;
+                    for (int dy = -r; dy <= r; dy++)
+                        for (int dx = -r; dx <= r; dx++)
+                        {
+                            int xx = x + dx, yy = y + dy;
+                            bool q = xx >= 0 && yy >= 0 && xx < w && yy < h && src[yy * w + xx];
+                            if (all) v &= q; else v |= q;
+                        }
+                    o[y * w + x] = v;
+                }
+            return o;
+        };
+        return pass(pass(m, true), false);
+    }
 }
