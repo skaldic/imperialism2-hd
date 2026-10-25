@@ -1,115 +1,149 @@
 # Imperialism II HD
 
-A fan patch that makes *Imperialism II: Age of Exploration* (1999) fill a modern display, plus the
-reverse-engineering tooling used to build it.
+An unofficial fan patch that makes *Imperialism II: Age of Exploration* (1999) fill a modern
+display: the game at your screen's resolution, wide screens, HD art and sharp text. It also holds
+the reverse-engineering tooling used to build it.
 
 The game is hard-wired to 800x600. Out of the box it either switches your monitor to that
 resolution or draws a small box in the middle of the desktop. With this patch the desktop stays at
-its native resolution and the game is scaled to fit. Optionally the map, battle and main management screens are widened to use a
-16:9 display, and the artwork is replaced by 2x upscaled versions.
+its native resolution and the game is scaled to fit; the map, battle and most other screens are
+widened to 1056x600, close to 16:9, and the art is replaced by 2x versions.
 
-You need your own copy of the game. Nothing from the game is included here, and the game's files
-are never modified.
+## For players
 
-## Status
+Download the latest archive from [Releases](https://github.com/skaldic/imperialism2-hd/releases)
+and unzip it into the game's folder, so that `ddraw.dll` and `imp2hd.ini` sit next to
+`Imperialism II.exe`. The included `imp2hd\README.txt` has the details. To uninstall, delete
+`ddraw.dll`, `imp2hd.ini` and the `imp2hd` folder. The game's own files are never modified.
 
-Developed and tested against the GOG release (v1.03 executable) on Windows 11.
+You need your own copy of the game: the GOG release (v1.03 executable) on Windows 10 or 11 is what
+the patch is made and tested for. Other builds load the patch but it leaves them unchanged.
 
-| Feature | Setting | State |
+What it does:
+
+| Feature | Setting | Notes |
 |---|---|---|
-| Scaling to the display | always on | Works on every screen tried |
-| Wide map (13 tile columns instead of 9) | `Wide=1` | Works; land map and zoomed-out overview |
-| Wide battlefield (1031 instead of 775 pixels) | `Wide=1` | Works on the battles tried |
-| Wide transport, industry, trade and diplomacy screens | `Wide=1` | Works on the screens tried |
-| HD artwork | `HD=1` | Works; quality varies, see below |
-
-Not yet checked: multiplayer, with any of the options on.
+| Scaling to the display | always on | Every screen |
+| Wide map, battlefield and screens (1056x600) | `Wide=1` | Map, battles, transport, industry, trade, diplomacy and its offers, load/save, deals, technology, new game, preferences, high scores, credits. Screens that are one painting (the main menu) are painted out at the sides |
+| HD art | `HD=1` | Upscaled terrain, units, towns, icons and screens |
+| HD map units | `HDMapSprites=1` | Each unit and town drawn from its own HD picture, shadows smoothed |
+| Sharp text | `SharpText=1` | Text drawn again at full resolution |
+| Main menu at 4x | `HDNative=1` | Drawn at the display's own resolution |
 
 Known limits:
 
-- The technology screen, city and battle-report screens, menus and dialogs are not widened: they stay 800 wide and is shown centred, with
-  its own background continued into the margins.
-- HD art is an automatic upscale. Line art and icons come out well; fine textures and very small
-  figures less so.
-- The zoomed-out overview is not HD.
+- Map squares are captured and upscaled as they are met in play, so the released art covers the
+  combinations seen while it was made. On other maps a new mix of coast, river and road shows
+  smoothed instead of HD.
+- Some dialogs and the city screens stay 800 wide, centred, with painted sides.
+- Multiplayer has not been tried.
 
-## Install
-
-1. Build `ddraw.dll` (see below).
-2. Copy it into the game folder, next to `Imperialism II.exe`.
-3. Start the game as usual.
-
-To uninstall, delete `ddraw.dll` from the game folder.
+Problems: open an [issue](https://github.com/skaldic/imperialism2-hd/issues) and attach
+`imp2hd.log` from the game folder (rewritten on each launch).
 
 ## Settings
 
-Optional. Create `imp2hd.ini` next to the exe:
-
-```ini
-[Display]
-Wide=1
-HD=1
-```
+`imp2hd.ini` next to the exe, section `[Display]`:
 
 | Key | Default | Effect |
 |---|---|---|
 | `Enabled` | 1 | 0 turns the patch off without removing the DLL |
+| `Wide` | 0 | 1 widens the screens to 1056x600 (the release ini sets it) |
+| `HD` | 0 | 1 uses the HD art (the release ini sets it) |
+| `Assets` | `imp2hd` in the game folder, else `decomp\assets` | Where the HD art is |
+| `SharpText` | 1 | Draw text again at 2x in a doubled font (fonts that do not scale evenly keep their 1x text) |
+| `HDMapSprites` | 1 | Units, towns and other map pictures from their HD art |
+| `HDNative` | 1 | Painted-out full-screen pictures (the main menu) at the display's resolution from their 4x art |
 | `Smooth` | 1 | 0 uses blocky nearest-neighbour scaling |
 | `FastScale` | 1 | 0 uses GDI's own smooth scaling, which is much slower on large displays |
 | `IntegerScale` | 0 | 1 snaps to a whole-number scale |
-| `Wide` | 0 | 1 widens the map, battle and management screens to 1056x600 |
-| `MarginArt` | 3 | Beside centred screens in wide mode: 0 black, 1 blurred edge, 2 tiled game texture, 3 the screen's background continued |
-| `HD` | 0 | 1 uses upscaled artwork (needs the assets, see below) |
-| `HDAssets` | `decomp\assets\x2` in the game folder | Where the upscaled artwork is |
-| `HDCaptureTiles` | 1 | Save new map tiles for upscaling as they are met |
-| `HDAutoUpscale` | 1 | Upscale newly captured tiles when the game closes |
-| `SharpText` | 1 | Draw the game's text again at 2x in a doubled font, so it is sharp instead of enlarged (fonts that do not scale evenly keep their 1x text) |
-| `HDNative` | 1 | Show painted-out full-screen pictures (the main menu) at the display's own resolution from their 4x art; 0 uses the 2x art like other screens |
-| `HDMapSprites` | 1 | Draw units, towns and other map sprites from their HD art. The patch notes which picture the game loads by number and where it paints it, so each sprite is drawn from its own art (never guessed from pixels); sprite shadows become a soft darkening instead of an enlarged chequer |
+| `MarginArt` | 3 | Beside centred screens: 0 black, 1 blurred edge, 2 tiled game texture, 3 the screen's background continued |
+| `HDCaptureTiles` | 0 | 1 saves new map squares for upscaling as they are met (needs the tools below) |
+| `HDAutoUpscale` | 0 | 1 upscales captured squares when the game closes (needs the tools below) |
 
-`imp2hd.log` is rewritten in the game folder on each launch and records what the patch did.
-`[Debug]` keys (`DumpViews`, `TraceCopies`, `Timing`, `WideSteps`) add diagnostics to it.
+`[Debug]` keys (`DumpViews`, `TraceCopies`, `Timing`, `WideSteps`, `LogCrashes`) add diagnostics to
+`imp2hd.log`.
 
-## Build
+## Contributing
 
-The DLL must be 32-bit. It is built with [llvm-mingw](https://github.com/mstorsjo/llvm-mingw):
+Changes go through pull requests to `main`; each needs the owner's approval before it is merged.
+Open an issue first for anything large.
+
+### Tools
+
+| Tool | Used for |
+|---|---|
+| [llvm-mingw](https://github.com/mstorsjo/llvm-mingw) | building the 32-bit DLL |
+| [Real-ESRGAN ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN/releases) | upscaling the art |
+| [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) with an SDXL inpainting model and the SDXL fp16 VAE | painting out the sides of one-painting screens |
+| [Ghidra](https://github.com/NationalSecurityAgency/ghidra) and a JDK | the decompilation tooling (optional) |
+
+Put them in one folder and set the `IMP2HD_TOOLS` environment variable to it, or put them in
+`tools\external`. The scripts look for `realesrgan\realesrgan-ncnn-vulkan.exe`,
+`sdcpp\bin\sd-cli.exe`, `sdcpp\models\sdxl_inpaint.safetensors`,
+`sdcpp\models\sdxl_vae_fp16_fix.safetensors` and `llvm-mingw-*\bin` there
+(`tools\tools_dir.ps1`); the compiler can also be on `PATH`.
+
+The repository is expected in a folder directly inside the game folder (`<game>\decomp`), so that
+`build.ps1 -Install` and the art paths find the game.
+
+### Build
 
 ```powershell
 .\hd\build.ps1            # builds hd\ddraw.dll
 .\hd\build.ps1 -Install   # also copies it into the game folder
 ```
 
-`build.ps1` has the compiler path hard-coded near the top; change it to match your install. The
-`-Install` switch assumes this repository sits in a folder directly inside the game folder.
+### HD art
 
-## HD artwork
-
-The upscaled art is made from your own copy of the game and is not part of this repository.
-It needs [Real-ESRGAN ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN/releases); the scripts
-expect it in `D:\Tools\realesrgan` unless told otherwise with `-Upscaler`.
+The art is made from your own copy of the game and is not part of this repository.
 
 ```powershell
 .\tools\extract_rsrc.ps1   # Data\*.rsrc -> assets\orig\<archive>\<id>.png
-.\tools\upscale_all.ps1    # assets\orig -> assets\x2, a few minutes on a recent GPU
+.\tools\upscale_all.ps1    # assets\orig -> assets\x2 (and the HD pack), a few minutes on a recent GPU
 ```
 
-`upscale_all.ps1` runs each picture through the `realesrgan-x4plus` model and reduces the result
-to 2x. Along real outlines the model's output is kept; elsewhere most of it is replaced by a plain
-enlargement, so dithered textures are not redrawn as patterns that were never there (`-Grain`,
-`-EdgeLow`, `-EdgeHigh`). Pictures with the magenta transparency key have the key area filled from
-the sprite before upscaling and stamped back afterwards with a rounded mask. `-Only <archive>`
-limits a run; `-NewOnly` skips pictures that are already up to date.
+`upscale_all.ps1` runs each picture through Real-ESRGAN at 4x and reduces it to 2x. Along real
+outlines the model's output is kept; elsewhere most of it is replaced by a plain enlargement, so
+dithered textures are not redrawn as patterns that were never there (`-Grain`, `-EdgeLow`,
+`-EdgeHigh`, `-Model`). Pictures with the magenta transparency key have the key area filled from
+the sprite before upscaling and stamped back afterwards. `-Only <archive>` limits a run;
+`-NewOnly` skips pictures that are already up to date; `-SpritesOnly` does only pictures with
+transparency.
 
-Map tiles are different: the game composes each one at run time, so there is no picture to upscale
-in advance. With `HD=1` the patch saves every new tile it meets to `assets\orig\_tiles` and, when
-the game closes, upscales them into `assets\x2\_tiles`. A part of the map therefore turns HD the
-second time you visit it.
+Map squares are composed by the game at run time, so there is nothing to upscale in advance. With
+`HDCaptureTiles=1` the patch saves every new square it meets to `assets\orig\_tiles`;
+`upscale_all.ps1 -Only _tiles` (or `HDAutoUpscale=1`, when the game closes) makes them HD.
+`grain_tiles.ps1` then puts the original's fine grain and soft grass patches back into terrain, and
+`build_pack.ps1` packs every square and small picture into `assets\x2\hd.pack`, which the game
+reads instead of thousands of PNG files.
+
+Screens that are one painting (the main menu, the sea chart beside the map of nations) are painted
+out by an image model: `outpaint.ps1` and `inpaint_strips.ps1` (with `match_margins.ps1` and
+`refine_region.ps1` to clean up) write `assets\wide\<id>.png` and its 2x and 4x upscales.
+
+### Release
+
+```powershell
+.\tools\make_release.ps1 -Version 1.0.0   # dist\ImperialismII-HD-1.0.0.zip
+```
+
+It builds the DLL and packs it with a default ini, the HD art (the pack, the large pictures, and the
+finished painted-out screens), `INSTALL.txt`, the license and the notice.
+
+### Testing
+
+`hd\drive.ps1` starts the game and plays back clicks, keys and screenshots, for example
+`.\hd\drive.ps1 -GameW 1056 wait:8 click:278,450 wait:4 shot:load`. It only clicks or types while
+the game is the window in front. `hd\layouttool.c` previews a wide layout offline from the
+extracted art and a view dump (`tools\views_from_log.ps1`).
 
 ## How it works
 
 `ddraw.dll` is a proxy: the game loads it in place of the system DirectDraw library, and every
 DirectDraw call is forwarded to the real one. Everything else is done in memory while it loads; all
-addresses are for the v1.03 executable, and patches are only applied if the build matches.
+addresses are for the v1.03 executable, and patches are only applied if the build matches. All of
+it is in `hd/imp2hd.c`.
 
 **Scaling.** One function in the game sets the monitor to 800x600x16; it is patched to report
 success without touching the display. The game paints each frame into an offscreen bitmap and
@@ -124,48 +158,32 @@ from 800 to 1056. Screens are trees of view objects built in code; when the map 
 its views are moved and resized. The map view keeps a cache of rendered tiles with bookkeeping in
 a fixed 110-slot array inside the view object, sized for a 9-column view. That array is relocated
 to the end of an enlarged object by repointing every instruction that indexes it, and the slot
-counts, cache bitmaps and visible-column constants are raised to match. The zoomed-out overview
-has no cache, only loop bounds and limits to change. The map screen's background picture is drawn
-by a replacement routine that moves the side panel's art to the new edge and fills the gap with a
-repeated slice of the border. Other screens are left at 800 and shifted when shown.
+counts, cache bitmaps and visible-column constants are raised to match.
 
 **Wide battlefield.** The battlefield picture is about twice as wide as the battle view and the
 view scrolls across it, with limits taken from the view's own width, so the view is simply made
-wider. Its gilt corner pieces are drawn at fixed positions, which are moved. The background is
-lengthened like the map screen's: the title bar in its middle and the toolbar panel in two plain
-stretches, with the toolbar's buttons spread out to match. On a battle too small to fill the wider
-view, the view is scrolled onto the picture's unused terrain beside the field rather than past the
-picture's edge.
+wider. Its gilt corner pieces are drawn at fixed positions, which are moved, and the background is
+lengthened like the other screens'.
 
-**Wide management screens.** Screens drawn on a single background picture get a table-driven
-layout (`hd/layouts.h`). In each horizontal band of the picture, columns are inserted at chosen
-places and filled from plain artwork nearby: repeated, mirrored, scrambled in short runs, or
-smoothly stretched. Every view is moved by the insertions to its left and widened by any under it.
-The game moves views later (tabs and panels are swapped by moving them on and off screen), so the
-layout is re-applied whenever it does. A few positions are fixed in the game's drawing code and are
-patched to match: the trade screen's goods icons and the diplomacy screens' map of nations. That
-map's country shapes and drawing code are generated once at a fixed screen position, so the
-generator is shown the map view where the layout puts it. `hd/layouttool.c` previews a layout
-offline from the extracted artwork and a view dump (`tools/views_from_log.ps1`).
+**Wide screens.** Screens drawn on a background picture get a table-driven layout (`hd/layouts.h`).
+In each horizontal band of the picture, columns are inserted at chosen places and filled from plain
+artwork nearby: repeated, mirrored, scrambled in short runs, smoothly stretched, or taken from a
+painted-out picture. Every view is moved by the insertions to its left and widened by any under it,
+and the layout is re-applied whenever the game moves views (tabs and panels). A few positions are
+fixed in the game's drawing code and are patched to match: the trade screen's goods icons and the
+diplomacy screens' map of nations.
 
-**Painted-out screens.** Screens that are one painting with nothing plain to lengthen (the main
-menu) are kept whole and centred, and the room is painted out either side by an image model:
-`tools/outpaint.ps1` runs an SDXL inpainting model through
-[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (Vulkan, so it runs on AMD
-cards too) and joins the result to the original along a seam where the two agree best. The pictures
-are made from your own copy of the game and live in `assets/wide` and `assets/x2/_wide`, like the
-other HD art. Without them those screens fall back to mirrored edges.
+**HD art.** The game keeps drawing at 1x. Its picture-copy routine is intercepted; when it copies a
+picture for which an HD version exists, the same rectangle is also drawn at 2x into the 2x frame,
+and the 1x pixels written are remembered. When the frame is shown, pixels that still hold the
+remembered value come from the HD art and everything else is smoothed from the 1x frame. Pictures
+are matched to the game's archives by hashing their pixels; map units and other sprites by the
+number the game loaded them by (its resource manager and its sprite buffers are watched), so no
+sprite is guessed from its pixels. The map is assembled in a second buffer before it reaches the
+frame; that buffer gets the same treatment and its HD blocks travel with it.
 
-**HD artwork.** The game keeps drawing at 1x. Its picture-copy routine is intercepted; when it
-copies a picture for which an upscaled version exists, the same rectangle is also copied at 2x
-into the 2x frame, and the 1x pixels written are remembered. When the frame is shown, pixels that
-still hold the remembered value come from the HD art and everything else is smoothed from the 1x
-frame. Full-colour pictures are matched to files by hashing their pixel data against the game's
-archives; 8-bit pictures, whose palette indices the game remaps on load, by similarity. The map is
-assembled in a second buffer before it reaches the frame, so that buffer gets the same treatment
-and its HD blocks travel with it.
-
-All of it is in `hd/imp2hd.c`.
+**Sharp text.** Every text call is drawn a second time into the 2x frame in a font of twice the
+size, with each character at twice its 1x position, and kept only where the 1x text landed.
 
 ## Decompilation tooling
 
@@ -173,9 +191,6 @@ The game ships with a linker map from an earlier build, which names most of its 
 scripts carry those names over to the shipped executable and produce readable pseudo-C, one file
 per original source file. The output is for study only and is deliberately not part of this
 repository; generate it from your own copy.
-
-Requires [Ghidra](https://github.com/NationalSecurityAgency/ghidra) and a JDK. Paths below assume
-the repository is in a folder inside the game folder.
 
 ```powershell
 # 1. Linker map -> symbols_map_jan1999.csv
@@ -198,26 +213,14 @@ analyzeHeadless.bat .\ghidra_proj Imp2 -process "Imperialism II.exe" `
 The map is from January 1999 and the executable from June 1999, so addresses do not line up.
 `match_names.ps1` relies on both builds sharing link order: it finds the sequence of address
 shifts that lands the most map functions on real function starts. About 93% of game functions are
-placed this way, and a spot check against class names embedded in the executable found roughly 95%
-of those correct. Treat names as strong hints, not facts.
+placed this way; treat names as strong hints, not facts.
 
-`Probe.java` decompiles an address range or lists references to an address, for functions that
-did not get a name. `FindInstructions.java` lists instructions matching a regular expression,
-which is how patch sites were enumerated.
+## License
 
-## Layout
+The code and tools in this repository are under the
+[PolyForm Noncommercial License 1.0.0](LICENSE.md): you may use, change and share them for any
+non-commercial purpose; nobody may use them commercially.
 
-| Path | Contents |
-|---|---|
-| `hd/imp2hd.c`, `hd/imp2hd.def` | the DLL |
-| `hd/build.ps1` | build and install |
-| `hd/drive.ps1` | launch the game and play back clicks, keys and screenshots |
-| `hd/widetest.ps1`, `hd/menutest.ps1`, `hd/shot.ps1`, `hd/cursorshot.ps1` | test runs built on it |
-| `tools/extract_rsrc.ps1`, `tools/upscale_all.ps1`, `tools/upscale_compare.ps1` | artwork pipeline |
-| `tools/map_to_csv.ps1`, `tools/match_names.ps1` | linker-map conversion and name matching |
-| `ghidra_scripts/` | Ghidra headless scripts |
-
-## Legal
-
-*Imperialism II* is a commercial game that is still on sale; its code, artwork and other assets
-belong to their owners. This project is not affiliated with or endorsed by them.
+*Imperialism II* is a commercial game; its code, artwork and other assets belong to their owners,
+and this project is not affiliated with or endorsed by them. The release archives contain artwork
+made from the game's own pictures, which the license does not cover; see [NOTICE.md](NOTICE.md).

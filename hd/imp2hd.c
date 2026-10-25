@@ -3419,7 +3419,7 @@ static void hd_forget_art(void)
 // are met; tools\upscale_all.ps1 -Only _tiles turns those into assets\x2\_tiles, which is what
 // is loaded here.
 
-typedef struct { DWORD hash; DWORD *pixels; BYTE used, onDisk, captured; } HdTile;
+typedef struct { DWORD hash; DWORD *pixels; BYTE used, onDisk, captured, packTried; } HdTile;
 #define HD_TILE_SLOTS 16384
 #define HD_TILE_MAX 12000
 #define HD_TILE_LOADED_MAX 3000
@@ -3476,7 +3476,7 @@ static void hd_scan_tiles(void)
 	CreateDirectoryA(g_tileOrigDir, NULL);
 	int captured = scan_tile_dir(g_tileOrigDir, FALSE);
 	int art = scan_tile_dir(g_tileArtDir, TRUE);
-	logf_("HD: map tiles: %d upscaled, %d captured so far; capture %s", art, captured, g_captureTiles ? "on" : "off");
+	logf_("HD: map tiles: %d upscaled as files, %d captured so far; capture %s (the HD pack holds more)", art, captured, g_captureTiles ? "on" : "off");
 }
 
 static void save_tile(DWORD hash, const WORD *frame, int stride, BOOL bottomUp, int surfaceH, int dx, int dy)
@@ -3517,6 +3517,16 @@ static const DWORD *tile_art(const BYTE *bits, int pw, int ph, BOOL bottomUp8, i
 	HdTile *t = tile_slot(tight_hash(bits, pw, ph, bottomUp8, sx, sy, 64, 64));
 	if (!t) return NULL;
 	if (t->pixels) return t->pixels;
+	if (!t->onDisk && !t->packTried && g_packIndex) {
+		// Not among the PNG files (a release has its squares only in the pack): looked up there once.
+		t->packTried = 1;
+		if (g_tilesLoaded < HD_TILE_LOADED_MAX) {
+			char path[MAX_PATH];
+			snprintf(path, sizeof path, "%s\\%08lx.png", g_tileArtDir, (unsigned long)t->hash);
+			t->pixels = pack_load(path, 128, 128);
+			if (t->pixels) { g_tilesLoaded++; return t->pixels; }
+		}
+	}
 	if (t->onDisk) {
 		if (g_tilesLoaded >= HD_TILE_LOADED_MAX) return NULL;
 		char path[MAX_PATH];

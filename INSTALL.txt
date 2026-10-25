@@ -1,0 +1,38 @@
+Imperialism II HD
+=================
+
+An unofficial fan patch for Imperialism II: Age of Exploration (GOG version 1.03): the game at
+your screen's resolution, wide screens (1056x600 instead of 800x600), HD art for the map, units and
+screens, and sharp text.
+
+Install
+-------
+1. Find the game's folder. For the GOG version it is usually
+   C:\GOG Games\Imperialism II   or   C:\Program Files (x86)\GOG Galaxy\Games\Imperialism II
+   (in GOG Galaxy: the game > Manage installation > Show folder).
+2. Unzip this archive into that folder, so that ddraw.dll and imp2hd.ini sit next to
+   "Imperialism II.exe" and the imp2hd folder is beside them.
+3. Start the game as usual.
+
+Uninstall
+---------
+Delete ddraw.dll, imp2hd.ini and the imp2hd folder (and imp2hd.log, if there is one).
+
+Settings (imp2hd.ini)
+---------------------
+[Display]
+Wide=1          1056x600 screens; 0 keeps the original 800x600
+HD=1            HD art; 0 shows the original art, scaled
+SharpText=1     text drawn at full resolution
+HDMapSprites=1  units, towns and other map pictures in HD
+HDNative=1      the main menu at your screen's own resolution
+Smooth=1        smooth scaling of anything without HD art
+
+Known limits
+------------
+- Map squares are made HD from the combinations seen while the patch was made. On other maps
+  some squares (a new mix of coast, river and road, say) show smoothed instead of HD.
+- A few screens keep the original 800-wide layout, centred, with painted sides.
+
+Problems: https://github.com/skaldic/imperialism2-hd/issues (attach imp2hd.log from the game folder).
+The license and a notice about the artwork are in this folder (LICENSE.md, NOTICE.md).

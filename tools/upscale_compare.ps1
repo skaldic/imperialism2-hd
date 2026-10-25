@@ -3,8 +3,11 @@
 # reduced to 2x. Needs the pictures from extract_rsrc.ps1 and realesrgan-ncnn-vulkan.
 param(
     [string]$Assets = "$PSScriptRoot\..\assets",
-    [string]$Upscaler = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe")
+    [string]$Upscaler = ""
 )
+# External tools default to the tools folder (tools\tools_dir.ps1); set here, as $PSScriptRoot is
+# not available in parameter defaults of a script with mandatory parameters.
+if (-not $Upscaler) { $Upscaler = Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe" }
 
 Add-Type -AssemblyName System.Drawing
 $work = "$Assets\compare"

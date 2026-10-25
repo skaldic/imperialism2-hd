@@ -10,7 +10,7 @@
 # from the sprite, and afterwards the key is stamped back from a pixel-doubled copy of the mask.
 param(
     [string]$Assets = "$PSScriptRoot\..\assets",
-    [string]$Upscaler = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe"),
+    [string]$Upscaler = "",
     [string[]]$Only = @(),              # archive names to process; empty means all
     [string[]]$Terrain = @('MapTiles'), # archives whose key-less 64x64 pictures are repeating terrain
     [double]$Grain = 0.75,              # share of a plain enlargement used away from outlines (0 = none)
@@ -21,6 +21,9 @@ param(
     [switch]$SpritesOnly,               # only pictures with transparency (units, buildings, icons)
     [switch]$NewOnly                    # skip pictures whose upscaled version is already up to date
 )
+# External tools default to the tools folder (tools\tools_dir.ps1); set here, as $PSScriptRoot is
+# not available in parameter defaults of a script with mandatory parameters.
+if (-not $Upscaler) { $Upscaler = Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe" }
 
 Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
 using System;

@@ -5,9 +5,14 @@
 /*.csv
 /*.log
 
-# Build output and test captures
+# Build output, release archives and test captures
 /hd/ddraw.dll
+/hd/layouttool.exe
 /hd/shots/
+/dist/
+
+# External tools (Real-ESRGAN, stable-diffusion.cpp, llvm-mingw), when kept in the tree
+/tools/external/
 
 # Extracted and upscaled game artwork
 /assets/

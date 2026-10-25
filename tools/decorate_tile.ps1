@@ -17,10 +17,15 @@ param(
     [int]$Border = 14,                            # 2x pixels of the tile kept at each edge
     [int]$Steps = 32,
     [double]$Cfg = 7,
-    [string]$Sd = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\bin\sd-cli.exe"),
-    [string]$Model = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_inpaint.safetensors"),
-    [string]$Vae = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_vae_fp16_fix.safetensors")
+    [string]$Sd = "",
+    [string]$Model = "",
+    [string]$Vae = ""
 )
+# External tools default to the tools folder (tools\tools_dir.ps1); set here, as $PSScriptRoot is
+# not available in parameter defaults of a script with mandatory parameters.
+if (-not $Sd) { $Sd = Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\bin\sd-cli.exe" }
+if (-not $Model) { $Model = Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_inpaint.safetensors" }
+if (-not $Vae) { $Vae = Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_vae_fp16_fix.safetensors" }
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing
 $assets = Join-Path $PSScriptRoot "..\assets"
