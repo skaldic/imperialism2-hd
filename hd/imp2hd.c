@@ -268,8 +268,8 @@ static void adopt_child(HWND parent, HWND child)
 	RECT r;
 	GetWindowRect(child, &r);
 	MapWindowPoints(NULL, parent, (POINT *)&r, 2);
-	logf_("child %p of %p class '%s' style %08lx at %ld,%ld %ldx%ld", (void *)child, (void *)parent, cls,
-		(unsigned long)GetWindowLongA(child, GWL_STYLE), r.left, r.top, r.right - r.left, r.bottom - r.top);
+	logf_("child %p of %p class '%s' style %08lx at %ld,%ld %ldx%ld (offset %d)", (void *)child, (void *)parent, cls,
+		(unsigned long)GetWindowLongA(child, GWL_STYLE), r.left, r.top, r.right - r.left, r.bottom - r.top, g_offsetX);
 	SetWindowPos(child, NULL, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
 
 	// Re-send whatever font it has now, so it is swapped for the enlarged one.
@@ -735,6 +735,7 @@ typedef struct {
 	ScreenLayout layout;        // places its views
 	ScreenLayout look;          // fills it: the layout or its variant for the artwork shown
 	short lookPicture;          // the artwork `look` was chosen for
+	BOOL laidOut;               // its views have been placed once
 	short map[LAYOUT_MAX_BANDS][LAYOUT_MAX_W]; // from `look`
 } WidePicture;
 static WidePicture g_widePictures[MAX_WIDE_PICTURES];
@@ -931,6 +932,7 @@ static WidePicture *register_wide_picture(BYTE *picture, BYTE *screen, const Scr
 	slot->look = *layout;
 	if (slot->look.generated && !generated_art(slot->look.generated)) slot->look.generated = 0; // fall back
 	slot->lookPicture = -1;
+	slot->laidOut = FALSE;
 	for (int b = 0; b < LAYOUT_MAX_BANDS && layout->bands[b].bottom; b++)
 		layout_band_map(&slot->look, &slot->look.bands[b], slot->map[b]);
 	return slot;
@@ -956,7 +958,7 @@ static BOOL drawn_as_picture(const BYTE *view)
 // 800-wide layout) is remembered, and whenever the game has changed it since, the view is placed
 // again from the new value.
 #define VIEW_RECORDS 4096
-typedef struct { BYTE *view, *screen; int origX, origW, setX, setW; } ViewRecord;
+typedef struct { BYTE *view, *screen; int origX, origW, setX, setW; BOOL fixed; } ViewRecord;
 static ViewRecord g_viewRecords[VIEW_RECORDS];
 
 static ViewRecord *view_record(BYTE *view, BYTE *screen)
@@ -971,6 +973,7 @@ static ViewRecord *view_record(BYTE *view, BYTE *screen)
 			r->origX = VIEW_INT(view, V_X);
 			r->origW = VIEW_INT(view, V_W);
 			r->setX = INT_MIN;
+			r->fixed = FALSE;
 			return r;
 		}
 	}
@@ -990,6 +993,11 @@ static int sync_layout(BYTE *screen, BYTE *view, const LayoutContext *ctx, int p
 		if (!readable(child, 0x54)) continue;
 		ViewRecord *rec = view_record(child, screen);
 		if (!rec) return changed;
+		// A text box the game adds once the screen is up (the name of a saved game, typed into its
+		// slot) is placed from views already moved: it is where it belongs, and stays there.
+		if (rec->setX == INT_MIN && wide_picture(screen) && wide_picture(screen)->laidOut &&
+			!strcmp(view_class(child), "TEditText")) rec->fixed = TRUE;
+		if (rec->fixed) { rec->setX = VIEW_INT(child, V_X); rec->setW = VIEW_INT(child, V_W); continue; }
 		if (rec->setX != INT_MIN && (VIEW_INT(child, V_X) != rec->setX || VIEW_INT(child, V_W) != rec->setW)) {
 			if (g_dumpViews) {
 				static int logged;
@@ -1054,7 +1062,9 @@ static void sync_layout_screen(BYTE *screen)
 	WidePicture *wide = wide_picture(screen);
 	if (!wide) return;
 	LayoutContext ctx = { &wide->layout, 0, 0, VIEW_INT(screen, 0x30) };
-	if (sync_layout(screen, screen, &ctx, 0, 0)) {
+	int changed = sync_layout(screen, screen, &ctx, 0, 0);
+	wide->laidOut = TRUE;
+	if (changed) {
 		// Through the game (TView::InvalidateRect), so that the views themselves are redrawn and
 		// not just the last frame shown again.
 		typedef void (__attribute__((thiscall)) *Invalidate)(void *, const RECT *, int);
