@@ -18,9 +18,9 @@ param(
     [double]$Cfg = 6.5,
     [int]$Feather = 6,                            # 1x pixels of soft edge
     [switch]$Apply,
-    [string]$Sd = "D:\Tools\sdcpp\bin\sd-cli.exe",
-    [string]$Model = "D:\Tools\sdcpp\models\sdxl_inpaint.safetensors",
-    [string]$Vae = "D:\Tools\sdcpp\models\sdxl_vae_fp16_fix.safetensors"
+    [string]$Sd = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\bin\sd-cli.exe"),
+    [string]$Model = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_inpaint.safetensors"),
+    [string]$Vae = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_vae_fp16_fix.safetensors")
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing

@@ -65,6 +65,9 @@ static BYTE *g_topScreen; // the screen on top, as last seen by watch_screens
 static BOOL g_hdNative = TRUE;
 static BOOL g_mapSprites; // HD art for map units, drawn from the picture known by number (HDMapSprites) // full-screen paintings shown at the display's resolution (HDNative)
 static char g_gameDir[MAX_PATH];
+// The HD art: <game>\imp2hd as installed from a release (x2, x4, wide), or the source tree's
+// decomp\assets when working on the patch; [Display] Assets= in the ini overrides both.
+static char g_assetsRoot[MAX_PATH];
 static BOOL g_twoStage; // smooth scaling through the 2x frame instead of GDI's slow HALFTONE
 static HDC g_hdDC;
 static BOOL hd_compose(HDC source, int x0, int y0, int x1, int y1);
@@ -760,7 +763,6 @@ static void layout_patch_fill(BYTE *src, BYTE *dst, const LayoutInsert *in, int 
 // Painted-out screens (layouts.h, 'G'): the 1x picture, and its 2x upscale when there is one.
 typedef struct { short id; BOOL tried; DWORD *px1, *px2, *px4; } GeneratedArt;
 static GeneratedArt g_generated[8];
-static char g_gameDir[MAX_PATH];
 
 static const GeneratedArt *generated_art(short id)
 {
@@ -773,11 +775,11 @@ static const GeneratedArt *generated_art(short id)
 	if (!slot) return NULL;
 	slot->id = id;
 	char path[MAX_PATH];
-	snprintf(path, sizeof path, "%sdecomp\\assets\\wide\\%d.png", g_gameDir, id);
+	snprintf(path, sizeof path, "%s\\wide\\%d.png", g_assetsRoot, id);
 	slot->px1 = hd_load_png(path, g_gameW, GAME_H);
-	snprintf(path, sizeof path, "%sdecomp\\assets\\x2\\_wide\\%d.png", g_gameDir, id);
+	snprintf(path, sizeof path, "%s\\x2\\_wide\\%d.png", g_assetsRoot, id);
 	if (slot->px1) slot->px2 = hd_load_png(path, g_gameW * 2, GAME_H * 2);
-	snprintf(path, sizeof path, "%sdecomp\\assets\\x4\\_wide\\%d.png", g_gameDir, id);
+	snprintf(path, sizeof path, "%s\\x4\\_wide\\%d.png", g_assetsRoot, id);
 	if (slot->px1 && g_hd && g_hdNative) slot->px4 = hd_load_png(path, g_gameW * 4, GAME_H * 4);
 	logf_("painted-out picture %d: %s, 2x %s, 4x %s", id, slot->px1 ? "loaded" : "missing",
 		slot->px2 ? "loaded" : "missing", slot->px4 ? "loaded" : "missing");
@@ -4771,7 +4773,7 @@ static void hd_on_exit(void)
 {
 	if (!g_hd || !g_autoUpscale || g_tilesCaptured == 0) return;
 	char script[MAX_PATH], command[2 * MAX_PATH + 128];
-	snprintf(script, sizeof script, "%s\\..\\..\\tools\\upscale_all.ps1", g_hdAssets);
+	snprintf(script, sizeof script, "%s\\..\\tools\\upscale_all.ps1", g_assetsRoot);
 	if (GetFileAttributesA(script) == INVALID_FILE_ATTRIBUTES) {
 		logf_("HD: %d new map tiles captured; run upscale_all.ps1 -Only _tiles to upscale them", g_tilesCaptured);
 		return;
@@ -4896,8 +4898,8 @@ static void install(HMODULE self)
 	g_dumpViews = GetPrivateProfileIntA("Debug", "DumpViews", 0, ini);
 	g_timing = GetPrivateProfileIntA("Debug", "Timing", 0, ini);
 	g_twoStage = g_smooth && GetPrivateProfileIntA("Display", "FastScale", 1, ini);
-	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 1, ini);
-	g_autoUpscale = GetPrivateProfileIntA("Display", "HDAutoUpscale", 1, ini);
+	g_captureTiles = GetPrivateProfileIntA("Display", "HDCaptureTiles", 0, ini);
+	g_autoUpscale = GetPrivateProfileIntA("Display", "HDAutoUpscale", 0, ini);
 	g_marginArt = GetPrivateProfileIntA("Display", "MarginArt", 3, ini);
 	g_hdNative = GetPrivateProfileIntA("Display", "HDNative", 1, ini);
 	g_sharpText = GetPrivateProfileIntA("Display", "SharpText", 1, ini);
@@ -4940,9 +4942,12 @@ static void install(HMODULE self)
 	if (g_knownBuild && GetPrivateProfileIntA("Debug", "TraceCopies", 0, ini)) {
 		trace_picture_copies();
 	} else if (g_knownBuild && GetPrivateProfileIntA("Display", "HD", 0, ini)) {
-		char fallback[MAX_PATH];
-		snprintf(fallback, sizeof fallback, "%sdecomp\\assets\\x2", g_gameDir);
-		GetPrivateProfileStringA("Display", "HDAssets", fallback, g_hdAssets, sizeof g_hdAssets, ini);
+		char fallback[MAX_PATH], probe[MAX_PATH];
+		snprintf(fallback, sizeof fallback, "%simp2hd", g_gameDir);
+		snprintf(probe, sizeof probe, "%s\\x2", fallback);
+		if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) snprintf(fallback, sizeof fallback, "%sdecomp\\assets", g_gameDir);
+		GetPrivateProfileStringA("Display", "Assets", fallback, g_assetsRoot, sizeof g_assetsRoot, ini);
+		snprintf(g_hdAssets, sizeof g_hdAssets, "%s\\x2", g_assetsRoot);
 		hd_install();
 	}
 	// Four extra 64-pixel map columns: 1056x600, close to 16:9.

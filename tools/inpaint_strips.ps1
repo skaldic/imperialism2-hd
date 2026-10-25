@@ -18,10 +18,10 @@ param(
     [double]$Cfg = 6.5,
     [int]$Feather = 12,
     [int]$Overlap = 10,                           # columns of the picture repainted beside each strip
-    [string]$Sd = "D:\Tools\sdcpp\bin\sd-cli.exe",
-    [string]$Model = "D:\Tools\sdcpp\models\sdxl_inpaint.safetensors",
-    [string]$Vae = "D:\Tools\sdcpp\models\sdxl_vae_fp16_fix.safetensors",
-    [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe"
+    [string]$Sd = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\bin\sd-cli.exe"),
+    [string]$Model = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_inpaint.safetensors"),
+    [string]$Vae = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_vae_fp16_fix.safetensors"),
+    [string]$Upscaler = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe")
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing

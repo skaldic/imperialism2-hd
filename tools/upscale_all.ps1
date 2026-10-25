@@ -10,7 +10,7 @@
 # from the sprite, and afterwards the key is stamped back from a pixel-doubled copy of the mask.
 param(
     [string]$Assets = "$PSScriptRoot\..\assets",
-    [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe",
+    [string]$Upscaler = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe"),
     [string[]]$Only = @(),              # archive names to process; empty means all
     [string[]]$Terrain = @('MapTiles'), # archives whose key-less 64x64 pictures are repeating terrain
     [double]$Grain = 0.75,              # share of a plain enlargement used away from outlines (0 = none)

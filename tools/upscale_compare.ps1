@@ -3,7 +3,7 @@
 # reduced to 2x. Needs the pictures from extract_rsrc.ps1 and realesrgan-ncnn-vulkan.
 param(
     [string]$Assets = "$PSScriptRoot\..\assets",
-    [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe"
+    [string]$Upscaler = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe")
 )
 
 Add-Type -AssemblyName System.Drawing

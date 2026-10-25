@@ -17,9 +17,9 @@ param(
     [int]$Border = 14,                            # 2x pixels of the tile kept at each edge
     [int]$Steps = 32,
     [double]$Cfg = 7,
-    [string]$Sd = "D:\Tools\sdcpp\bin\sd-cli.exe",
-    [string]$Model = "D:\Tools\sdcpp\models\sdxl_inpaint.safetensors",
-    [string]$Vae = "D:\Tools\sdcpp\models\sdxl_vae_fp16_fix.safetensors"
+    [string]$Sd = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\bin\sd-cli.exe"),
+    [string]$Model = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_inpaint.safetensors"),
+    [string]$Vae = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_vae_fp16_fix.safetensors")
 )
 $ErrorActionPreference = "Stop"
 Add-Type -AssemblyName System.Drawing

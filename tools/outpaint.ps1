@@ -16,10 +16,10 @@ param(
     [double]$Cfg = 6.5,
     [int]$Overlap = 12,                           # columns of the original repainted at each seam
     [int]$Blend = 12,                             # of those, crossfaded into the original (GENERATED_BLEND)
-    [string]$Sd = "D:\Tools\sdcpp\bin\sd-cli.exe",
-    [string]$Model = "D:\Tools\sdcpp\models\sdxl_inpaint.safetensors",
-    [string]$Vae = "D:\Tools\sdcpp\models\sdxl_vae_fp16_fix.safetensors",
-    [string]$Upscaler = "D:\Tools\realesrgan\realesrgan-ncnn-vulkan.exe",
+    [string]$Sd = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\bin\sd-cli.exe"),
+    [string]$Model = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_inpaint.safetensors"),
+    [string]$Vae = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "sdcpp\models\sdxl_vae_fp16_fix.safetensors"),
+    [string]$Upscaler = (Join-Path (& "$PSScriptRoot\tools_dir.ps1") "realesrgan\realesrgan-ncnn-vulkan.exe"),
     [switch]$Make4x,                             # only (re)make the 4x picture from the 1x and 2x ones
     [int]$Pick = 0                                # with a seed: make that candidate the one used
 )
