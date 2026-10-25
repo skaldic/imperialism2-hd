@@ -4860,6 +4860,45 @@ static void widen_globals(void)
 	}
 }
 
+// The free-space check at startup: the game asks for the free bytes and keeps only their low 32
+// bits, so on a drive with many GB free the result wraps every 4 GB and can land under the 25 MB
+// it wants, putting up a false "low on free disk space" warning. The amounts are capped at 2 GB.
+static BOOL (WINAPI *o_GetDiskFreeSpaceExA)(LPCSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+static BOOL (WINAPI *o_GetDiskFreeSpaceA)(LPCSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD);
+static FARPROC (WINAPI *o_GetProcAddress)(HMODULE, LPCSTR);
+
+static BOOL WINAPI disk_free_ex(LPCSTR dir, PULARGE_INTEGER avail, PULARGE_INTEGER total, PULARGE_INTEGER free)
+{
+	BOOL ok = o_GetDiskFreeSpaceExA(dir, avail, total, free);
+	const ULONGLONG cap = 0x7fffffffull;
+	if (ok && avail && avail->QuadPart > cap) avail->QuadPart = cap;
+	if (ok && total && total->QuadPart > cap) total->QuadPart = cap;
+	if (ok && free && free->QuadPart > cap) free->QuadPart = cap;
+	return ok;
+}
+
+static BOOL WINAPI h_GetDiskFreeSpaceA(LPCSTR dir, LPDWORD sectorsPerCluster, LPDWORD bytesPerSector, LPDWORD freeClusters, LPDWORD clusters)
+{
+	BOOL ok = o_GetDiskFreeSpaceA(dir, sectorsPerCluster, bytesPerSector, freeClusters, clusters);
+	if (ok && sectorsPerCluster && bytesPerSector && freeClusters && *sectorsPerCluster && *bytesPerSector) {
+		ULONGLONG cluster = (ULONGLONG)*sectorsPerCluster * *bytesPerSector, most = 0x7fffffffull / cluster;
+		if (*freeClusters > most) *freeClusters = (DWORD)most;
+		if (clusters && *clusters > most) *clusters = (DWORD)most;
+	}
+	return ok;
+}
+
+// The game finds GetDiskFreeSpaceEx by name at run time, so it is handed the capped one there.
+static FARPROC WINAPI h_GetProcAddress(HMODULE module, LPCSTR name)
+{
+	FARPROC fn = o_GetProcAddress(module, name);
+	if (fn && HIWORD((DWORD_PTR)name) && (!strcmp(name, "GetDiskFreeSpaceExA") || !strcmp(name, "GetDiskFreeSpaceEx"))) {
+		if (!o_GetDiskFreeSpaceExA) o_GetDiskFreeSpaceExA = (void *)fn;
+		return (FARPROC)disk_free_ex;
+	}
+	return fn;
+}
+
 #define HOOK(dll, name) hook_import(dll, #name, h_##name, &o_##name)
 
 // Diagnostic: access violations are logged with where they happened (the game may handle some
@@ -4945,6 +4984,8 @@ static void install(HMODULE self)
 	HOOK("GDI32.dll", ExtTextOutA);
 	HOOK("GDI32.dll", TextOutA);
 	HOOK("USER32.dll", DrawTextA);
+	HOOK("KERNEL32.dll", GetDiskFreeSpaceA);
+	HOOK("KERNEL32.dll", GetProcAddress);
 	BOOL native = skip_mode_switch();
 	lstrcpynA(g_gameDir, ini, sizeof g_gameDir);
 	char *lastSlash = strrchr(g_gameDir, '\\');
