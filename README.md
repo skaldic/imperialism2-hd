@@ -9,6 +9,18 @@ resolution or draws a small box in the middle of the desktop. With this patch th
 its native resolution and the game is scaled to fit; the map, battle and most other screens are
 widened to 1056x600, close to 16:9, and the art is replaced by 2x versions.
 
+## Screenshots
+
+Left: the original game, scaled to the display. Right: with the patch.
+
+![The map, original and with the patch](https://github.com/skaldic/imperialism2-hd/releases/download/v1.0.0/map.jpg)
+
+![A close-up of the map: terrain, towns and units in HD](https://github.com/skaldic/imperialism2-hd/releases/download/v1.0.0/closeup.jpg)
+
+![The transport screen, widened](https://github.com/skaldic/imperialism2-hd/releases/download/v1.0.0/trans.jpg)
+
+![The main menu, painted out at the sides](https://github.com/skaldic/imperialism2-hd/releases/download/v1.0.0/menu.jpg)
+
 ## For players
 
 Download the latest archive from [Releases](https://github.com/skaldic/imperialism2-hd/releases)
