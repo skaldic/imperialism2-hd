@@ -360,7 +360,8 @@ static int g_presentPixels;
 static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks, g_findTicks;
 static int g_tileCalls, g_tileHits;
 static int g_spriteById, g_spriteUnknown; // sprites drawn from the picture known by number / left at 1x
-static LONGLONG g_knownTicks, g_noteTicks, g_tileTicks;  // time finding sprites by number, and recording cache sprites
+static LONGLONG g_knownTicks, g_noteTicks, g_tileTicks, g_pngTicks;
+static int g_pngLoads;                       // HD pictures read from disk and decoded  // time finding sprites by number, and recording cache sprites
 static int g_copyCalls;
 static int g_traceBudget; // diagnostic: number of paint calls still to be logged
 static int g_drawTrace; // diagnostic: direct-to-window drawing calls still to be logged
@@ -1262,14 +1263,14 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		QueryPerformanceFrequency(&freq);
 		QueryPerformanceCounter(&a);
 		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = g_findTicks = 0; g_tileCalls = g_tileHits = 0; g_copyCalls = 0;
-		g_spriteById = g_spriteUnknown = 0; g_knownTicks = g_noteTicks = 0; g_tileTicks = 0;
+		g_spriteById = g_spriteUnknown = 0; g_knownTicks = g_noteTicks = 0; g_tileTicks = 0; g_pngTicks = 0; g_pngLoads = 0;
 		LRESULT r = CallWindowProcA(g_viewProc, hwnd, msg, wp, lp);
 		QueryPerformanceCounter(&b);
 		double ms = (b.QuadPart - a.QuadPart) * 1000.0 / freq.QuadPart;
 		double k = 1000.0 / freq.QuadPart;
-		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f), tiles %d/%d HD; %d game pixels; sprites %d by number (%.1f), %d unknown; cache sprites %.1f; tiles %.1f", ms,
+		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f), tiles %d/%d HD; %d game pixels; sprites %d by number (%.1f), %d unknown; cache sprites %.1f; tiles %.1f; %d pictures read (%.1f)", ms,
 			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_findTicks * k, g_tileHits, g_tileCalls, g_presentPixels,
-			g_spriteById, g_knownTicks * k, g_spriteUnknown, g_noteTicks * k, g_tileTicks * k);
+			g_spriteById, g_knownTicks * k, g_spriteUnknown, g_noteTicks * k, g_tileTicks * k, g_pngLoads, g_pngTicks * k);
 		return r;
 	}
 	switch (msg) {
@@ -2782,7 +2783,103 @@ static void hd_build_index(void)
 	logf_("HD: indexed %d pictures", g_hdIndexCount);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The HD pack (tools\build_pack.ps1): map tiles and small pictures as ready-to-use pixels in one
+// file, x2\hd.pack. A picture is one small read instead of opening and decoding a PNG, and the
+// whole file is read once in the background at startup, so on a hard disk the first map views
+// do not wait on thousands of scattered files (Windows keeps it cached, outside the game's
+// memory). Pictures not in the pack are read from their PNG.
+
+typedef struct { DWORD key; WORD w, h; DWORD offset; } PackEntry;
+static HANDLE g_pack = INVALID_HANDLE_VALUE;
+static PackEntry *g_packIndex;
+static int g_packCount;
+
+static DWORD WINAPI pack_warm(LPVOID path)
+{
+	SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN); // low disk priority too
+	HANDLE f = CreateFileA((const char *)path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+	if (f == INVALID_HANDLE_VALUE) return 0;
+	BYTE *buf = malloc(1 << 20);
+	DWORD got;
+	LARGE_INTEGER t0, t1, freq;
+	QueryPerformanceCounter(&t0);
+	long long total = 0;
+	while (buf && ReadFile(f, buf, 1 << 20, &got, NULL) && got) total += got;
+	QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&freq);
+	logf_("HD: pack read ahead, %lld MB in %.1f s", total >> 20, (double)(t1.QuadPart - t0.QuadPart) / freq.QuadPart);
+	free(buf);
+	CloseHandle(f);
+	return 0;
+}
+
+static void pack_open(void)
+{
+	static char path[MAX_PATH];
+	static BOOL tried;
+	if (tried) return;
+	tried = TRUE;
+	snprintf(path, sizeof path, "%s\\hd.pack", g_hdAssets);
+	HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_RANDOM_ACCESS, NULL);
+	if (f == INVALID_HANDLE_VALUE) { logf_("HD: no pack (%s): pictures are read as PNG", path); return; }
+	DWORD head[3], got;
+	if (!ReadFile(f, head, sizeof head, &got, NULL) || got != sizeof head || head[0] != 0x50483249 || head[1] != 1 || head[2] > 100000) {
+		logf_("HD: %s is not a pack this version reads", path);
+		CloseHandle(f);
+		return;
+	}
+	PackEntry *index = malloc((size_t)head[2] * sizeof *index);
+	if (!index || !ReadFile(f, index, head[2] * sizeof *index, &got, NULL) || got != head[2] * sizeof *index) {
+		free(index);
+		CloseHandle(f);
+		return;
+	}
+	g_packIndex = index; g_packCount = (int)head[2]; g_pack = f;
+	logf_("HD: pack with %d pictures", g_packCount);
+	HANDLE t = CreateThread(NULL, 0, pack_warm, path, 0, NULL);
+	if (t) CloseHandle(t);
+}
+
+// The picture at `path` (a PNG under the assets folder) from the pack, or NULL.
+static DWORD *pack_load(const char *path, int w2, int h2)
+{
+	pack_open();
+	if (!g_packIndex) return NULL;
+	size_t n = strlen(g_hdAssets), len = strlen(path);
+	if (len < n + 5 || _strnicmp(path, g_hdAssets, n) || path[n] != '\\' || _stricmp(path + len - 4, ".png")) return NULL;
+	DWORD key = 2166136261u;
+	for (size_t i = n + 1; i < len - 4; i++) key = (key ^ (BYTE)tolower((BYTE)path[i])) * 16777619u;
+	int lo = 0, hi = g_packCount;
+	while (lo < hi) { int mid = (lo + hi) / 2; if (g_packIndex[mid].key < key) lo = mid + 1; else hi = mid; }
+	if (lo >= g_packCount || g_packIndex[lo].key != key || g_packIndex[lo].w != w2 || g_packIndex[lo].h != h2) return NULL;
+	size_t count = (size_t)w2 * h2;
+	BYTE *raw = malloc(count * 3);
+	DWORD *pixels = malloc(count * 4);
+	OVERLAPPED at = { 0 };
+	at.Offset = g_packIndex[lo].offset;
+	DWORD got = 0;
+	if (!raw || !pixels || !ReadFile(g_pack, raw, (DWORD)(count * 3), &got, &at) || got != count * 3) {
+		free(raw); free(pixels);
+		return NULL;
+	}
+	for (size_t i = 0; i < count; i++) pixels[i] = 0xff000000u | raw[i * 3 + 2] << 16 | raw[i * 3 + 1] << 8 | raw[i * 3];
+	free(raw);
+	return pixels;
+}
+
+static DWORD *hd_load_png_(const char *path, int w2, int h2);
 static DWORD *hd_load_png(const char *path, int w2, int h2)
+{
+	LARGE_INTEGER a, b;
+	QueryPerformanceCounter(&a);
+	DWORD *pixels = pack_load(path, w2, h2);
+	if (!pixels) pixels = hd_load_png_(path, w2, h2);
+	QueryPerformanceCounter(&b);
+	g_pngTicks += b.QuadPart - a.QuadPart;
+	g_pngLoads++;
+	return pixels;
+}
+static DWORD *hd_load_png_(const char *path, int w2, int h2)
 {
 	static ULONG_PTR token;
 	if (!token) {
@@ -3371,6 +3468,7 @@ static BOOL hd_ready(void)
 		indexed = TRUE;
 		hd_build_index();
 		hd_scan_tiles();
+		pack_open(); // and start reading it ahead
 	}
 	return TRUE;
 }

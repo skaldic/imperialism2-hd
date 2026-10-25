@@ -295,8 +295,14 @@ public static class ImageOps
 
     // Puts a tile's own fine grain back into its 2x version: each 2x pixel gets `amount` times the
     // difference between the 1x pixel under it and that pixel's 3x3 average (the tile wraps at its
-    // edges, as terrain does). Shading and colour stay the upscale's; only the speckle returns.
+    // edges, as terrain does; a captured map square, whose neighbours differ, is clamped instead).
+    // Shading and colour stay the upscale's; only the speckle returns.
     public static void AddGrain(int[] hd, int w2, int h2, int[] orig, int w, int h, double amount)
+    {
+        AddGrain(hd, w2, h2, orig, w, h, amount, true);
+    }
+
+    public static void AddGrain(int[] hd, int w2, int h2, int[] orig, int w, int h, double amount, bool wrap)
     {
         var detail = new double[w * h * 3];
         for (int y = 0; y < h; y++)
@@ -306,7 +312,9 @@ public static class ImageOps
                 for (int dy = -1; dy <= 1; dy++)
                     for (int dx = -1; dx <= 1; dx++)
                     {
-                        int q = orig[((y + dy + h) % h) * w + (x + dx + w) % w];
+                        int yy = wrap ? (y + dy + h) % h : Math.Min(Math.Max(y + dy, 0), h - 1);
+                        int xx = wrap ? (x + dx + w) % w : Math.Min(Math.Max(x + dx, 0), w - 1);
+                        int q = orig[yy * w + xx];
                         r += (q >> 16) & 255; g += (q >> 8) & 255; b += q & 255;
                     }
                 int p = orig[y * w + x], i = (y * w + x) * 3;
@@ -372,7 +380,9 @@ public static class ImageOps
 
     // Uneven grass: smooth random patches, wrapping at the tile's edges so the tile still repeats
     // seamlessly. Light patches turn slightly yellow (dry), dark ones deeper green (clumps).
-    // `amount` is the brightness change at the strongest patch (0.15 = 15%).
+    // `amount` is the brightness change at the strongest patch (0.15 = 15%). Only grass takes it:
+    // each pixel by how green it is, so water, snow and roads are left alone, and a grass pixel
+    // gets the same change in any tile (the pattern is the same everywhere): no seams.
     public static void Mottle(int[] px, int w, int h, double amount, int seed)
     {
         var field = new double[w * h];
@@ -397,8 +407,9 @@ public static class ImageOps
         double max = 1e-9; foreach (double v in field) max = Math.Max(max, Math.Abs(v));
         for (int i = 0; i < w * h; i++)
         {
-            double f = field[i] / max, k = 1 + amount * f;
             int p = px[i], r = (p >> 16) & 255, g = (p >> 8) & 255, b = p & 255;
+            double green = Math.Min(1, Math.Max(0, (g - Math.Max(r, b) - 6) / 20.0));
+            double f = field[i] / max * green, k = 1 + amount * f;
             double dry = Math.Max(0, f) * amount * 0.6; // light patches drift toward straw
             int nr = Clamp((int)Math.Round(r * k + dry * 90));
             int ng = Clamp((int)Math.Round(g * k + dry * 40));
@@ -506,5 +517,12 @@ public static class ImageOps
             return o;
         };
         return pass(pass(m, true), false);
+    }
+
+    // True when any pixel is the transparent key (magenta): a sprite, not a terrain square.
+    public static bool HasKey(int[] px)
+    {
+        foreach (int p in px) if ((p & 0xffffff) == 0xff00ff) return true;
+        return false;
     }
 }

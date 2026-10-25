@@ -306,11 +306,9 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
     foreach ($name in $info.Keys) {
         if (-not (Test-Path -LiteralPath "$tempOut\$name")) { continue }
         $dest = "$Assets\x2\$($dir.Name)\$name"
-        if ($info[$name].Tile) {
-            [KeyedUpscale]::FinishTile("$tempOut\$name", $info[$name].Source, $dest, $Grain); $tiles++
-            # grain_tiles.ps1 starts from its saved copy, which this tile now replaces
-            Remove-Item -LiteralPath "$Assets\x2_before_grain\$($dir.Name)\$name" -ErrorAction SilentlyContinue
-        }
+        # grain_tiles.ps1 starts from its saved copy, which this picture now replaces
+        Remove-Item -LiteralPath "$Assets\x2_before_grain\$($dir.Name)\$name" -ErrorAction SilentlyContinue
+        if ($info[$name].Tile) { [KeyedUpscale]::FinishTile("$tempOut\$name", $info[$name].Source, $dest, $Grain); $tiles++ }
         else { [KeyedUpscale]::Finish("$tempOut\$name", "$tempIn\$name", $dest, $info[$name].Mask, $info[$name].W, $info[$name].H, $Grain) }
         $done++
         if ($null -ne $info[$name].Mask) { $keyed++ }
@@ -320,4 +318,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $orig -Directory) {
 }
 Remove-Item -Recurse -Force $tempIn, $tempOut -ErrorAction SilentlyContinue
 "upscaled $total pictures ($keyed with transparency, $tiles terrain tiles) -> $Assets\x2"
-if ($tiles -gt 0) { & "$PSScriptRoot\grain_tiles.ps1" -Amount $TileGrain -Terrain $Terrain -Assets $Assets }
+# New terrain (the game's tiles, and map squares captured in play) gets its grain; the HD pack
+# is rebuilt either way, so the game reads the new pictures from it.
+& "$PSScriptRoot\grain_tiles.ps1" -Amount $TileGrain -Assets $Assets -NewOnly -NoPack
+if ($total -gt 0) { & "$PSScriptRoot\build_pack.ps1" -Assets $Assets }
