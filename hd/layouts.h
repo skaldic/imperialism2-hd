@@ -121,9 +121,20 @@ static const ScreenLayout g_screenLayouts[] = {
 		// either side of it is painted out (tools\\inpaint_strips.ps1).
 		0, 1, 4140,
 	},
+	// The screen for offers made to you: the diplomacy screen with a panel over it, the Reject and
+	// Accept seals either side of the offer's text. The seals' pictures carry a strip of the panel's
+	// frame on their outer side, so they must stay against the frame: the panel is lengthened between
+	// each seal and the text instead of at its ends (the diplomacy screen's places, which cut through
+	// the seals). It is widened only when the panel turns out as expected (offer_panel_fits).
+	{ "diplomatic offers", "TDiplomacyOfferView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600, {
+		{ 0, 55, { { 135, 128, 135, 20, 'S' }, { 667, 128, 647, 20, 'S' } } },
+		{ 55, 96, { { 135, 128, 140, 40, 'R' }, { 667, 128, 600, 40, 'R' } } },
+		// The panel down to the gold rope under it, all at the same places: the rope runs straight
+		// there (the diplomacy screen's places are in its curve up into the corners).
+		{ 96, 245, { { 200, 128, 200, 64, 'M' }, { 590, 128, 526, 64, 'M' } } },
+		{ 245, 600, { { 100, 125, 80, 20, 'G' }, { 705, 131, 705, 20, 'G' } } },
+	}, 0, 1, 4140 },
 	// The same map of nations on the final vote screen.
-	// (Not the screen for offers made to you: its panel, with the Accept and Reject seals, is laid
-	// out differently and came out broken. It stays centred until it has a layout of its own.)
 	{ "final vote", "TDiplomacyFinalView", LID('m', 'a', 'i', 'n'), LID('h', 'e', 'r', 'e'), 800, 600,
 		DIPLOMACY_BANDS, 0, 1, 4140 },
 	// And on the battle report, which is built on the diplomacy screen (with the red cloth).

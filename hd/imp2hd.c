@@ -1063,10 +1063,65 @@ static void sync_layout_screen(BYTE *screen)
 	}
 }
 
+// The offer screen's panel, checked before the screen is widened (it could not be tried in the
+// game while its layout was made): every picture over the background must lie clear of the places
+// the panel is lengthened, as the seals do. Counts the seals found, and logs any picture in the way.
+static int offer_panel_scan(BYTE *view, const ScreenLayout *s, int *seals, int depth)
+{
+	int blocking = 0;
+	BYTE *list = *(BYTE **)(view + V_SUBVIEWS);
+	if (!readable(list, 8) || depth > 6) return 0;
+	for (void **node = *(void ***)(list + 4); readable(node, 12); node = (void **)node[0]) {
+		BYTE *child = (BYTE *)node[2];
+		if (!readable(child, 0x8c)) continue;
+		if (drawn_as_picture(child)) {
+			short art = *(short *)(child + 0x88);
+			if (art == 8406 || art == 8408 || art == 8409 || art == 8532 || art == 8533) (*seals)++;
+			int x = VIEW_INT(child, 0x2c), y = VIEW_INT(child, 0x30), w = VIEW_INT(child, V_W), h = VIEW_INT(child, V_H);
+			for (int b = 0; w < s->width && b < LAYOUT_MAX_BANDS && s->bands[b].bottom; b++) {
+				const LayoutBand *band = &s->bands[b];
+				if (band->top != 96) continue; // the panel's rows: the rest is the diplomacy screen's layout
+				if (y + h / 2 < band->top || y + h / 2 >= band->bottom) continue; // placed by the band holding its centre
+				for (int k = 0; k < LAYOUT_MAX_INSERTS && band->ins[k].width; k++) {
+					if (x < band->ins[k].at && band->ins[k].at < x + w) {
+						DWORD id = (DWORD)VIEW_INT(child, V_ID);
+						logf_("offer panel: picture %d '%c%c%c%c' at %d,%d %dx%d lies across column %d", art, (char)(id >> 24),
+							(char)(id >> 16), (char)(id >> 8), (char)id, x, y, w, h, band->ins[k].at);
+						blocking++;
+					}
+				}
+			}
+		}
+		blocking += offer_panel_scan(child, s, seals, depth + 1);
+	}
+	return blocking;
+}
+
+// Whether the offer screen has its panel yet (TRUE for any other screen).
+static BOOL offer_panel_ready(BYTE *screen)
+{
+	if (strcmp(view_class(screen), "TDiplomacyOfferView")) return TRUE;
+	const ScreenLayout *s = find_layout(screen);
+	int seals = 0;
+	if (s) offer_panel_scan(screen, s, &seals, 0);
+	return !s || seals >= 2;
+}
+
+static BOOL offer_panel_fits(BYTE *screen, const ScreenLayout *s)
+{
+	int seals = 0, blocking = offer_panel_scan(screen, s, &seals, 0);
+	if (seals < 2 || blocking) {
+		logf_("offer screen left centred: %d seals found, %d pictures in the way", seals, blocking);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static BOOL widen_layout_screen(BYTE *screen)
 {
 	const ScreenLayout *s = find_layout(screen);
 	if (!s || !g_layoutDrawHooked || g_gameW != BASE_W + LAYOUT_EXTRA) return FALSE;
+	if (!strcmp(s->cls, "TDiplomacyOfferView") && !offer_panel_fits(screen, s)) return FALSE;
 	if (!layout_valid(s) || layout_extra(s) != LAYOUT_EXTRA || VIEW_INT(screen, 0x2c) != 0) {
 		logf_("layout '%s' is not valid here", s->name);
 		return FALSE;
@@ -1215,6 +1270,12 @@ static void watch_screens_now(void)
 				// The map view is one of the last things attached; wait until the screen is built.
 				if ((map || battle) && !child_view(screen, ID4('D', 'L', 'O', 'G'))) continue;
 				if (battle && !child_view(screen, ID4('t', 'u', 'r', 'n'))) continue;
+				// The offer screen's seals may be added after it; wait for them (for a few seconds).
+				static BYTE *waiting; static int waited;
+				if (!offer_panel_ready(screen)) {
+					if (waiting != screen) { waiting = screen; waited = 0; }
+					if (++waited < 25) continue;
+				}
 
 				if (g_gameW > BASE_W) {
 					if (map) widen_map_screen(screen);
