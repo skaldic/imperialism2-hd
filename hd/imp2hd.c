@@ -1515,6 +1515,9 @@ static void remote_hide(HWND frame)
 static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	if (g_remote && msg >= WM_REMOTE_MOVE && msg <= WM_REMOTE_SHOT) { remote_message(hwnd, msg, wp, lp); return 0; }
+	// The view draws a 2-pixel border of its own (a gray line along the screen's edges): none.
+	if (scaled() && msg == WM_NCCALCSIZE) return 0;   // the client area is the whole window
+	if (scaled() && msg == WM_NCPAINT) return 0;
 	if (msg == WM_PAINT) watch_gui_objects();
 	if (msg == WM_TIMER && wp == VIEW_DUMP_TIMER) {
 		watch_screens();
@@ -1680,6 +1683,7 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 			SetWindowLongA(g_frame, GWL_STYLE, (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU)) | WS_POPUP);
 			SetWindowLongA(g_frame, GWL_EXSTYLE, ex & ~(WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE));
 			SetWindowPos(g_frame, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+			SetWindowPos(g_view, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 		}
 		if (g_remote) remote_hide(g_frame);
 		if (g_remote) {
