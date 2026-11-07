@@ -368,6 +368,10 @@ static int g_spriteById, g_spriteUnknown; // sprites drawn from the picture know
 static LONGLONG g_knownTicks, g_noteTicks, g_tileTicks, g_pngTicks;
 static int g_squaresBuilt, g_squarePixelsKnown, g_squarePixelsOther; // map squares built from their pieces
 static int g_pieceCalls, g_pieceNoSheet, g_squareNotFound, g_squareFew, g_sheetCellsSeen;
+// How a copy's pixels are found: by comparing the square before and after (the default), or with
+// [Debug] PieceMark=1 by first filling it with a value the source lacks. The fill is exact but some
+// routines read the square while writing it, and it then leaked into the game's own pixels.
+static BOOL g_pieceMark;
 static BOOL g_piecesOnly; // [Debug] PiecesOnly=1: every square built from its pieces (captured art ignored)
 static BOOL g_pieceTint; // [Debug] PieceTint=1: pixels of built squares not from a piece shown magenta
 static int g_pngLoads;                       // HD pictures read from disk and decoded  // time finding sprites by number, and recording cache sprites
@@ -1347,8 +1351,120 @@ static void watch_gui_objects(void)
 	}
 }
 
+// ---------------------------------------------------------------------------------------------
+// Remote testing ([Debug] Remote=1)
+//
+// For automated tests that must not take over the person's screen, mouse or keyboard: the game's
+// window is cloaked (invisible, as on another virtual desktop, but still drawn), cannot be activated
+// and lets clicks through, and is driven by messages posted to its view (tools\bgdrive.ps1). Those
+// carry positions in the frame's game coordinates; the patch turns them into the mouse messages
+// the game expects, and answers the game's own questions about the cursor, the buttons and the
+// active window from them instead of from the real mouse and keyboard. A frame is saved on request
+// (imp2hd-shot.png beside the exe). Window handles are written to imp2hd-remote.txt.
+#define WM_REMOTE_MOVE (WM_APP + 0x101)
+#define WM_REMOTE_DOWN (WM_APP + 0x102)
+#define WM_REMOTE_UP   (WM_APP + 0x103)
+#define WM_REMOTE_KEY  (WM_APP + 0x104)
+#define WM_REMOTE_SHOT (WM_APP + 0x110)
+static BOOL g_remote, g_remoteDown;
+static void remote_mute(void);
+static int g_remoteX = 400, g_remoteY = 300, g_shotRequest;
+
+static void remote_screen_point(POINT *pt)
+{
+	RECT r = { 0 };
+	if (g_view) GetWindowRect(g_view, &r);
+	pt->x = r.left + to_view_x(g_remoteX);
+	pt->y = r.top + to_view_y(g_remoteY);
+}
+
+static void remote_message(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+	remote_mute(); // (again: the game may open its sound devices later)
+	if (msg == WM_REMOTE_SHOT) { g_shotRequest = 1; InvalidateRect(hwnd, NULL, FALSE); return; }
+	if (msg == WM_REMOTE_KEY) {
+		PostMessageA(hwnd, WM_KEYDOWN, wp, 1);
+		if (lp) PostMessageA(hwnd, WM_CHAR, (WPARAM)lp, 1);
+		PostMessageA(hwnd, WM_KEYUP, wp, 0xc0000001);
+		return;
+	}
+	g_remoteX = (short)LOWORD(lp); g_remoteY = (short)HIWORD(lp);
+	LPARAM raw = MAKELPARAM(to_view_x(g_remoteX), to_view_y(g_remoteY));
+	if (msg == WM_REMOTE_DOWN) { g_remoteDown = TRUE; PostMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, raw); }
+	else if (msg == WM_REMOTE_UP) { g_remoteDown = FALSE; PostMessageA(hwnd, WM_LBUTTONUP, 0, raw); }
+	else PostMessageA(hwnd, WM_MOUSEMOVE, g_remoteDown ? MK_LBUTTON : 0, raw);
+}
+
+static BOOL (WINAPI *o_GetCursorPos)(POINT *);
+static SHORT (WINAPI *o_GetAsyncKeyState)(int);
+static SHORT (WINAPI *o_GetKeyState)(int);
+static DWORD (WINAPI *o_GetMessagePos)(void);
+static HWND (WINAPI *o_GetForegroundWindow)(void);
+static HWND (WINAPI *o_GetActiveWindow)(void);
+static BOOL WINAPI h_GetCursorPos(POINT *p)
+{
+	if (!g_remote || !g_view || !p) return o_GetCursorPos(p);
+	remote_screen_point(p);
+	return TRUE;
+}
+static SHORT WINAPI h_GetAsyncKeyState(int vk)
+{
+	if (!g_remote) return o_GetAsyncKeyState(vk);
+	return (SHORT)(vk == VK_LBUTTON && g_remoteDown ? 0x8000 : 0); // the person's keys and buttons do not reach it
+}
+static SHORT WINAPI h_GetKeyState(int vk)
+{
+	if (!g_remote) return o_GetKeyState(vk);
+	return (SHORT)(vk == VK_LBUTTON && g_remoteDown ? 0x8000 : 0);
+}
+static DWORD WINAPI h_GetMessagePos(void)
+{
+	if (!g_remote || !g_view) return o_GetMessagePos();
+	POINT pt;
+	remote_screen_point(&pt);
+	return MAKELONG(pt.x, pt.y);
+}
+static HWND WINAPI h_GetForegroundWindow(void) { return g_remote && g_frame ? g_frame : o_GetForegroundWindow(); }
+static HWND WINAPI h_GetActiveWindow(void) { return g_remote && g_frame ? g_frame : o_GetActiveWindow(); }
+
+static void save_frame_shot(int width);
+
+// Remote testing: the game is silent. Since Windows Vista the wave volume is the process's own audio
+// session volume, so this mutes all of the game's sound (effects, music, movies) and nothing else.
+static void remote_mute(void)
+{
+	typedef UINT (WINAPI *SetVolume)(HANDLE, DWORD);
+	static SetVolume set;
+	if (!set) { HMODULE mm = LoadLibraryA("winmm.dll"); set = mm ? (SetVolume)GetProcAddress(mm, "waveOutSetVolume") : NULL; }
+	if (!set) return;
+	set((HANDLE)0, 0);
+	set((HANDLE)(UINT_PTR)0xffffffff, 0); // WAVE_MAPPER
+	static BOOL logged;
+	typedef UINT (WINAPI *GetVolume)(HANDLE, DWORD *);
+	GetVolume get = (GetVolume)GetProcAddress(GetModuleHandleA("winmm.dll"), "waveOutGetVolume");
+	DWORD v = 0xffffffff;
+	if (!logged && get && get((HANDLE)0, &v) == 0) { logged = TRUE; logf_("remote testing: game volume now %08lx (0 = muted)", (unsigned long)v); }
+}
+// Remote testing: the frame window made invisible, click-through and unable to take focus.
+static HWND g_remoteReturnFocus; // the person's window when the game started, given focus back
+static void remote_hide(HWND frame)
+{
+	SetWindowLongA(frame, GWL_EXSTYLE, GetWindowLongA(frame, GWL_EXSTYLE) | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW |
+		WS_EX_LAYERED | WS_EX_TRANSPARENT);
+	SetLayeredWindowAttributes(frame, 0, 255, LWA_ALPHA);
+	typedef HRESULT (WINAPI *SetAttr)(HWND, DWORD, LPCVOID, DWORD);
+	HMODULE dwm = LoadLibraryA("dwmapi.dll");
+	SetAttr set = dwm ? (SetAttr)GetProcAddress(dwm, "DwmSetWindowAttribute") : NULL;
+	BOOL cloak = TRUE;
+	HRESULT hr = set ? set(frame, 13 /* DWMWA_CLOAK */, &cloak, sizeof cloak) : E_FAIL;
+	SetWindowPos(frame, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+	if (g_remoteReturnFocus && IsWindow(g_remoteReturnFocus)) SetForegroundWindow(g_remoteReturnFocus);
+	remote_mute();
+	logf_("remote testing: window cloaked (%s), click-through, not activated, muted", SUCCEEDED(hr) ? "ok" : "FAILED");
+}
 static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+	if (g_remote && msg >= WM_REMOTE_MOVE && msg <= WM_REMOTE_SHOT) { remote_message(hwnd, msg, wp, lp); return 0; }
 	if (msg == WM_PAINT) watch_gui_objects();
 	if (msg == WM_TIMER && wp == VIEW_DUMP_TIMER) {
 		watch_screens();
@@ -1422,6 +1538,9 @@ static int g_testScreenW, g_testScreenH;
 
 static LRESULT CALLBACK frame_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+	if (g_remote && msg == WM_ACTIVATE && LOWORD(wp) != WA_INACTIVE && g_remoteReturnFocus && IsWindow(g_remoteReturnFocus))
+		SetForegroundWindow(g_remoteReturnFocus); // never keeps the focus from the person's own window
+	if (g_remote && msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
 	if (msg == WM_ERASEBKGND && g_view) {
 		// The game only clears an 800x600 corner; black out everything around the view.
 		RECT c, v;
@@ -1503,6 +1622,13 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 		g_frameProc = (WNDPROC)SetWindowLongA(g_frame, GWL_WNDPROC, (LONG)frame_proc);
 		g_viewProc = (WNDPROC)SetWindowLongA(g_view, GWL_WNDPROC, (LONG)view_proc);
 		logf_("attached: frame %p view %p", (void *)g_frame, (void *)g_view);
+		if (g_remote) remote_hide(g_frame);
+		if (g_remote) {
+			char path[MAX_PATH];
+			snprintf(path, sizeof path, "%simp2hd-remote.txt", g_gameDir);
+			FILE *f = fopen(path, "w");
+			if (f) { fprintf(f, "%lu %lu %lu\n", (unsigned long)(DWORD_PTR)g_view, (unsigned long)(DWORD_PTR)g_frame, GetCurrentProcessId()); fclose(f); }
+		}
 		widen_globals();
 		if (g_dumpViews || g_gameW > BASE_W) SetTimer(g_view, VIEW_DUMP_TIMER, 200, NULL);
 		place_view();
@@ -2249,6 +2375,7 @@ static BOOL WINAPI h_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx
 			g_presentPixels += w * h;
 		}
 		if (g_offsetX) draw_margins(dst, src);
+		if (g_shotRequest && composed && hd_compose(src, 0, 0, width, GAME_H)) { save_frame_shot(width); g_shotRequest = 0; }
 		RestoreDC(dst, saved);
 		return ok;
 	}
@@ -3535,14 +3662,15 @@ static void piece_copy(int routine, void *map, BYTE *src, BYTE *dst, int srcRow,
 		original(map, src, dst, srcRow, dstRow);
 		return;
 	}
-	// A value the source square does not contain marks the pixels the routine leaves alone.
+	// (With PieceMark) a value the source square does not contain marks the pixels left alone.
 	BYTE seen[256] = { 0 };
 	for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) seen[src[(size_t)y * ss + x]] = 1;
 	int mark = -1;
 	for (int v = 0; v < 256 && mark < 0; v++) if (!seen[v]) mark = v;
 	if (mark < 0) { original(map, src, dst, srcRow, dstRow); return; }
 	static BYTE before[64 * 64];
-	for (int y = 0; y < 64; y++) { memcpy(before + y * 64, dst + (size_t)y * ds, 64); memset(dst + (size_t)y * ds, mark, 64); }
+	for (int y = 0; y < 64; y++) memcpy(before + y * 64, dst + (size_t)y * ds, 64);
+	if (g_pieceMark) for (int y = 0; y < 64; y++) memset(dst + (size_t)y * ds, mark, 64);
 	original(map, src, dst, srcRow, dstRow);
 	int px = 0, py = 0, down = 1, pic = sheet_cell_at(src, &px, &py, &down);
 	g_pieceCalls++; if (pic < 0) g_pieceNoSheet++;
@@ -3552,7 +3680,7 @@ static void piece_copy(int routine, void *map, BYTE *src, BYTE *dst, int srcRow,
 		BYTE *row = dst + (size_t)y * ds;
 		for (int x = 0; x < 64; x++) {
 			int i = y * 64 + x;
-			if (row[x] == mark) { row[x] = before[i]; continue; }
+			if (g_pieceMark ? row[x] == mark : (row[x] == before[i] && routine != 0)) { if (g_pieceMark) row[x] = before[i]; continue; }
 			// (The square is noted in memory rows; its pixel's place in the picture in the
 			// picture's own rows.)
 			int ix = px + x, iy = py + y * down;
@@ -3627,10 +3755,27 @@ static const DWORD *square_from_pieces(const BYTE *bits, int pw, int ph, BOOL bo
 				art = arts[artCount++].px;
 			}
 			if (!art) continue;
+			// On a picture's edge the outermost 2x row or column is the upscale's least reliable
+			// (it shows as a fine line where a wedge ends inside a square): the inner one is used twice.
 			int ax = sq->px[i] * 2, ay = sq->py[i] * 2;
 			for (int h = 0; h < 2; h++) {
-				out[(y * 2 + h) * 128 + x * 2] = art[(ay + h) * 128 + ax];
-				out[(y * 2 + h) * 128 + x * 2 + 1] = art[(ay + h) * 128 + ax + 1];
+				int r = ay + h;
+				if (r == 0) r = 1; else if (r == 127) r = 126;
+				int c0 = ax == 0 ? 1 : ax, c1 = ax + 1 == 127 ? 126 : ax + 1;
+				out[(y * 2 + h) * 128 + x * 2] = art[r * 128 + c0];
+				out[(y * 2 + h) * 128 + x * 2 + 1] = art[r * 128 + c1];
+			}
+			// A guard: HD art far from the game's own pixel there (a piece noted from the wrong
+			// place, or an upscale gone wrong at a picture's edge) is not used for that pixel.
+			{
+				DWORD one = rgb555(frame[(size_t)(bottomUp ? surfaceH - 1 - (dy + y) : dy + y) * stride + dx + x]);
+				int d = 0;
+				for (int ch = 0; ch < 24; ch += 8) {
+					int sum = 0;
+					for (int h = 0; h < 2; h++) sum += (int)((out[(y * 2 + h) * 128 + x * 2] >> ch) & 255) + (int)((out[(y * 2 + h) * 128 + x * 2 + 1] >> ch) & 255);
+					d += abs(sum / 4 - (int)((one >> ch) & 255));
+				}
+				if (d > 110) continue;
 			}
 			fromPiece[y * 64 + x] = 1;
 			known++;
@@ -3781,6 +3926,29 @@ static void hd_scan_tiles(void)
 	logf_("HD: map tiles: %d upscaled as files, %d captured so far; capture %s (the HD pack holds more)", art, captured, g_captureTiles ? "on" : "off");
 }
 
+// Remote testing: the 2x frame as shown (the game's area, without the margins), as a PNG beside the
+// exe. Written under another name and renamed, so a reader never sees half a file.
+static void save_frame_shot(int width)
+{
+	static const CLSID pngEncoder = { 0x557cf406, 0x1a04, 0x11d3, { 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
+	static ULONG_PTR token;
+	if (!token) {
+		GpStartupInput input = { 1, NULL, FALSE, FALSE };
+		if (GdiplusStartup(&token, &input, NULL) != 0) return;
+	}
+	if (!g_main.frame) return;
+	GdiFlush();
+	char tmp[MAX_PATH], done[MAX_PATH];
+	WCHAR wide[MAX_PATH];
+	snprintf(tmp, sizeof tmp, "%simp2hd-shot.tmp", g_gameDir);
+	snprintf(done, sizeof done, "%simp2hd-shot.png", g_gameDir);
+	MultiByteToWideChar(CP_ACP, 0, tmp, -1, wide, MAX_PATH);
+	void *bitmap = NULL;
+	if (GdipCreateBitmapFromScan0(width * 2, GAME_H * 2, g_main.w * 2 * 4, GP_FORMAT_32BPP_RGB, (BYTE *)g_main.frame, &bitmap) != 0 || !bitmap) return;
+	BOOL ok = GdipSaveImageToFile(bitmap, wide, &pngEncoder, NULL) == 0;
+	GdipDisposeImage(bitmap);
+	if (ok) MoveFileExA(tmp, done, MOVEFILE_REPLACE_EXISTING);
+}
 static void save_tile(DWORD hash, const WORD *frame, int stride, BOOL bottomUp, int surfaceH, int dx, int dy)
 {
 	static const CLSID pngEncoder = { 0x557cf406, 0x1a04, 0x11d3, { 0x9a, 0x73, 0x00, 0x00, 0xf8, 0x1e, 0xf3, 0x2e } };
@@ -5272,7 +5440,10 @@ static void install(HMODULE self)
 	g_sharpText = GetPrivateProfileIntA("Display", "SharpText", 1, ini);
 	g_mapSprites = GetPrivateProfileIntA("Display", "HDMapSprites", 1, ini);
 	g_pieceTint = GetPrivateProfileIntA("Debug", "PieceTint", 0, ini);
+	g_remote = GetPrivateProfileIntA("Debug", "Remote", 0, ini);
+	if (g_remote) { g_remoteReturnFocus = GetForegroundWindow(); remote_mute(); }
 	g_piecesOnly = GetPrivateProfileIntA("Debug", "PiecesOnly", 0, ini);
+	g_pieceMark = GetPrivateProfileIntA("Debug", "PieceMark", 0, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 	{
 		char size[32] = "";
@@ -5298,6 +5469,14 @@ static void install(HMODULE self)
 	HOOK("USER32.dll", ValidateRect);
 	HOOK("USER32.dll", RedrawWindow);
 	HOOK("USER32.dll", SetCursor);
+	if (g_remote) {
+		HOOK("USER32.dll", GetCursorPos);
+		HOOK("USER32.dll", GetAsyncKeyState);
+		HOOK("USER32.dll", GetKeyState);
+		HOOK("USER32.dll", GetMessagePos);
+		HOOK("USER32.dll", GetForegroundWindow);
+		HOOK("USER32.dll", GetActiveWindow);
+	}
 	HOOK("GDI32.dll", StretchBlt);
 	HOOK("GDI32.dll", GetClipBox);
 	HOOK("GDI32.dll", StretchDIBits);
