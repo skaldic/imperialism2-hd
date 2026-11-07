@@ -1672,6 +1672,15 @@ static HWND WINAPI h_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD s
 		g_frameProc = (WNDPROC)SetWindowLongA(g_frame, GWL_WNDPROC, (LONG)frame_proc);
 		g_viewProc = (WNDPROC)SetWindowLongA(g_view, GWL_WNDPROC, (LONG)view_proc);
 		logf_("attached: frame %p view %p", (void *)g_frame, (void *)g_view);
+		if (scaled()) {
+			// Borderless: no caption, sizing frame or edges, so the client area is the whole
+			// monitor (with them a thin light border showed along the screen's edges).
+			LONG style = GetWindowLongA(g_frame, GWL_STYLE), ex = GetWindowLongA(g_frame, GWL_EXSTYLE);
+			logf_("frame style %08lx ex %08lx", (unsigned long)style, (unsigned long)ex);
+			SetWindowLongA(g_frame, GWL_STYLE, (style & ~(WS_CAPTION | WS_THICKFRAME | WS_BORDER | WS_DLGFRAME | WS_SYSMENU)) | WS_POPUP);
+			SetWindowLongA(g_frame, GWL_EXSTYLE, ex & ~(WS_EX_CLIENTEDGE | WS_EX_WINDOWEDGE | WS_EX_DLGMODALFRAME | WS_EX_STATICEDGE));
+			SetWindowPos(g_frame, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+		}
 		if (g_remote) remote_hide(g_frame);
 		if (g_remote) {
 			char path[MAX_PATH];
