@@ -1367,6 +1367,7 @@ static void watch_gui_objects(void)
 #define WM_REMOTE_KEY  (WM_APP + 0x104)
 #define WM_REMOTE_SHOT (WM_APP + 0x110)
 static BOOL g_remote, g_remoteDown;
+static HWND g_remoteCapture;
 static void remote_mute(void);
 static int g_remoteX = 400, g_remoteY = 300, g_shotRequest;
 
@@ -1383,16 +1384,51 @@ static void remote_message(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	remote_mute(); // (again: the game may open its sound devices later)
 	if (msg == WM_REMOTE_SHOT) { g_shotRequest = 1; InvalidateRect(hwnd, NULL, FALSE); return; }
 	if (msg == WM_REMOTE_KEY) {
-		PostMessageA(hwnd, WM_KEYDOWN, wp, 1);
-		if (lp) PostMessageA(hwnd, WM_CHAR, (WPARAM)lp, 1);
-		PostMessageA(hwnd, WM_KEYUP, wp, 0xc0000001);
+		// To the window with the keyboard focus (a dialog's edit box), else the view.
+		GUITHREADINFO gti = { sizeof gti };
+		HWND to = GetGUIThreadInfo(GetCurrentThreadId(), &gti) && gti.hwndFocus ? gti.hwndFocus : hwnd;
+		PostMessageA(to, WM_KEYDOWN, wp, 1);
+		if (lp) PostMessageA(to, WM_CHAR, (WPARAM)lp, 1);
+		PostMessageA(to, WM_KEYUP, wp, 0xc0000001);
 		return;
 	}
 	g_remoteX = (short)LOWORD(lp); g_remoteY = (short)HIWORD(lp);
-	LPARAM raw = MAKELPARAM(to_view_x(g_remoteX), to_view_y(g_remoteY));
-	if (msg == WM_REMOTE_DOWN) { g_remoteDown = TRUE; PostMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, raw); }
-	else if (msg == WM_REMOTE_UP) { g_remoteDown = FALSE; PostMessageA(hwnd, WM_LBUTTONUP, 0, raw); }
-	else PostMessageA(hwnd, WM_MOUSEMOVE, g_remoteDown ? MK_LBUTTON : 0, raw);
+	// To the window under the point: a dialog over the view, or a control in it, gets the click as
+	// it would from the mouse (in its own client pixels); the view gets it otherwise.
+	POINT pt;
+	remote_screen_point(&pt);
+	HWND to = hwnd;
+	if (g_frame) {
+		// The frame's other children (the game's dialogs) are over the view, whatever their order.
+		HWND under = NULL;
+		for (HWND c = GetWindow(g_frame, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+			RECT r;
+			if (c == g_view || !IsWindowVisible(c) || !GetWindowRect(c, &r) || !PtInRect(&r, pt)) continue;
+			under = c;
+			break;
+		}
+		while (under && under != g_frame) {
+			to = under;
+			POINT d = pt;
+			ScreenToClient(under, &d);
+			HWND deeper = ChildWindowFromPointEx(under, d, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED);
+			if (!deeper || deeper == under) break;
+			under = deeper;
+		}
+	}
+	if (g_remoteCapture) to = g_remoteCapture;
+	POINT local = pt;
+	ScreenToClient(to, &local); // (the patch's own calls are not hooked)
+	LPARAM raw = to == hwnd ? MAKELPARAM(to_view_x(g_remoteX), to_view_y(g_remoteY)) : MAKELPARAM(local.x, local.y);
+	if (msg == WM_REMOTE_DOWN) {
+		char cls[64] = "";
+		GetClassNameA(to, cls, sizeof cls);
+		if (g_dumpViews) logf_("remote press at %d,%d -> window %p '%s' at %d,%d%s", g_remoteX, g_remoteY, (void *)to, cls, (short)LOWORD(raw), (short)HIWORD(raw), to == hwnd ? " (view)" : "");
+		if (!lstrcmpiA(cls, "Edit")) SetFocus(to); // a posted click does not move the keyboard focus
+		g_remoteDown = TRUE; PostMessageA(to, WM_LBUTTONDOWN, MK_LBUTTON, raw);
+	}
+	else if (msg == WM_REMOTE_UP) { g_remoteDown = FALSE; PostMessageA(to, WM_LBUTTONUP, 0, raw); }
+	else PostMessageA(to, WM_MOUSEMOVE, g_remoteDown ? MK_LBUTTON : 0, raw);
 }
 
 static BOOL (WINAPI *o_GetCursorPos)(POINT *);
@@ -1424,7 +1460,21 @@ static DWORD WINAPI h_GetMessagePos(void)
 	remote_screen_point(&pt);
 	return MAKELONG(pt.x, pt.y);
 }
-static HWND WINAPI h_GetForegroundWindow(void) { return g_remote && g_frame ? g_frame : o_GetForegroundWindow(); }
+// Windows only lets the foreground window capture the mouse, and the game's buttons track a click
+// with capture (CMouseTracker): in remote testing the capture is kept here instead.
+static HWND (WINAPI *o_SetCapture)(HWND);
+static HWND (WINAPI *o_GetCapture)(void);
+static BOOL (WINAPI *o_ReleaseCapture)(void);
+static HWND WINAPI h_SetCapture(HWND h) { if (!g_remote) return o_SetCapture(h); HWND was = g_remoteCapture; g_remoteCapture = h; return was; }
+static HWND WINAPI h_GetCapture(void) { return g_remote ? g_remoteCapture : o_GetCapture(); }
+static BOOL WINAPI h_ReleaseCapture(void)
+{
+	if (!g_remote) return o_ReleaseCapture();
+	HWND was = g_remoteCapture;
+	g_remoteCapture = NULL;
+	if (was) SendMessageA(was, WM_CAPTURECHANGED, 0, 0);
+	return TRUE;
+}static HWND WINAPI h_GetForegroundWindow(void) { return g_remote && g_frame ? g_frame : o_GetForegroundWindow(); }
 static HWND WINAPI h_GetActiveWindow(void) { return g_remote && g_frame ? g_frame : o_GetActiveWindow(); }
 
 static void save_frame_shot(int width);
@@ -5476,6 +5526,9 @@ static void install(HMODULE self)
 		HOOK("USER32.dll", GetMessagePos);
 		HOOK("USER32.dll", GetForegroundWindow);
 		HOOK("USER32.dll", GetActiveWindow);
+		HOOK("USER32.dll", SetCapture);
+		HOOK("USER32.dll", GetCapture);
+		HOOK("USER32.dll", ReleaseCapture);
 	}
 	HOOK("GDI32.dll", StretchBlt);
 	HOOK("GDI32.dll", GetClipBox);

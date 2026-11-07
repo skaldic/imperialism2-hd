@@ -6,13 +6,16 @@
 param(
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Steps,
     [string]$Game = "",
-    [string]$Shots = ""
+    [string]$Shots = "",
+    [long]$View = 0     # the game's view window (two copies running); default from imp2hd-remote.txt
 )
 if (-not $Game) { $Game = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path }
 if (-not $Shots) { $Shots = Join-Path $PSScriptRoot "..\hd\shots" }
 Add-Type -Namespace BG -Name M -MemberDefinition '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
-$info = Get-Content "$Game\imp2hd-remote.txt" -ErrorAction Stop
-$view = [IntPtr][long]($info -split ' ')[0]
+if ($View) { $view = [IntPtr]$View } else {
+    $info = Get-Content "$Game\imp2hd-remote.txt" -ErrorAction Stop
+    $view = [IntPtr][long]($info -split ' ')[0]
+}
 $base = 0x8000
 function Post([int]$msg, [long]$w, [long]$l) { [void][BG.M]::PostMessage($view, $base + $msg, [IntPtr]$w, [IntPtr]$l) }
 function XY([string]$a) { $x, $y = $a -split ','; return ([long][int]$y -shl 16) -bor ([int]$x -band 0xffff) }
@@ -26,13 +29,13 @@ foreach ($step in $Steps) {
         'click' { $l = XY $arg; Post 0x101 0 $l; Start-Sleep -Milliseconds 120; Post 0x102 0 $l; Start-Sleep -Milliseconds 80; Post 0x103 0 $l }
         'key'   {
             if ($keys.ContainsKey($arg)) { Post 0x104 $keys[$arg] 0 }
-            else { foreach ($c in $arg.ToCharArray()) { $vk = if ($c -eq '.') { 0xbe } else { [int][char]([string]$c).ToUpper() }; Post 0x104 $vk ([int]$c); Start-Sleep -Milliseconds 40 } }
+            else { foreach ($c in $arg.ToCharArray()) { $vk = if ($c -eq '.') { 0xbe } else { [int][char]([string]$c).ToUpper() }; Post 0x104 $vk 0; Start-Sleep -Milliseconds 40 } }
         }
         'shot'  {
             $f = "$Game\imp2hd-shot.png"; Remove-Item $f -ErrorAction SilentlyContinue
             Post 0x110 1 0
             $t = 0; while (-not (Test-Path $f) -and $t -lt 100) { Start-Sleep -Milliseconds 100; $t++ }
-            if (Test-Path $f) { Move-Item -Force $f (Join-Path $Shots "$arg.png"); "saved $arg.png" } else { "no frame for $arg" }
+            if (Test-Path $f) { Start-Sleep -Milliseconds 200; Move-Item -Force $f (Join-Path $Shots "$arg.png"); "saved $arg.png" } else { "no frame for $arg" }
         }
         default { "unknown step '$step'" }
     }
