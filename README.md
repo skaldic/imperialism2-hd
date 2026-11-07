@@ -37,18 +37,21 @@ What it does:
 |---|---|---|
 | Scaling to the display | always on | Every screen |
 | Wide map, battlefield and screens (1056x600) | `Wide=1` | Map, battles, transport, industry, trade, diplomacy and its offers, load/save, deals, technology, new game, preferences, high scores, credits. Screens that are one painting (the main menu) are painted out at the sides |
-| HD art | `HD=1` | Upscaled terrain, units, towns, icons and screens |
+| HD art | `HD=1` | Upscaled terrain, units, towns, icons and screens; map squares never seen before are built from the HD terrain pieces, so every map is HD |
+| Fills the screen | always on | Borderless, at the monitor's own resolution, from 720p up; stays full screen after alt-tab |
 | HD map units | `HDMapSprites=1` | Each unit and town drawn from its own HD picture, shadows smoothed |
 | Sharp text | `SharpText=1` | Text drawn again at full resolution |
 | Main menu at 4x | `HDNative=1` | Drawn at the display's own resolution |
 
 Known limits:
 
-- Map squares are captured and upscaled as they are met in play, so the released art covers the
-  combinations seen while it was made. On other maps a new mix of coast, river and road shows
-  smoothed instead of HD.
-- Some dialogs and the city screens stay 800 wide, centred, with painted sides.
-- Multiplayer has not been tried.
+- Some dialogs and the city screens stay 800 wide, centred, with painted sides (the multiplayer
+  room too: its click areas are tied to its 800-wide layout).
+- Multiplayer was tested with two copies on one PC, including a simulated bad connection (650 ms
+  round trip, 5% packet loss); not yet over the internet.
+
+Testing without the mouse: `[Debug] Remote=1` makes the game window invisible, click-through and
+muted, and `tools\bgdrive.ps1` drives it by posted messages (clicks, keys, frames saved to a file).
 
 Problems: open an [issue](https://github.com/skaldic/imperialism2-hd/issues) and attach
 `imp2hd.log` from the game folder (rewritten on each launch).
