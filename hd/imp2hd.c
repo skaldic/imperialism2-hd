@@ -123,8 +123,10 @@ static void view_placement(RECT *out)
 	RECT c;
 	GetClientRect(g_frame, &c);
 	double s = min((double)c.right / GAME_W, (double)c.bottom / GAME_H);
-	if (g_integerScale) s = (double)(int)s;
-	if (s < 1.0) s = 1.0;
+	if (g_integerScale && s >= 1.0) s = (double)(int)s;
+	// A screen smaller than the game (1056x600 in wide mode on a small window): shrink to fit
+	// rather than cut it off.
+	if (s <= 0.1) s = 1.0; // no client area yet (minimized, or being created)
 	int w = (int)(GAME_W * s + 0.5), h = (int)(GAME_H * s + 0.5);
 	out->left = (c.right - w) / 2;
 	out->top = (c.bottom - h) / 2;
@@ -762,13 +764,13 @@ static void layout_patch_fill(BYTE *src, BYTE *dst, const LayoutInsert *in, int 
 #define GENERATED_BLEND 48 // columns of crossfade into the original; must match tools\outpaint.ps1
 // Painted-out screens (layouts.h, 'G'): the 1x picture, and its 2x upscale when there is one.
 typedef struct { short id; BOOL tried; DWORD *px1, *px2, *px4; } GeneratedArt;
-static GeneratedArt g_generated[8];
+static GeneratedArt g_generated[24];
 
 static const GeneratedArt *generated_art(short id)
 {
 	if (!id) return NULL;
 	GeneratedArt *slot = NULL;
-	for (int i = 0; i < 8; i++) {
+	for (int i = 0; i < (int)(sizeof g_generated / sizeof g_generated[0]); i++) {
 		if (g_generated[i].id == id) return g_generated[i].px1 ? &g_generated[i] : NULL;
 		if (!slot && !g_generated[i].id) slot = &g_generated[i];
 	}
@@ -1315,6 +1317,8 @@ static void watch_screens_now(void)
 	// with no screen at all (the intro movies) the 800-wide layout is centred too.
 	int offset = g_gameW > BASE_W && !(top && is_wide_screen(top)) ? (g_gameW - BASE_W) / 2 : 0;
 	if (top && is_battle_screen(top)) keep_battlefield_in_picture(top);
+	// A new screen on top of a centred one repaints the margins too (they show the top screen's art).
+	if (top != g_topScreen && g_offsetX && offset == g_offsetX && g_view) InvalidateRect(g_view, NULL, FALSE);
 	g_topScreen = top;
 	g_screenOnTop = top != NULL;
 	g_mapOnTop = top && is_map_screen(top);
@@ -1324,8 +1328,24 @@ static void watch_screens_now(void)
 		InvalidateRect(g_view, NULL, FALSE);
 	}
 }
+// Diagnostic for crash reports: the process's GDI and USER object counts (Windows allows 10000 of
+// each), logged when either passes another thousand, so a leak shows in a player's log.
+static void watch_gui_objects(void)
+{
+	static int paints, gdiLogged = 1000, userLogged = 1000;
+	if (++paints % 100) return;
+	int gdi = (int)GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
+	int user = (int)GetGuiResources(GetCurrentProcess(), GR_USEROBJECTS);
+	if (gdi >= gdiLogged || user >= userLogged) {
+		logf_("Windows objects in use: %d GDI, %d USER (after %d paints)", gdi, user, paints);
+		while (gdiLogged <= gdi) gdiLogged += 1000;
+		while (userLogged <= user) userLogged += 1000;
+	}
+}
+
 static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+	if (msg == WM_PAINT) watch_gui_objects();
 	if (msg == WM_TIMER && wp == VIEW_DUMP_TIMER) {
 		watch_screens();
 		return 0;
@@ -1392,6 +1412,10 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 	return CallWindowProcA(g_viewProc, hwnd, msg, wp, lp);
 }
 
+// [Debug] TestScreen=WxH: the frame is kept at that size instead of the monitor's, to see the game as
+// it is on a smaller display.
+static int g_testScreenW, g_testScreenH;
+
 static LRESULT CALLBACK frame_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
 	if (msg == WM_ERASEBKGND && g_view) {
@@ -1407,8 +1431,35 @@ static LRESULT CALLBACK frame_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		RestoreDC(dc, saved);
 		return 1;
 	}
+	if (msg == WM_WINDOWPOSCHANGING && g_view && scaled()) {
+		// The frame always covers the monitor it is on, whatever asks to move or size it: Windows
+		// restoring it to its last "normal" size (a 400x300 box after it lost focus) or maximizing
+		// it with borders past the screen's edges, or the game itself. Minimizing is left alone.
+		WINDOWPOS *pos = (WINDOWPOS *)lp;
+		MONITORINFO mi = { sizeof mi };
+		if (!IsIconic(hwnd) && !(GetWindowLongA(hwnd, GWL_STYLE) & WS_MINIMIZE) &&
+			GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+			RECT test = { 0, 0, g_testScreenW, g_testScreenH };
+			const RECT *m = g_testScreenW ? &test : &mi.rcMonitor;
+			if (!(pos->flags & SWP_NOMOVE) || !(pos->flags & SWP_NOSIZE)) {
+				pos->x = m->left; pos->y = m->top;
+				pos->cx = m->right - m->left; pos->cy = m->bottom - m->top;
+				pos->flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+			}
+		}
+	}
 	LRESULT res = CallWindowProcA(g_frameProc, hwnd, msg, wp, lp);
 	if (msg == WM_SIZE && g_view && wp != SIZE_MINIMIZED) place_view();
+	if (msg == WM_SIZE && g_view && wp == SIZE_RESTORED && scaled()) {
+		// Restored from minimized (alt-tab back): make sure it is back at the monitor's full size.
+		MONITORINFO mi = { sizeof mi };
+		RECT w;
+		if (g_testScreenW) SetRect(&mi.rcMonitor, 0, 0, g_testScreenW, g_testScreenH);
+		if ((g_testScreenW || GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) && GetWindowRect(hwnd, &w) &&
+			!EqualRect(&w, &mi.rcMonitor))
+			SetWindowPos(hwnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
+				mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
+	}
 	if (msg == WM_NCDESTROY) {
 		g_frame = NULL;
 		hd_on_exit();
@@ -1863,6 +1914,43 @@ static HDC margin_extension(HDC src)
 	return dc;
 }
 
+static HDC dib_dc(int w, int h, DWORD **bits);
+
+// The margins of a centred screen whose picture has been painted out (assets\wide\<id>.png), taken
+// from that painting: a screen kept at 800 wide because widening it would break it (the multiplayer
+// room's click regions are tied to its picture) still gets its painted sides. Returns a DC holding
+// both margins at 2x, left then right, or NULL.
+static HDC margin_generated(void)
+{
+	static HDC dc;
+	static DWORD *bits;
+	static short shown, missing[32];
+	static int missingCount;
+	BYTE *top = g_topScreen;
+	if (!top || !readable(top, 0x8c) || !drawn_as_picture(top)) return NULL;
+	short id = *(short *)(top + 0x88);
+	if (id <= 0) return NULL;
+	for (int i = 0; i < missingCount; i++) if (missing[i] == id) return NULL;
+	char path[MAX_PATH];
+	snprintf(path, sizeof path, "%s\\wide\\%d.png", g_assetsRoot, id);
+	const GeneratedArt *art = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES ? generated_art(id) : NULL;
+	if (!art || !art->px2) {
+		if (missingCount < (int)(sizeof missing / sizeof missing[0])) missing[missingCount++] = id;
+		return NULL;
+	}
+	int m2 = g_offsetX * 2, W2 = g_gameW * 2;
+	if (m2 <= 0 || m2 * 2 > W2) return NULL;
+	if (!dc && !(dc = dib_dc(m2 * 2, GAME_H * 2, &bits))) return NULL;
+	if (shown != id) {
+		for (int y = 0; y < GAME_H * 2; y++) {
+			memcpy(bits + (size_t)y * m2 * 2, art->px2 + (size_t)y * W2, sizeof(DWORD) * m2);
+			memcpy(bits + (size_t)y * m2 * 2 + m2, art->px2 + (size_t)y * W2 + W2 - m2, sizeof(DWORD) * m2);
+		}
+		GdiFlush();
+		shown = id;
+	}
+	return dc;
+}
 // Beside a centred 800-wide screen, instead of plain black bars: the screen's own background
 // continued outward, the tiled panel texture, or a dimmed, heavily blurred wash of its edge. "src" holds the 1x frame.
 static void draw_margins(HDC dst, HDC src)
@@ -1877,7 +1965,8 @@ static void draw_margins(HDC dst, HDC src)
 		FillRect(dst, &right, (HBRUSH)GetStockObject(BLACK_BRUSH));
 		return;
 	}
-	HDC extended = g_marginArt == 3 ? margin_extension(src) : NULL;
+	HDC extended = g_marginArt == 3 ? margin_generated() : NULL;
+	if (!extended && g_marginArt == 3) extended = margin_extension(src);
 	if (extended) {
 		int mode = SetStretchBltMode(dst, g_twoStage ? COLORONCOLOR : HALFTONE);
 		if (showLeft) StretchBlt(dst, left.left, 0, g_offsetX, GAME_H, extended, 0, 0, g_offsetX * 2, GAME_H * 2, SRCCOPY);
@@ -2256,12 +2345,14 @@ static HCURSOR WINAPI h_SetCursor(HCURSOR cur)
 		if (g_cursors[i].from == cur) return o_SetCursor(g_cursors[i].to);
 		if (g_cursors[i].to == cur) return o_SetCursor(cur); // one of ours, handed back to us
 	}
+	// Only cursors that can be remembered are rebuilt: a rebuilt cursor is never destroyed (the game
+	// may hand it back at any time), so making one per call once the table is full would leak a
+	// Windows object on every mouse move until the process runs out of them.
+	if (g_cursorCount >= (int)(sizeof g_cursors / sizeof g_cursors[0])) return o_SetCursor(cur);
 	HCURSOR made = rebuild_cursor(cur);
-	if (g_cursorCount < (int)(sizeof g_cursors / sizeof g_cursors[0])) {
-		g_cursors[g_cursorCount].from = cur;
-		g_cursors[g_cursorCount].to = made;
-		g_cursorCount++;
-	}
+	g_cursors[g_cursorCount].from = cur;
+	g_cursors[g_cursorCount].to = made;
+	g_cursorCount++;
 	return o_SetCursor(made);
 }
 
@@ -4363,14 +4454,21 @@ static HDC g_textDC;
 static DWORD *g_textBits;
 
 typedef struct { LOGFONTA from; HFONT font; } TextFont;
-static TextFont g_textFonts[32];
-static int g_textFontCount;
+static TextFont g_textFonts[64];
+static int g_textFontCount, g_textFontNext;
 
+// The doubled font for the one selected in `dc`, made once and kept. Fonts are compared by what they
+// describe (the bytes after the face name's end are whatever the game left there, and would make
+// one font look like many). When the table is full the oldest is freed and replaced: making a new
+// font per call and never freeing it would leak a Windows object on every line of text, until the
+// process runs out of them and the game crashes.
 static HFONT text_font_2x(HDC dc)
 {
 	LOGFONTA lf;
 	HGDIOBJ f = GetCurrentObject(dc, OBJ_FONT);
 	if (!f || !GetObjectA(f, sizeof lf, &lf)) return NULL;
+	size_t name = strnlen(lf.lfFaceName, LF_FACESIZE);
+	memset(lf.lfFaceName + name, 0, LF_FACESIZE - name);
 	for (int i = 0; i < g_textFontCount; i++)
 		if (!memcmp(&g_textFonts[i].from, &lf, sizeof lf)) return g_textFonts[i].font;
 	LOGFONTA big = lf;
@@ -4378,11 +4476,17 @@ static HFONT text_font_2x(HDC dc)
 	big.lfWidth *= 2;
 	big.lfQuality = ANTIALIASED_QUALITY;
 	HFONT font = CreateFontIndirectA(&big);
-	if (font && g_textFontCount < (int)(sizeof g_textFonts / sizeof g_textFonts[0])) {
-		g_textFonts[g_textFontCount].from = lf;
-		g_textFonts[g_textFontCount].font = font;
-		g_textFontCount++;
+	if (!font) return NULL;
+	int slot;
+	if (g_textFontCount < (int)(sizeof g_textFonts / sizeof g_textFonts[0])) slot = g_textFontCount++;
+	else {
+		// Not selected anywhere: g_textDC gets its fonts within a SaveDC/RestoreDC pair.
+		slot = g_textFontNext;
+		g_textFontNext = (g_textFontNext + 1) % (int)(sizeof g_textFonts / sizeof g_textFonts[0]);
+		DeleteObject(g_textFonts[slot].font);
 	}
+	g_textFonts[slot].from = lf;
+	g_textFonts[slot].font = font;
 	return font;
 }
 
@@ -4954,6 +5058,14 @@ static void install(HMODULE self)
 	g_sharpText = GetPrivateProfileIntA("Display", "SharpText", 1, ini);
 	g_mapSprites = GetPrivateProfileIntA("Display", "HDMapSprites", 1, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
+	{
+		char size[32] = "";
+		GetPrivateProfileStringA("Debug", "TestScreen", "", size, sizeof size, ini);
+		char *x;
+		g_testScreenW = (int)strtol(size, &x, 10);
+		g_testScreenH = *x == 'x' ? (int)strtol(x + 1, NULL, 10) : 0;
+		if (g_testScreenW < 320 || g_testScreenH < 240) g_testScreenW = g_testScreenH = 0;
+	}
 	if (GetPrivateProfileIntA("Debug", "LogCrashes", 1, ini)) AddVectoredExceptionHandler(1, log_crash);
 
 	// Without this Windows scales the whole window itself on high-DPI displays, blurring it.

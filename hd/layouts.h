@@ -198,6 +198,8 @@ static const ScreenLayout g_screenLayouts[] = {
 		{ { 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } } }, 0, 0, 4590 },
 	{ "credits", "TCreditsPicture", LID('m', 'a', 'i', 'n'), 0, 800, 600,
 		{ { 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } } }, 0, 0, 4597 },
+	// (The multiplayer room is not widened: its click regions stop working. It stays centred and
+	// its margins come from its painted-out picture, 4200; see margin_generated.)
 	{ "new game", "TSetupRandomMapPicture", LID('m', 'a', 'i', 'n'), 0, 800, 600,
 		{ { 0, 600, { { 0, 128, 0, 32, 'G' }, { 800, 128, 768, 32, 'G' } } } }, 0, 0, 4540 },
 	{
