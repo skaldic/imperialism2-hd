@@ -366,6 +366,10 @@ static LONGLONG g_copyTicks, g_composeTicks, g_origCopyTicks, g_findTicks;
 static int g_tileCalls, g_tileHits;
 static int g_spriteById, g_spriteUnknown; // sprites drawn from the picture known by number / left at 1x
 static LONGLONG g_knownTicks, g_noteTicks, g_tileTicks, g_pngTicks;
+static int g_squaresBuilt, g_squarePixelsKnown, g_squarePixelsOther; // map squares built from their pieces
+static int g_pieceCalls, g_pieceNoSheet, g_squareNotFound, g_squareFew, g_sheetCellsSeen;
+static BOOL g_piecesOnly; // [Debug] PiecesOnly=1: every square built from its pieces (captured art ignored)
+static BOOL g_pieceTint; // [Debug] PieceTint=1: pixels of built squares not from a piece shown magenta
 static int g_pngLoads;                       // HD pictures read from disk and decoded  // time finding sprites by number, and recording cache sprites
 static int g_copyCalls;
 static int g_traceBudget; // diagnostic: number of paint calls still to be logged
@@ -1356,14 +1360,14 @@ static LRESULT CALLBACK view_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 		QueryPerformanceFrequency(&freq);
 		QueryPerformanceCounter(&a);
 		g_presentTicks = 0; g_presentPixels = 0; g_copyTicks = g_composeTicks = g_origCopyTicks = g_findTicks = 0; g_tileCalls = g_tileHits = 0; g_copyCalls = 0;
-		g_spriteById = g_spriteUnknown = 0; g_knownTicks = g_noteTicks = 0; g_tileTicks = 0; g_pngTicks = 0; g_pngLoads = 0;
+		g_spriteById = g_spriteUnknown = 0; g_knownTicks = g_noteTicks = 0; g_tileTicks = 0; g_pngTicks = 0; g_pngLoads = 0; g_squaresBuilt = g_squarePixelsKnown = g_squarePixelsOther = 0; g_squareNotFound = g_squareFew = 0;
 		LRESULT r = CallWindowProcA(g_viewProc, hwnd, msg, wp, lp);
 		QueryPerformanceCounter(&b);
 		double ms = (b.QuadPart - a.QuadPart) * 1000.0 / freq.QuadPart;
 		double k = 1000.0 / freq.QuadPart;
-		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f), tiles %d/%d HD; %d game pixels; sprites %d by number (%.1f), %d unknown; cache sprites %.1f; tiles %.1f; %d pictures read (%.1f)", ms,
+		if (ms > 3) logf_("paint %.1f ms: presenting %.1f (compose %.1f), game copies %.1f in %d calls, HD copy work %.1f (matching %.1f), tiles %d/%d HD; %d game pixels; sprites %d by number (%.1f), %d unknown; cache sprites %.1f; tiles %.1f; %d pictures read (%.1f); %d squares from pieces (%d px pieces, %d px other; piece copies %d, %d not from a known sheet cell, %d sheet cells; %d squares not recorded, %d mostly unknown)", ms,
 			g_presentTicks * k, g_composeTicks * k, g_origCopyTicks * k, g_copyCalls, g_copyTicks * k, g_findTicks * k, g_tileHits, g_tileCalls, g_presentPixels,
-			g_spriteById, g_knownTicks * k, g_spriteUnknown, g_noteTicks * k, g_tileTicks * k, g_pngLoads, g_pngTicks * k);
+			g_spriteById, g_knownTicks * k, g_spriteUnknown, g_noteTicks * k, g_tileTicks * k, g_pngLoads, g_pngTicks * k, g_squaresBuilt, g_squarePixelsKnown, g_squarePixelsOther, g_pieceCalls, g_pieceNoSheet, g_sheetCellsSeen, g_squareNotFound, g_squareFew);
 		return r;
 	}
 	switch (msg) {
@@ -3331,6 +3335,39 @@ static void forget_painted(const BYTE *bits, int x, int y, int w, int h)
 	}
 }
 
+// Terrain sheets: the game assembles the map's terrain pictures (MapTiles 10000 and on) into an
+// 8-bit sheet at startup and builds each map square from its cells (see the square pieces below).
+// Every 64x64 picture painted into a buffer is remembered here for good, not just the latest few.
+static PaintedPicture g_sheetCells[2048];
+static int g_sheetCellCount;
+
+static void note_sheet_cell(const PaintedPicture *p)
+{
+	for (int i = 0; i < g_sheetCellCount; i++)
+		if (g_sheetCells[i].bits == p->bits && g_sheetCells[i].x == p->x && g_sheetCells[i].y == p->y) { g_sheetCells[i] = *p; return; }
+	if (g_sheetCellCount < (int)(sizeof g_sheetCells / sizeof g_sheetCells[0])) g_sheetCells[g_sheetCellCount++] = *p;
+	g_sheetCellsSeen = g_sheetCellCount;
+}
+
+// The sheet cell holding the pixel at `src`: its picture and where `src` is in it (in the
+// picture's own rows, top down), or -1. *down is 1 when the next row in memory is the next row
+// of the picture, -1 when the buffer is stored bottom up (the game's buffers are).
+static int sheet_cell_at(const BYTE *src, int *px, int *py, int *down)
+{
+	for (int i = 0; i < g_sheetCellCount; i++) {
+		const PaintedPicture *c = &g_sheetCells[i];
+		if (src < c->bits) continue;
+		size_t off = (size_t)(src - c->bits);
+		if (off >= (size_t)c->stride * c->rows) continue;
+		int row = (int)(off / c->stride), col = (int)(off % c->stride);
+		if (c->bottomUp) row = c->rows - 1 - row;
+		if (col < c->x || col >= c->x + 64 || row < c->y || row >= c->y + 64) continue;
+		*px = col - c->x; *py = row - c->y; *down = c->bottomUp ? -1 : 1;
+		return c->id;
+	}
+	return -1;
+}
+
 static void note_painted(HDC dc, const BYTE *srcBits, int srcBpp, int x, int y, int w, int h)
 {
 	DIBSECTION ds;
@@ -3344,6 +3381,7 @@ static void note_painted(HDC dc, const BYTE *srcBits, int srcBpp, int x, int y, 
 	GdiFlush();
 	p.hash = region_hash(dst, p.stride, p.rows, p.bottomUp, p.bpp, x, y, w, h);
 	if (!p.hash) return;
+	if (w == 64 && h == 64 && p.bpp == 8) note_sheet_cell(&p);
 	if (g_paintedCount >= (int)(sizeof g_painted / sizeof g_painted[0])) {
 		memmove(g_painted, g_painted + 1, (g_paintedCount - 1) * sizeof *g_painted);
 		g_paintedCount--;
@@ -3442,6 +3480,179 @@ static BOOL hook_picture_numbers(void)
 	if (memcmp(getDib, seh, sizeof seh) || memcmp(drawThyself, thyself, sizeof thyself)) return FALSE;
 	g_getDibRest = make_trampoline(getDib, 7);
 	return g_getDibRest && redirect(getDib, 7, (void *)get_dib) && redirect(drawThyself, 5, (void *)draw_thyself);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Map squares built from their pieces (with HDMapSprites)
+//
+// The game builds each square of its map in a cache of finished squares (TMapDialog::DrawTile):
+// the terrain's own 64x64 picture, then wedges of the neighbouring terrains blended in at each of
+// the six sides, coast and unexplored edges, all copied out of the terrain sheet by small routines
+// that move each pixel to the same place within the square. Each of those copies is watched: the
+// square is first filled with a value the source does not contain, so afterwards exactly the
+// pixels the routine wrote are known, and each is noted with the sheet picture it came from. A
+// square with no HD art of its own is then built at 2x from the HD art of those pictures, pixel by
+// pixel; whatever else the game drew there (rivers, roads, borders) is enlarged from the 1x pixels.
+
+typedef struct {
+	const BYTE *at;            // the square's top-left pixel in the cache
+	short pic[64 * 64];        // picture each pixel came from (-1: not from a known picture)
+	BYTE px[64 * 64], py[64 * 64], val[64 * 64]; // where in it, and the 1x value written
+} PieceSquare;
+#define PIECE_SQUARES 384
+static PieceSquare *g_pieceSquares;
+static int g_pieceSquareNext;
+
+typedef void (__attribute__((thiscall)) *PieceFn)(void *map, BYTE *src, BYTE *dst, int srcRow, int dstRow);
+enum { PIECE_ROUTINES = 19 };
+static const DWORD g_pieceThunks[PIECE_ROUTINES][2] = { // jump-table entry, routine
+	{ 0x408576, 0x564ff0 }, // NewCopy64: the whole square
+	{ 0x4012c1, 0x563770 }, { 0x406866, 0x563630 }, { 0x407103, 0x5639c0 }, // terrain wedges
+	{ 0x403a53, 0x563c20 }, { 0x4090c0, 0x563af0 }, { 0x4025a4, 0x563f10 },
+	{ 0x40a376, 0x5645c0 }, { 0x406b9a, 0x564180 }, { 0x407c52, 0x564050 }, // coast wedges
+	{ 0x4059bb, 0x564390 }, { 0x40589e, 0x5649e0 }, { 0x4040e3, 0x5647f0 },
+	{ 0x4026d0, 0x564de0 }, { 0x402072, 0x564c80 }, { 0x407ab3, 0x564be0 }, // unexplored edges
+	{ 0x405542, 0x564d40 }, { 0x40a66e, 0x564f60 }, { 0x404228, 0x564ea0 },
+};
+
+static PieceSquare *piece_square(const BYTE *at, BOOL make)
+{
+	if (!g_pieceSquares) return NULL;
+	for (int i = 0; i < PIECE_SQUARES; i++) if (g_pieceSquares[i].at == at) return &g_pieceSquares[i];
+	if (!make) return NULL;
+	PieceSquare *s = &g_pieceSquares[g_pieceSquareNext];
+	g_pieceSquareNext = (g_pieceSquareNext + 1) % PIECE_SQUARES;
+	s->at = at;
+	memset(s->pic, 0xff, sizeof s->pic);
+	return s;
+}
+
+static void piece_copy(int routine, void *map, BYTE *src, BYTE *dst, int srcRow, int dstRow)
+{
+	PieceFn original = (PieceFn)g_pieceThunks[routine][1];
+	int ss = (short)srcRow & ~3, ds = (short)dstRow & ~3;
+	if (!g_hd || !g_pieceSquares || ss < 64 || ds < 64 || !readable(src, (size_t)ss * 63 + 64) || !readable(dst, (size_t)ds * 63 + 64)) {
+		original(map, src, dst, srcRow, dstRow);
+		return;
+	}
+	// A value the source square does not contain marks the pixels the routine leaves alone.
+	BYTE seen[256] = { 0 };
+	for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) seen[src[(size_t)y * ss + x]] = 1;
+	int mark = -1;
+	for (int v = 0; v < 256 && mark < 0; v++) if (!seen[v]) mark = v;
+	if (mark < 0) { original(map, src, dst, srcRow, dstRow); return; }
+	static BYTE before[64 * 64];
+	for (int y = 0; y < 64; y++) { memcpy(before + y * 64, dst + (size_t)y * ds, 64); memset(dst + (size_t)y * ds, mark, 64); }
+	original(map, src, dst, srcRow, dstRow);
+	int px = 0, py = 0, down = 1, pic = sheet_cell_at(src, &px, &py, &down);
+	g_pieceCalls++; if (pic < 0) g_pieceNoSheet++;
+	PieceSquare *sq = piece_square(dst, TRUE);
+	if (routine == 0) memset(sq->pic, 0xff, sizeof sq->pic); // a new square
+	for (int y = 0; y < 64; y++) {
+		BYTE *row = dst + (size_t)y * ds;
+		for (int x = 0; x < 64; x++) {
+			int i = y * 64 + x;
+			if (row[x] == mark) { row[x] = before[i]; continue; }
+			// (The square is noted in memory rows; its pixel's place in the picture in the
+			// picture's own rows.)
+			int ix = px + x, iy = py + y * down;
+			sq->pic[i] = (short)(pic >= 0 && ix >= 0 && ix < 64 && iy >= 0 && iy < 64 ? pic : -1);
+			sq->px[i] = (BYTE)ix; sq->py[i] = (BYTE)iy;
+			sq->val[i] = row[x];
+		}
+	}
+}
+
+#define PIECE_WRAPPER(n) static void __attribute__((thiscall)) piece_##n(void *m, BYTE *s, BYTE *d, int sr, int dr) { piece_copy(n, m, s, d, sr, dr); }
+PIECE_WRAPPER(0) PIECE_WRAPPER(1) PIECE_WRAPPER(2) PIECE_WRAPPER(3) PIECE_WRAPPER(4) PIECE_WRAPPER(5) PIECE_WRAPPER(6)
+PIECE_WRAPPER(7) PIECE_WRAPPER(8) PIECE_WRAPPER(9) PIECE_WRAPPER(10) PIECE_WRAPPER(11) PIECE_WRAPPER(12)
+PIECE_WRAPPER(13) PIECE_WRAPPER(14) PIECE_WRAPPER(15) PIECE_WRAPPER(16) PIECE_WRAPPER(17) PIECE_WRAPPER(18)
+static void *const g_pieceWrappers[PIECE_ROUTINES] = { piece_0, piece_1, piece_2, piece_3, piece_4, piece_5, piece_6,
+	piece_7, piece_8, piece_9, piece_10, piece_11, piece_12, piece_13, piece_14, piece_15, piece_16, piece_17, piece_18 };
+
+// Points the jump-table entries of the square-building routines at the wrappers above.
+static BOOL hook_square_pieces(void)
+{
+	for (int i = 0; i < PIECE_ROUTINES; i++) {
+		BYTE *thunk = (BYTE *)g_pieceThunks[i][0];
+		if (thunk[0] != 0xe9 || (DWORD)(thunk + 5 + *(int *)(thunk + 1)) != g_pieceThunks[i][1]) return FALSE;
+	}
+	g_pieceSquares = calloc(PIECE_SQUARES, sizeof *g_pieceSquares);
+	if (!g_pieceSquares) return FALSE;
+	for (int i = 0; i < PIECE_ROUTINES; i++) {
+		BYTE *thunk = (BYTE *)g_pieceThunks[i][0];
+		DWORD old;
+		if (!VirtualProtect(thunk, 5, PAGE_EXECUTE_READWRITE, &old)) return FALSE;
+		*(int *)(thunk + 1) = (int)((BYTE *)g_pieceWrappers[i] - (thunk + 5));
+		VirtualProtect(thunk, 5, old, &old);
+		FlushInstructionCache(GetCurrentProcess(), thunk, 5);
+	}
+	return TRUE;
+}
+
+static DWORD rgb555(WORD p)
+{
+	DWORD r = (p >> 10) & 31, g = (p >> 5) & 31, b = p & 31;
+	return 0xff000000u | (r << 3 | r >> 2) << 16 | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2);
+}
+
+
+// The 2x art for the cache square at (sx, sy), built from its pieces, or NULL. "frame" holds the
+// square's 1x pixels at (dx, dy) (the map buffer it was just copied to), for what is not a piece.
+static const DWORD *square_from_pieces(const BYTE *bits, int pw, int ph, BOOL bottomUp8, int sx, int sy,
+	const WORD *frame, int stride, BOOL bottomUp, int surfaceH, int dx, int dy)
+{
+	if (!g_pieceSquares || !frame || sy < 0 || sy + 64 > ph) return NULL;
+	int cs = (pw + 3) & ~3;
+	// The square's first row in memory (its bottom row when the cache is stored bottom up).
+	const BYTE *at = bits + (size_t)(bottomUp8 ? ph - 64 - sy : sy) * cs + sx;
+	PieceSquare *sq = piece_square(at, FALSE);
+	if (!sq) { g_squareNotFound++; return NULL; }
+	static DWORD out[128 * 128];
+	static struct { short id; const DWORD *px; } arts[16];
+	int artCount = 0, known = 0, other = 0;
+	static BYTE fromPiece[64 * 64];
+	for (int y = 0; y < 64; y++) {                 // y: the square's rows, top down
+		int k = bottomUp8 ? 63 - y : y;               // the same row in memory
+		const BYTE *row = at + (size_t)k * cs;
+		for (int x = 0; x < 64; x++) {
+			int i = k * 64 + x;
+			fromPiece[y * 64 + x] = 0;
+			if (sq->pic[i] < 0 || row[x] != sq->val[i]) continue;
+			const DWORD *art = NULL;
+			for (int k = 0; k < artCount; k++) if (arts[k].id == sq->pic[i]) art = arts[k].px;
+			if (!art && artCount < 16) {
+				const HdImage *img = hd_by_id(sq->pic[i], 64, 64);
+				arts[artCount].id = sq->pic[i]; arts[artCount].px = img ? img->pixels : NULL;
+				art = arts[artCount++].px;
+			}
+			if (!art) continue;
+			int ax = sq->px[i] * 2, ay = sq->py[i] * 2;
+			for (int h = 0; h < 2; h++) {
+				out[(y * 2 + h) * 128 + x * 2] = art[(ay + h) * 128 + ax];
+				out[(y * 2 + h) * 128 + x * 2 + 1] = art[(ay + h) * 128 + ax + 1];
+			}
+			fromPiece[y * 64 + x] = 1;
+			known++;
+		}
+	}
+	if (known < 64 * 64 / 2) { g_squareFew++; return NULL; } // mostly something else: left to the usual smoothing
+	// The rest (rivers, roads, borders) from the 1x pixels, doubled: thin lines stay solid (an edge-keeping
+	// enlargement such as scale2x thins a one-pixel diagonal line into a broken staircase).
+	#define F1(xx, yy) frame[(size_t)(bottomUp ? surfaceH - 1 - (dy + (yy)) : dy + (yy)) * stride + dx + (xx)]
+	for (int y = 0; y < 64; y++)
+		for (int x = 0; x < 64; x++) {
+			if (fromPiece[y * 64 + x]) continue;
+			other++;
+			DWORD c = rgb555(F1(x, y));
+			out[(y * 2) * 128 + x * 2] = out[(y * 2) * 128 + x * 2 + 1] = c;
+			out[(y * 2 + 1) * 128 + x * 2] = out[(y * 2 + 1) * 128 + x * 2 + 1] = c;
+			if (g_pieceTint) out[(y * 2) * 128 + x * 2] = out[(y * 2) * 128 + x * 2 + 1] = out[(y * 2 + 1) * 128 + x * 2] = out[(y * 2 + 1) * 128 + x * 2 + 1] = 0xffff00ffu;
+		}
+	#undef F1
+	if (g_pieceTint) for (int k = 0; k < 128; k++) out[k] = out[127 * 128 + k] = out[k * 128] = out[k * 128 + 127] = 0xff0000ffu;
+	g_squaresBuilt++; g_squarePixelsKnown += known; g_squarePixelsOther += other;
+	return out;
 }
 
 // A surface pairs one of the game's 1x pixel buffers with a frame twice its size. "state" says
@@ -3605,6 +3816,7 @@ static const DWORD *tile_art(const BYTE *bits, int pw, int ph, BOOL bottomUp8, i
 	const WORD *frame, int stride, BOOL bottomUp, int surfaceH, int dx, int dy)
 {
 	if (!g_tiles || !readable(bits, pixel_bytes(pw, ph, 8))) return NULL;
+	if (g_piecesOnly) return square_from_pieces(bits, pw, ph, bottomUp8, sx, sy, frame, stride, bottomUp, surfaceH, dx, dy);
 	HdTile *t = tile_slot(tight_hash(bits, pw, ph, bottomUp8, sx, sy, 64, 64));
 	if (!t) return NULL;
 	if (t->pixels) return t->pixels;
@@ -3630,7 +3842,8 @@ static const DWORD *tile_art(const BYTE *bits, int pw, int ph, BOOL bottomUp8, i
 		t->captured = 1;
 		save_tile(t->hash, frame, stride, bottomUp, surfaceH, dx, dy);
 	}
-	return NULL;
+	// No HD art for this exact square: built from the HD art of its pieces.
+	return square_from_pieces(bits, pw, ph, bottomUp8, sx, sy, frame, stride, bottomUp, surfaceH, dx, dy);
 }
 
 static BOOL hd_ready(void)
@@ -4910,6 +5123,7 @@ static void hd_install(void)
 {
 	if (g_mapSprites) logf_("HD: sprites drawn onto the window: %s", hook_draw_transparent() ? "hooked" : "NOT hooked");
 	if (g_mapSprites) logf_("HD: pictures known by number: %s", hook_picture_numbers() ? "hooked" : "NOT hooked");
+	if (g_mapSprites) logf_("HD: map squares from their pieces: %s", hook_square_pieces() ? "hooked" : "NOT hooked");
 	const DWORD thunk = 0x00403125, target = 0x00487790;
 	DWORD *rel = (DWORD *)(thunk + 1), old;
 	if (*(BYTE *)thunk != 0xe9 || thunk + 5 + *rel != target) {
@@ -5057,6 +5271,8 @@ static void install(HMODULE self)
 	g_hdNative = GetPrivateProfileIntA("Display", "HDNative", 1, ini);
 	g_sharpText = GetPrivateProfileIntA("Display", "SharpText", 1, ini);
 	g_mapSprites = GetPrivateProfileIntA("Display", "HDMapSprites", 1, ini);
+	g_pieceTint = GetPrivateProfileIntA("Debug", "PieceTint", 0, ini);
+	g_piecesOnly = GetPrivateProfileIntA("Debug", "PiecesOnly", 0, ini);
 	g_wideSteps = GetPrivateProfileIntA("Debug", "WideSteps", 7, ini);
 	{
 		char size[32] = "";
