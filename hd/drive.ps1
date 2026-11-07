@@ -5,11 +5,14 @@
 #   key:<sendkeys>      press a key, e.g. key:{ESC}
 #   shot:<name>         save a half-size screenshot as shots\<name>.png
 # Example: .\drive.ps1 wait:9 click:150,450 wait:3 shot:load
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(ValueFromRemainingArguments = $true)][string[]]$Steps,
     [switch]$KeepRunning,
     [switch]$Attach,     # play the steps on the game that is already running instead of starting it
-    [int]$GameW = 800   # width of the game's frame: 1056 when testing wide mode
+    [int]$GameW = 800,  # width of the game's frame: 1056 when testing wide mode
+    [int]$ScreenW = 0,  # the game's window size at the screen's top left, when not the whole screen
+    [int]$ScreenH = 0   # (the patch's [Debug] TestScreen)
 )
 
 Add-Type -AssemblyName System.Drawing, System.Windows.Forms
@@ -45,6 +48,7 @@ $oy = ($b.Height - 600 * $scale) / 2
 function Move-To([int]$gx, [int]$gy) {
     # The screen size can change while the game runs (the stock game switches display modes).
     $script:b = [Windows.Forms.Screen]::PrimaryScreen.Bounds
+    if ($ScreenW) { $script:b = New-Object Drawing.Rectangle 0, 0, $ScreenW, $ScreenH }
     $script:scale = [Math]::Min($b.Width / [double]$GameW, $b.Height / 600.0)
     $script:ox = ($b.Width - $GameW * $scale) / 2
     $script:oy = ($b.Height - 600 * $scale) / 2

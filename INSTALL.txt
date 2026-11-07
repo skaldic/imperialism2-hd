@@ -30,9 +30,8 @@ Smooth=1        smooth scaling of anything without HD art
 
 Known limits
 ------------
-- Map squares are made HD from the combinations seen while the patch was made. On other maps
-  some squares (a new mix of coast, river and road, say) show smoothed instead of HD.
 - A few screens keep the original 800-wide layout, centred, with painted sides.
+- Multiplayer has been tested on one PC (with simulated lag), not yet over the internet.
 
 Problems: https://github.com/skaldic/imperialism2-hd/issues (attach imp2hd.log from the game folder).
 The license and a notice about the artwork are in this folder (LICENSE.md, NOTICE.md).
